@@ -41,6 +41,15 @@ Official numbers for GLM-5.3-Flash on 2x RTX PRO 6000, with both cards capped at
 | tok/s per stream | 245.5 | 169.1 | 132.0 | 110.3 |
 | TTFT | 54 ms | 74 ms | 99 ms | 122 ms |
 
+Those numbers are for cards allowed 400 W. On the **Max-Q Workstation Edition**
+the board caps at 300 W (325 W hard maximum), the die and memory are the same,
+and sustained decode sits on the cap: 81% / 86% / 90% of the figures above at
+1 / 2 / 4 streams. Prefill, a short burst, still reaches 90-213% of them.
+[`docs/RESULTS-MAX-Q-300W.md`](docs/RESULTS-MAX-Q-300W.md) has those measurements,
+what each setting contributed (`DENSE=q4`, `HEAD=q6`, `W8A8`, `ABSORB_MMA`,
+`TF_GLM_DRAFT_CONFIDENCE`), the drafting sweep, and the deployment notes
+(cold-start time, `ABLIT` with `MODEL_SOURCE=local`, the container-runtime check).
+
 ## Requirements
 
 - Linux x86_64 with two NVIDIA GPUs of 96 GB each (RTX PRO 6000 Blackwell, sm_120) and a driver for CUDA 13.
