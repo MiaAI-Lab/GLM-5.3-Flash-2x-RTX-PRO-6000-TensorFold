@@ -82,7 +82,7 @@ NUM_GPUS=$(( $(tr -cd , <<< "$GPUS" | wc -c) + 1 ))   # TF_GLM_WORLD
 PORT="${PORT:-8020}"
 HOST="${HOST:-0.0.0.0}"
 NCCL_PORT="${NCCL_PORT:-29583}"                  # NCCL_COMM_ID=127.0.0.1:NCCL_PORT; the rank watch uses NCCL_PORT+1
-SERVED_NAME="${SERVED_NAME:-glm-5.3-flash}"
+SERVED_NAME="${SERVED_NAME:-GLM-5.3-Flash}"
 
 # --- serving --------------------------------------------------------------------------------------------------------
 DRAFTER="${DRAFTER:-dflash2}"                    # dflash2 (--drafter DIR) | mtp (the checkpoint's MTP head) | none (--no-drafts)

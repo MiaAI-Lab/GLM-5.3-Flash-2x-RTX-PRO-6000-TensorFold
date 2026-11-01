@@ -69,7 +69,7 @@ $EDITOR scripts/local.sh                        # GPUS, PARALLEL, ...
 DRY_RUN=1 ./start.sh                            # read the plan
 ./start.sh
 curl -s http://127.0.0.1:8020/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model": "glm-5.3-flash", "messages": [{"role": "user", "content": "Hello"}]}'
+  -d '{"model": "GLM-5.3-Flash", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
 `./start.sh restart` applies changed settings. `./start.sh` on a running server only waits for it and smoke-tests it.
@@ -118,7 +118,7 @@ compare a fingerprint of their settings, the checkpoint and the binary. The comm
 ```sh
 # rank 1 on host GPU 1
 env CUDA_VISIBLE_DEVICES=1,0 TF_CUDA_DEVICE=0 TF_GLM_RANK=1 TF_GLM_WORLD=2 NCCL_COMM_ID=127.0.0.1:29583 \
-  /usr/local/bin/tensorfold-native serve /model --name glm-5.3-flash --host 0.0.0.0 --port 8020 --context N \
+  /usr/local/bin/tensorfold-native serve /model --name GLM-5.3-Flash --host 0.0.0.0 --port 8020 --context N \
   --parallel 4 --max-tokens 32768 --kv-cache fp8 --no-update-check --no-thinking --reasoning-effort high --vision \
   --drafter /dflash2 --drafter-bits 4
 # rank 0 on host GPU 0: the same with CUDA_VISIBLE_DEVICES=0,1 TF_GLM_RANK=0
@@ -167,7 +167,7 @@ Settings are layered: `scripts/config.sh` defaults, then `.env` (literal `KEY=va
 | `CLEAR_THINKING` | `1` | `TF_GLM_CLEAR_THINKING`: `1` drops earlier turns' reasoning from the prompt, `0` keeps it (upstream's default) |
 | `SERVE_EXTRA_ARGS` | empty | More `serve` flags for both ranks, word-split |
 | `PORT`, `HOST` | `8020`, `0.0.0.0` | The API address |
-| `SERVED_NAME` | `glm-5.3-flash` | `--name`, the model ID clients send |
+| `SERVED_NAME` | `GLM-5.3-Flash` | `--name`, the model ID clients send |
 | `NCCL_PORT` | `29583` | Rank 0's NCCL bootstrap port. The ranks' watch line also uses the next port |
 | `NCCL_P2P_LEVEL` | `SYS` | NCCL peer-to-peer across the CPU's host bridge |
 | `TENSORFOLD_API_KEY` | unset | If exported: every route except `/health` needs `Authorization: Bearer KEY`. Comma-separated for several keys |
