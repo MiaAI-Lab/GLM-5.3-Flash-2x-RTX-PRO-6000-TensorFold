@@ -1,0 +1,127 @@
+From 48c3c37a2914c33b189d7dbbd0ee2ddae50f142e Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 16:39:24 +0200
+Subject: [PATCH 20/25] contract: GLM's three E4M3 latent launches on KV pages
+ record their compiles
+
+tf_glm_lat_write_fp8_paged, tf_glm_chunks_16_fp8_paged and tf_glm_chunks_32_fp8_paged are registered as their
+window twins are launched: glm_glue, 512 and 256 threads, the chunks' 83,328 and 101,120 opt-in dynamic bytes, sm_80
+on. nvcc 13.0's receipts are owed (usage none, so 13.0 images stay pending); nvcc 13.3's five-SM usage is in
+measurements/pending_133.zig, read from a -Dsm=80,86,89,120,121 glm_glue fatbin of this tree with the contract's own
+cubin reader (the same registers, static bytes and bounds kernel-contract-limits prints; its window twins read back
+exactly as their records at the stock kernels):
+
+  lat_write_fp8_paged  30 30 30 27 27 registers, 64 static bytes, bound 512
+  chunks_16_fp8_paged  178 178 128 128 128, bound 256
+  chunks_32_fp8_paged  218 218 196 159 159, bound 256
+
+Every one fits every SM's limits. A test holds each paged launch to its twin's image, block, shared bytes and bound,
+and the registry to exactly these three paged FP8 launches.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj6TMcvsfVhxuBcBLg
+---
+ .../core/contract/glm_kv_paged_records.zig    | 52 +++++++++++++++++++
+ .../contract/measurements/pending_133.zig     |  3 ++
+ zig/src/core/contract/registry.zig            |  3 +-
+ 3 files changed, 57 insertions(+), 1 deletion(-)
+ create mode 100644 zig/src/core/contract/glm_kv_paged_records.zig
+
+diff --git a/zig/src/core/contract/glm_kv_paged_records.zig b/zig/src/core/contract/glm_kv_paged_records.zig
+new file mode 100644
+index 00000000..f86953ac
+--- /dev/null
++++ b/zig/src/core/contract/glm_kv_paged_records.zig
+@@ -0,0 +1,52 @@
++//! GLM's E4M3 latent cache on KV pages: nvcc 13.0's receipts owed, 13.3's in measurements/pending_133.zig.
++//! Each paged launch is its window twin's (glm_kv_pending.zig) with a page table: same image, block and shared bytes.
++const std = @import("std");
++const registry = @import("registry.zig");
++const limits = @import("limits.zig");
++
++pub const cuda = [_]registry.CudaRecord{
++    .{ .launch = .{ .name = "glm_glue tf_glm_lat_write_fp8_paged", .symbol = "tf_glm_lat_write_fp8_paged", .image = "glm_glue", .threads = 512, .min_sm = 80 }, .usage = registry.none },
++    .{ .launch = .{ .name = "glm_glue tf_glm_chunks_16_fp8_paged", .symbol = "tf_glm_chunks_16_fp8_paged", .image = "glm_glue", .threads = 256, .dynamic = 83328, .opt_in = true, .min_sm = 80 }, .usage = registry.none },
++    .{ .launch = .{ .name = "glm_glue tf_glm_chunks_32_fp8_paged", .symbol = "tf_glm_chunks_32_fp8_paged", .image = "glm_glue", .threads = 256, .dynamic = 101120, .opt_in = true, .min_sm = 80 }, .usage = registry.none },
++};
++
++fn twin(paged: registry.CudaRecord) !registry.CudaRecord {
++    const symbol = paged.launch.symbol[0 .. paged.launch.symbol.len - "_paged".len];
++    for (@import("glm_kv_pending.zig").records) |r| if (std.mem.eql(u8, r.launch.symbol, symbol)) return r;
++    return error.MissingRecord;
++}
++
++test "GLM FP8 KV pages: 13.0 pending, 13.3's receipts fit every SM, and each launch is its window twin's" {
++    for (cuda) |r| {
++        try std.testing.expect(std.mem.endsWith(u8, r.launch.symbol, "_paged"));
++        try std.testing.expect(std.mem.endsWith(u8, r.launch.name, r.launch.symbol));
++        try std.testing.expectEqual(registry.none, registry.usageFor(r, .{ .major = 13, .minor = 0 }));
++        const got = registry.usageFor(r, .{ .major = 13, .minor = 3 });
++        for (limits.sms, got) |sm, u| {
++            try std.testing.expect(u.regs > 0 and u.bound == r.launch.threads);
++            var text: std.ArrayList(u8) = .empty;
++            defer text.deinit(std.testing.allocator);
++            try std.testing.expectEqual(@as(usize, 0), try limits.cuda(r.launch, u, sm, &text, std.testing.allocator));
++        }
++        // the table changes addressing only: the block, its shared bytes and the image are the window kernel's
++        const w = try twin(r);
++        try std.testing.expectEqualStrings(w.launch.image, r.launch.image);
++        try std.testing.expectEqual(w.launch.threads, r.launch.threads);
++        try std.testing.expectEqual(w.launch.dynamic, r.launch.dynamic);
++        try std.testing.expectEqual(w.launch.opt_in, r.launch.opt_in);
++        try std.testing.expectEqual(w.launch.min_sm, r.launch.min_sm);
++        for (registry.usageFor(w, .{ .major = 13, .minor = 3 }), got) |a, b| {
++            try std.testing.expectEqual(a.static, b.static);
++            try std.testing.expectEqual(a.bound, b.bound);
++        }
++    }
++}
++
++test "GLM FP8 KV pages: every paged launch is registered once, beside the window's three" {
++    var n: usize = 0;
++    for (registry.all_cuda) |r| {
++        if (std.mem.startsWith(u8, r.launch.symbol, "tf_glm_") and std.mem.endsWith(u8, r.launch.symbol, "_fp8_paged")) n += 1;
++    }
++    try std.testing.expectEqual(cuda.len, n);
++    for (cuda) |r| _ = try twin(r);
++}
+diff --git a/zig/src/core/contract/measurements/pending_133.zig b/zig/src/core/contract/measurements/pending_133.zig
+index acaec82c..6ab90d70 100644
+--- a/zig/src/core/contract/measurements/pending_133.zig
++++ b/zig/src/core/contract/measurements/pending_133.zig
+@@ -30,8 +30,11 @@ pub const records = [_]Override{
+     .{ .name = "gdn_prep tf_gdn_prep_64", .usage = .{ .{ .regs = 44, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 46, .static = 0, .bound = 128 }, .{ .regs = 46, .static = 0, .bound = 128 } } },
+     .{ .name = "gdn_prep tf_gdn_prep_64, 16 rows or fewer", .usage = .{ .{ .regs = 44, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 46, .static = 0, .bound = 128 }, .{ .regs = 46, .static = 0, .bound = 128 } } },
+     .{ .name = "glm_glue tf_glm_chunks_16_fp8", .usage = .{ .{ .regs = 64, .static = 0, .bound = 256 }, .{ .regs = 64, .static = 0, .bound = 256 }, .{ .regs = 64, .static = 0, .bound = 256 }, .{ .regs = 64, .static = 0, .bound = 256 }, .{ .regs = 64, .static = 0, .bound = 256 } } },
++    .{ .name = "glm_glue tf_glm_chunks_16_fp8_paged", .usage = .{ .{ .regs = 178, .static = 0, .bound = 256 }, .{ .regs = 178, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 } } },
+     .{ .name = "glm_glue tf_glm_chunks_32_fp8", .usage = .{ .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 127, .static = 0, .bound = 256 }, .{ .regs = 130, .static = 0, .bound = 256 }, .{ .regs = 130, .static = 0, .bound = 256 } } },
++    .{ .name = "glm_glue tf_glm_chunks_32_fp8_paged", .usage = .{ .{ .regs = 218, .static = 0, .bound = 256 }, .{ .regs = 218, .static = 0, .bound = 256 }, .{ .regs = 196, .static = 0, .bound = 256 }, .{ .regs = 159, .static = 0, .bound = 256 }, .{ .regs = 159, .static = 0, .bound = 256 } } },
+     .{ .name = "glm_glue tf_glm_lat_write_fp8", .usage = .{ .{ .regs = 26, .static = 64, .bound = 512 }, .{ .regs = 28, .static = 64, .bound = 512 }, .{ .regs = 28, .static = 64, .bound = 512 }, .{ .regs = 25, .static = 64, .bound = 512 }, .{ .regs = 25, .static = 64, .bound = 512 } } },
++    .{ .name = "glm_glue tf_glm_lat_write_fp8_paged", .usage = .{ .{ .regs = 30, .static = 64, .bound = 512 }, .{ .regs = 30, .static = 64, .bound = 512 }, .{ .regs = 30, .static = 64, .bound = 512 }, .{ .regs = 27, .static = 64, .bound = 512 }, .{ .regs = 27, .static = 64, .bound = 512 } } },
+     .{ .name = "norms tf_l2_rows", .usage = .{ .{ .regs = 48, .static = 32, .bound = 256 }, .{ .regs = 48, .static = 32, .bound = 256 }, .{ .regs = 48, .static = 32, .bound = 256 }, .{ .regs = 64, .static = 32, .bound = 256 }, .{ .regs = 64, .static = 32, .bound = 256 } } },
+     .{ .name = "norms tf_slerp_rows", .usage = .{ .{ .regs = 113, .static = 32, .bound = 256 }, .{ .regs = 113, .static = 32, .bound = 256 }, .{ .regs = 113, .static = 32, .bound = 256 }, .{ .regs = 113, .static = 32, .bound = 256 }, .{ .regs = 113, .static = 32, .bound = 256 } } },
+     .{ .name = "qk_rows tf_qk_rows at dim 256", .usage = .{ .{ .regs = 30, .static = 32, .bound = 256 }, .{ .regs = 36, .static = 32, .bound = 256 }, .{ .regs = 36, .static = 32, .bound = 256 }, .{ .regs = 29, .static = 32, .bound = 256 }, .{ .regs = 29, .static = 32, .bound = 256 } } },
+diff --git a/zig/src/core/contract/registry.zig b/zig/src/core/contract/registry.zig
+index 3818ee5e..7daeb12c 100644
+--- a/zig/src/core/contract/registry.zig
++++ b/zig/src/core/contract/registry.zig
+@@ -355,7 +355,7 @@ pub fn usageFor(r: CudaRecord, release: ?limits.Nvcc) [limits.sms.len]U {
+     return u;
+ }
+ /// Restored Qwen launches retain a pending entry wherever a compiler receipt is absent.
+-pub const cuda_pending = @import("qwen_whole_records.zig").records ++ @import("cuda_lane_pending.zig").records ++ @import("weight_only_records.zig").cuda ++ @import("hc_activation_records.zig").cuda ++ @import("qwen4_records.zig").cuda ++ @import("exl3_prompt_records.zig").cuda;
++pub const cuda_pending = @import("qwen_whole_records.zig").records ++ @import("cuda_lane_pending.zig").records ++ @import("weight_only_records.zig").cuda ++ @import("hc_activation_records.zig").cuda ++ @import("qwen4_records.zig").cuda ++ @import("exl3_prompt_records.zig").cuda ++ @import("glm_kv_paged_records.zig").cuda;
+ /// Gate 5's planted CUDA controls: a launch past its __launch_bounds__, one needing more registers than a block has.
+ pub const cuda_controls = [_]CudaRecord{
+     .{ .launch = .{ .name = "control: past its bounds", .symbol = "tf_ctl_bounded", .image = "contract_controls", .threads = 512 }, .usage = .{ .{ .regs = 10, .static = 0, .bound = 256 }, .{ .regs = 10, .static = 0, .bound = 256 }, .{ .regs = 10, .static = 0, .bound = 256 }, .{ .regs = 10, .static = 0, .bound = 256 }, .{ .regs = 10, .static = 0, .bound = 256 } } },
+@@ -590,6 +590,7 @@ test {
+     _ = @import("glm_f32w_pending.zig");
+     _ = @import("registry_pending_test.zig");
+     _ = @import("exl3_prompt_records.zig");
++    _ = @import("glm_kv_paged_records.zig");
+     _ = @import("flashnext_pages_pending.zig");
+ }
+ test "unmeasured CUDA records cannot pass a compiled resource check" {
+-- 
+2.53.0
+

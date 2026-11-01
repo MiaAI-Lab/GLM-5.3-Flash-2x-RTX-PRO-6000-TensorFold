@@ -1,0 +1,34 @@
+From 3f94715d0a864ab3898a87223ae57ebfa9fe6976 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 21:09:24 +0200
+Subject: [PATCH 66/66] tests: glm-pair-check on whole windows reads no page
+ list
+
+On whole windows a twin holds no pages, so the out-of-order count's held[1..] sliced an empty list:
+past its end in a ReleaseFast build, where rank 0 segfaulted before its first prompt. The count now
+runs only over a list of two pages or more.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj6TMcvsfVhxuBcBLg
+---
+ zig/tests/cuda/glm_pair_tests.zig | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/zig/tests/cuda/glm_pair_tests.zig b/zig/tests/cuda/glm_pair_tests.zig
+index c5300134..6e65ee1c 100644
+--- a/zig/tests/cuda/glm_pair_tests.zig
++++ b/zig/tests/cuda/glm_pair_tests.zig
+@@ -91,7 +91,9 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
+         for (0..2) |twin| { // twin 0 a chunk a step, twin 1 paired where it can, both with the same marks
+             e.settings.pair = twin == 1;
+             const held = if (set.pages) try e.pages.?.open(slots[twin], len, 64) else &.{};
+-            for (held[1..], held[0 .. held.len -| 1]) |b, prev| unordered += @intFromBool(b != prev + 1);
++            if (held.len > 1) {
++                for (held[1..], held[0 .. held.len - 1]) |b, prev| unordered += @intFromBool(b != prev + 1);
++            }
+             try x.bind(slots[twin]);
+             if (set.pages) try x.beginOn(null, held) else try x.begin(null);
+             const before = e.pair.?.steps;
+-- 
+2.53.0
+

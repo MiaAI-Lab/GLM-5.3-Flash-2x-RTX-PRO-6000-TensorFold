@@ -1,0 +1,195 @@
+integ5 0070 = patches/pdl5/0068-glm-pdl-hc-chain.patch (overnight 2026-10-31), renumbered for the integrated stack on 3f94715d.
+integ5 resolution: cuda_forward.zig Forward.set() and cuda_glue.zig Set keep attn5 0067's `dsel` beside this patch's `pdl_hc` (one initializer, one struct line).
+
+pdl5 0068: a decode window's hc_post, hc_partial8 and hc_finish launch as dependents (TF_GLM_PDL_CHAIN's hc).
+- glm_triton.cuh: pdl_wait / pdl_trigger (griddepcontrol, sm_90+; the glue builds native sm_120 SASS only).
+- hc_post: wait first (every input is an earlier grid's), then trigger. hc_partial8: its 3 fn rows (immutable weights)
+  load before the wait, x and part after; then trigger. hc_finish(_f32w): the norm weight, base and scale (immutable)
+  load before the wait; x, the partials and every store after it; then trigger. No exit precedes any wait.
+- cuda_glue.zig: Set.pdl_hc; hc_partial8, hc_finish and hc_post launch with it (decode rows only; the prompt kernel
+  tf_glm_hc_partial has no wait and never does). cuda_forward.zig: Forward.set() sets it for decode windows only.
+Needs 0067 (Chain). Exact by construction.
+
+diff --git a/zig/kernels/cuda/glm_glue_hc.cuh b/zig/kernels/cuda/glm_glue_hc.cuh
+index 48e203a9..5c6f6993 100644
+--- a/zig/kernels/cuda/glm_glue_hc.cuh
++++ b/zig/kernels/cuda/glm_glue_hc.cuh
+@@ -56,6 +56,7 @@ extern "C" __global__ void __launch_bounds__(128)
+ }
+ 
+ // The same for decode windows (16 blocks a row): 8 steps of 128 at once, a 128-thread group each; same ops, same order.
++// Dependent launch (decode windows): the weights `fn` load before the wait (immutable); x and part only after it.
+ extern "C" __global__ void __launch_bounds__(1024)
+     tf_glm_hc_partial8(const __nv_bfloat16* x, const __nv_bfloat16* fn, float* part, int64_t wide, int nb) {
+   __shared__ float dots[8][24];
+@@ -63,6 +64,12 @@ extern "C" __global__ void __launch_bounds__(1024)
+   const int64_t r = blockIdx.x, b = blockIdx.y, kb = wide / nb;
+   const int grp = threadIdx.x >> 7, t = threadIdx.x & 127, c = t & 15, m0 = (t >> 4) & 7;
+   const int steps = static_cast<int>(kb / 128);
++  uint4 wu[3];
++  if (grp < steps)
++    for (int i = 0; i < 3; ++i)
++      wu[i] = __ldg(reinterpret_cast<const uint4*>(fn + (int64_t)(m0 + 8 * i) * wide + b * kb + grp * 128 + c * 8));
++  pdl_wait();
++  pdl_trigger();
+   if (grp < steps) {
+     const int64_t base = b * kb + grp * 128;
+     float xv[8];
+@@ -72,8 +79,7 @@ extern "C" __global__ void __launch_bounds__(1024)
+       for (int j = 0; j < 8; ++j) xv[j] = bf(h[j]);
+     }
+     for (int i = 0; i < 3; ++i) {
+-      const uint4 u = __ldg(reinterpret_cast<const uint4*>(fn + (int64_t)(m0 + 8 * i) * wide + base + c * 8));
+-      const __nv_bfloat16* w = reinterpret_cast<const __nv_bfloat16*>(&u);
++      const __nv_bfloat16* w = reinterpret_cast<const __nv_bfloat16*>(&wu[i]);
+       float d = __fmul_rn(xv[1], bf(w[1]));
+       d = __fmaf_rn(xv[0], bf(w[0]), d);
+       for (int j = 2; j < 8; ++j) d = __fmaf_rn(xv[j], bf(w[j]), d);
+@@ -149,14 +155,23 @@ __device__ __forceinline__ void finish(const __nv_bfloat16* x, const float* part
+   __shared__ float pre[4];
+   const int64_t r = blockIdx.x;
+   const int t = threadIdx.x, lane = t & 31;
++  // Dependent launch (decode windows): the norm weight, base and scale (immutable) load before the wait; x and the
++  // partials, earlier grids' rows, only after it.
++  Weights<W> wu;
++  for (int rep = 0; rep < 2; ++rep) wu.load(nw, rep, t);
++  const int k = lane & 3, idx = lane & 15;
++  float bpre = 0.0f, bpost = 0.0f, bcomb = 0.0f, s0 = 0.0f, s1 = 0.0f, s2 = 0.0f;
++  if (t < 32) {
++    bpre = base[k], bpost = base[4 + k], bcomb = base[8 + idx];
++    s0 = scale[0], s1 = scale[1], s2 = scale[2];
++  }
++  pdl_wait();
++  pdl_trigger();
+   // A thread's 8 inputs of each half are contiguous: one 16-byte load per stream and half, issued before Sinkhorn.
+   const __nv_bfloat16* row = x + r * S * D;
+   uint4 xu[2][S];
+-  Weights<W> wu;
+-  for (int rep = 0; rep < 2; ++rep) {
++  for (int rep = 0; rep < 2; ++rep)
+     for (int st = 0; st < S; ++st) xu[rep][st] = *reinterpret_cast<const uint4*>(row + st * D + rep * 2048 + t * 8);
+-    wu.load(nw, rep, t);
+-  }
+   if (t < 32) {
+     const float* p = part + r * nb * 32;
+     float mix = 0.0f, ss = 0.0f;
+@@ -166,13 +181,11 @@ __device__ __forceinline__ void finish(const __nv_bfloat16* x, const float* part
+     }
+     const float rinv = div_full(1.0f, sqrt_approx(eps + div_full(ss, (float)(S * D))));
+     mix = __fmul_rn(mix, rinv);
+-    const int k = lane & 3, idx = lane & 15;
+-    const float bpre = base[k], bpost = base[4 + k], bcomb = base[8 + idx];
+     const float mpre = __shfl_sync(0xffffffffu, mix, k), mpost = __shfl_sync(0xffffffffu, mix, 4 + k);
+     const float mcomb = __shfl_sync(0xffffffffu, mix, 8 + idx);
+-    const float pr = hc_eps + glm_hc::sigmoid(__fmaf_rn(mpre, scale[0], bpre));
+-    const float sp = glm_hc::sigmoid(__fmaf_rn(mpost, scale[1], bpost));
+-    const float cl = __fmaf_rn(mcomb, scale[2], bcomb);
++    const float pr = hc_eps + glm_hc::sigmoid(__fmaf_rn(mpre, s0, bpre));
++    const float sp = glm_hc::sigmoid(__fmaf_rn(mpost, s1, bpost));
++    const float cl = __fmaf_rn(mcomb, s2, bcomb);
+     float cmax = fmaxf(cl, __shfl_xor_sync(0xffffffffu, cl, 2));
+     cmax = fmaxf(cmax, __shfl_xor_sync(0xffffffffu, cmax, 1));
+     const float ce = exp_approx(cl - cmax);
+diff --git a/zig/kernels/cuda/glm_glue_rows.cuh b/zig/kernels/cuda/glm_glue_rows.cuh
+index f708771a..d3c5923c 100644
+--- a/zig/kernels/cuda/glm_glue_rows.cuh
++++ b/zig/kernels/cuda/glm_glue_rows.cuh
+@@ -89,8 +89,12 @@ extern "C" __global__ void tf_glm_rank_sum(const float* own, const float* peers,
+ }
+ 
+ // glue._hc_post: stream s = bf16(post[s] branch + sum_t comb[t][s] x[t]) in LLVM's fma order; x may be xout.
++// Dependent launch (decode windows): every input is an earlier grid's, so the wait comes first; hc_pre's partials
++// may then launch and load their weights while this runs.
+ extern "C" __global__ void tf_glm_hc_post(const __nv_bfloat16* x, __nv_bfloat16* xout, const float* g,
+                                           const float* post, const float* comb, int64_t rs, int64_t d, int world) {
++  pdl_wait();
++  pdl_trigger();
+   const int64_t c = glm_glue::col8();
+   if (c >= d) return;
+   const int64_t r = blockIdx.x;
+diff --git a/zig/kernels/cuda/glm_triton.cuh b/zig/kernels/cuda/glm_triton.cuh
+index 8c95e504..bbe9dfdf 100644
+--- a/zig/kernels/cuda/glm_triton.cuh
++++ b/zig/kernels/cuda/glm_triton.cuh
+@@ -57,4 +57,20 @@ __device__ __forceinline__ float block_sum(float acc, float* smem) {
+   return r;
+ }
+ 
++// Programmatic dependent launch (sm_90 on; the glue builds native sm_120 SASS only, ACQBULK and PREEXIT there).
++// pdl_wait: until the grids this one depends on have completed and their writes are visible. A kernel launched with
++// the attribute calls it in every thread before any read or write of another grid's data and before any exit, so
++// its own completion still implies its predecessors' (the chain stays ordered when overlap never happens).
++// pdl_trigger: the next grid may launch now; it too waits before it touches anything of ours.
++__device__ __forceinline__ void pdl_wait() {
++#if __CUDA_ARCH__ >= 900
++  asm volatile("griddepcontrol.wait;" ::: "memory");
++#endif
++}
++__device__ __forceinline__ void pdl_trigger() {
++#if __CUDA_ARCH__ >= 900
++  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
++#endif
++}
++
+ }  // namespace glm_triton
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index b5a09bd7..9f36e31e 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -216,7 +216,7 @@ pub const Forward = struct {
+     absorb_mma: bool = false, // TF_GLM_ABSORB_MMA=1: a prompt pass's absorb_q and expand_v on tensor cores
+ 
+     pub fn set(f: *const Forward) glue.Set {
+-        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .absorb_mma = f.absorb_mma and f.ranks[0].b.prefill, .dsel = f.m.dsel };
++        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .absorb_mma = f.absorb_mma and f.ranks[0].b.prefill, .dsel = f.m.dsel, .pdl_hc = f.m.mm.chain.hc and !f.ranks[0].b.prefill };
+     }
+ 
+     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index 12d35e5d..d57cf202 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -8,7 +8,8 @@ const index_mod = @import("cuda_index.zig");
+ /// What the forward's kernels launch from: our glue's, glm_mm's when tiled, qlinear's lane for FP8 kinds, copy_rows.
+ /// `absorb_mma`: TF_GLM_ABSORB_MMA=1 on a prompt pass (absorb_q and expand_v on tensor cores, cuda_latent).
+ /// `dsel`: a decode window's DSA select on many CTAs (tf_glm_dsel_*, cuda_sparse; TF_GLM_DSEL, default on).
+-pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false };
++/// `pdl_hc`: a decode window's hc_post, hc_partial8 and hc_finish launch as dependents (TF_GLM_PDL_CHAIN's hc).
++pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false, pdl_hc: bool = false };
+ 
+ /// A hidden-size norm's weight: bf16, or float32 (FP4-Local's) read as float32 by the _f32w kernels.
+ pub const Norm = union(enum) { bf16: u64, f32: u64 };
+@@ -243,8 +244,10 @@ pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale:
+     var a: cuda.Args = .{};
+     inline for (.{ x, fn_w, part, i64of(s * d), @as(c_int, hc_blocks) }) |v| a.add(v);
+     // Decode windows (16 blocks a row) take each block's 8 steps at once; prompt rows 4 rows a 128-thread block.
++    // `pdl_hc`: partial8 and finish launch as dependents (each waits before it reads x or the partials; the prompt
++    // kernel tf_glm_hc_partial has no wait and never does).
+     if (rows < 64) {
+-        try cuda.launch.launch(set.glue.hc_partial8, .{ .grid = .{ .x = @intCast(rows), .y = hc_blocks }, .block = .{ .x = 1024 } }, stream, &a);
++        try cuda.launch.launch(set.glue.hc_partial8, .{ .grid = .{ .x = @intCast(rows), .y = hc_blocks }, .block = .{ .x = 1024 }, .pdl = set.pdl_hc }, stream, &a);
+     } else {
+         a.add(i64of(rows));
+         try cuda.launch.launch(set.glue.hc_partial, .{ .grid = .{ .x = cdiv(rows, 4), .y = hc_blocks }, .block = .{ .x = 128 } }, stream, &a);
+@@ -255,15 +258,19 @@ pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale:
+     };
+     var b: cuda.Args = .{};
+     inline for (.{ x, part, base, scale, w, out, xs, post, comb, eps, hc_eps, @as(c_int, hc_blocks), cint(iters) }) |v| b.add(v);
+-    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &b);
++    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 }, .pdl = set.pdl_hc and rows < 64 }, stream, &b);
+ }
+ 
+ /// glue.hc_post: branch = bf16(`g`, rank 0 first); xout[s] = bf16(post[s] branch + sum_t comb[t][s] x[t]); x may alias.
++/// `pdl_hc`: it launches as a dependent and waits before it reads anything.
+ pub fn hcPost(set: Set, stream: cuda.Stream, x: u64, xout: u64, g: u64, post: u64, comb: u64, rows: usize, d: usize, s: usize, world: usize) !void {
+     if (s != 4) return error.StreamsNotFour;
+     var a: cuda.Args = .{};
+     inline for (.{ x, xout, g, post, comb, i64of(rows * d), i64of(d), cint(world) }) |v| a.add(v);
+-    try rows8Launch(set.glue.hc_post, stream, &a, rows, d, .{ x, xout, g });
++    if (!set.pdl_hc) return rows8Launch(set.glue.hc_post, stream, &a, rows, d, .{ x, xout, g });
++    if (d % 8 != 0) return error.WidthNotEights;
++    inline for (.{ x, xout, g }) |p| if (p % 16 != 0) return error.RowsUnaligned;
++    try cuda.launch.launch(set.glue.hc_post, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(d, 1024) }, .block = .{ .x = 128 }, .pdl = true }, stream, &a);
+ }
+ 
+ /// glm_glue_num.cuh's latent_mma dynamic shared bytes, three stages: [kn (absorb), nk (expand)].

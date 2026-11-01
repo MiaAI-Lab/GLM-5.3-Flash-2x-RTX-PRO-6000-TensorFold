@@ -1,0 +1,79 @@
+From 318c96904cf33c71ab504e81b6ac4058386f06bf Mon Sep 17 00:00:00 2001
+From: Bizuayeu <30091157+Bizuayeu@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 23:39:21 +0900
+Subject: [PATCH 54/63] glm cuda: only an engine with other ranks makes the
+ pair's twin
+
+At TP=1 a pair has no exchanges to hide and no receipt, yet the twin was allocated and the side stream ran
+at top priority. prompt_pair.wanted(on, world) is now on and world > 1, for both; pairedAt already pairs
+only with a twin. glm-pair-check needs other ranks.
+---
+ zig/src/families/glm/cuda_engine.zig      |  5 +++--
+ zig/src/families/glm/cuda_prompt_pair.zig | 11 +++++++++++
+ zig/tests/cuda/glm_pair_tests.zig         |  1 +
+ 3 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index a58d18bc..1ad8b346 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -171,7 +171,8 @@ pub const Engine = struct {
+         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
+         var m = try fw.Modules.load(d, ctx);
+         errdefer m.deinit();
+-        var pieces = try fw.Pieces.init(d, o.settings.pieces, o.settings.pair);
++        const pair = prompt_pair.wanted(o.settings.pair, world);
++        var pieces = try fw.Pieces.init(d, o.settings.pieces, pair);
+         errdefer pieces.deinit();
+         var side = try sideStream(d);
+         errdefer if (side) |*x| freeSide(x);
+@@ -219,7 +220,7 @@ pub const Engine = struct {
+         e.bp = try fw.Buffers.init(d, &e.w, fw.prefill_rows, true, o.capacity);
+         errdefer e.bp.deinit();
+         e.initNumerics();
+-        if (o.settings.pair) e.pair = try prompt_pair.Pair.init(d, &e.w, &e.bp, &e.pieces, o.capacity);
++        if (pair) e.pair = try prompt_pair.Pair.init(d, &e.w, &e.bp, &e.pieces, o.capacity);
+         errdefer if (e.pair) |*p| p.deinit();
+         e.bd = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
+         errdefer e.bd.deinit();
+diff --git a/zig/src/families/glm/cuda_prompt_pair.zig b/zig/src/families/glm/cuda_prompt_pair.zig
+index e68367c7..f6ce94ba 100644
+--- a/zig/src/families/glm/cuda_prompt_pair.zig
++++ b/zig/src/families/glm/cuda_prompt_pair.zig
+@@ -33,6 +33,11 @@ pub const Pair = struct {
+     }
+ };
+ 
++/// Whether an engine makes the pair's twin: TF_GLM_PROMPT_PAIR on, and other ranks whose exchanges a pair hides.
++pub fn wanted(on: bool, world: usize) bool {
++    return on and world > 1;
++}
++
+ /// Whether a step at `start` of a `len`-id prompt takes the next chunk too: min_rows or more there, and no mark at it.
+ pub fn takesTwo(start: usize, len: usize, world: usize, marks: []const u32) bool {
+     const next = start + fw.prefill_rows;
+@@ -134,3 +139,9 @@ test "a pair rebases the index rings where a chunk at a time would, so a ring ba
+     try std.testing.expect(ringsAgree(0, 2 * C, 2 * C, C)); // both at a's start
+     try std.testing.expect(ringsAgree(C, 2 * C, C, C));
+ }
++
++test "only ranks that exchange make the twin: TP=1 has no exchanges to hide" {
++    try std.testing.expect(!wanted(true, 1));
++    try std.testing.expect(wanted(true, 2));
++    try std.testing.expect(!wanted(false, 3));
++}
+diff --git a/zig/tests/cuda/glm_pair_tests.zig b/zig/tests/cuda/glm_pair_tests.zig
+index e339df16..633e1d9c 100644
+--- a/zig/tests/cuda/glm_pair_tests.zig
++++ b/zig/tests/cuda/glm_pair_tests.zig
+@@ -22,6 +22,7 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
+         return err;
+     };
+     try check.expect(set.pair, "glm-pair-check needs TF_GLM_PROMPT_PAIR on (unset or 1)", .{});
++    try check.expect(world > 1, "glm-pair-check needs other ranks: at TP=1 an engine makes no twin", .{});
+     const C = glm.engine.prompt_rows;
+     const capacity = @max(dc.capacity, 5 * C);
+     const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = capacity, .mtp = true, .settings = set });
+-- 
+2.53.0
+

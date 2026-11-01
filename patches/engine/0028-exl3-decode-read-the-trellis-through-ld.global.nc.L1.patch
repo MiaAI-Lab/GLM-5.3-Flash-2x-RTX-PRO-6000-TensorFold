@@ -1,0 +1,51 @@
+From e998e8cac31aae44bb039c9dae1b5dc022004b49 Mon Sep 17 00:00:00 2001
+From: Adam Hillson <598804+BadAd84@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 20:42:33 +0000
+Subject: [PATCH 28/63] exl3 decode: read the trellis through
+ ld.global.nc.L1::no_allocate
+
+The expert weight stream is read once per token and never revisited, but every trellis load went through
+__ldg, which allocates in the read-only cache. On a 163 GiB stream that fills L1 with lines nothing will
+ask for again, evicting the activations and the small tables that are reused every round.
+
+Production's decode kernel uses ld.global.nc.L1::no_allocate.v4.u32 for exactly this reason (read from its
+own exl3.cu). This takes the cache policy and nothing else: the same 32-bit value from the same address,
+bit-identical by construction and proven by reply digest, with the read-only path kept.
+
+Not the whole difference, and measured before claiming: production's lanes also read 16 contiguous bytes
+each where ours read 8, and it stages 1-4 steps ahead through a warp slice; both need a re-tile rather
+than a load swap, so they are separate work.
+---
+ zig/kernels/cuda/exl3_decode.cuh | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/zig/kernels/cuda/exl3_decode.cuh b/zig/kernels/cuda/exl3_decode.cuh
+index 45de99a5..982cb7e2 100644
+--- a/zig/kernels/cuda/exl3_decode.cuh
++++ b/zig/kernels/cuda/exl3_decode.cuh
+@@ -51,13 +51,21 @@ __device__ __forceinline__ void load_lane_words(const uint32_t* tile, int lane,
+     for (int i = 0; i < lane_words<K2>(); ++i) w[i] = tile[(word + i) % tile_words<K2>()];
+ }
+ 
++// A trellis word through the read-only path without allocating in L1: the weight stream is read once, so a
++// line kept in L1 evicts something that will be reused. Same value as __ldg, cache policy only.
++__device__ __forceinline__ uint32_t ldg_stream_u32(const uint32_t* p) {
++    uint32_t v;
++    asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];" : "=r"(v) : "l"(p));
++    return v;
++}
++
+ // The same from global memory through the read-only cache.
+ template <int K2>
+ __device__ __forceinline__ void ldg_lane_words(const uint32_t* tile, int lane, uint32_t (&w)[lane_words<K2>()]) {
+     int word, offset;
+     lane_start<K2>(lane, word, offset);
+ #pragma unroll
+-    for (int i = 0; i < lane_words<K2>(); ++i) w[i] = __ldg(tile + (word + i) % tile_words<K2>());
++    for (int i = 0; i < lane_words<K2>(); ++i) w[i] = ldg_stream_u32(tile + (word + i) % tile_words<K2>());
+ }
+ 
+ // Bits [d, d + 16) of the 96-bit big-endian stream hi:mid:lo (d a compile-time constant after unrolling).
+-- 
+2.53.0
+

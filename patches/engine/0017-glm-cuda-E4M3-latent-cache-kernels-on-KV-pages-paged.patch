@@ -1,0 +1,116 @@
+From f90b7e95a9eb66d3541f696f8ee9ff30a49961fe Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 16:32:26 +0200
+Subject: [PATCH 17/25] glm cuda: E4M3 latent cache kernels on KV pages (paged
+ lat_write_fp8, chunks_16_fp8, chunks_32_fp8)
+
+New symbols beside the window's, which compile to the same SASS as before (checked against opt-combined):
+- tf_glm_lat_write_fp8_paged(lat, stride, cache, scales, pos, pt, ps): row at = pos + r goes to page
+  pt[at / 512], its codes at cache + page * ps + (at % 512) * 512, its scale at scales + page * ps (bytes)
+  + (at % 512) * 4. `cache` and `scales` are this layer's codes and scales in page 0.
+- tf_glm_chunks_{16,32}_fp8_paged(..., sparse, pt, pstep): chunks_wide<HB, true, true>. A dense chunk is
+  one page (its base found once); a sparse key's token list entry is the logical position, translated
+  through the table per key. Codes and scales then load and convert as on a window: the arithmetic and
+  every partial are the window's (opt/mem2-wt/check_paged_fp8.cu: bitwise at 513 to 30,000 keys, dense and
+  sparse, 4 rows x 16 heads and 64 rows x 32 heads, a shuffled table, ten other layers' parts untouched).
+
+ptxas sm_120 (nvcc 13): chunks_32_fp8_paged 159 registers, chunks_16_fp8_paged 128, lat_write_fp8_paged 27;
+no spills. The window's: 167, 125, 25.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj6TMcvsfVhxuBcBLg
+---
+ zig/kernels/cuda/glm_glue_attn.cuh   | 34 +++++++++++++++++++++++++---
+ zig/kernels/cuda/glm_glue_latent.cuh | 13 +++++++++++
+ 2 files changed, 44 insertions(+), 3 deletions(-)
+
+diff --git a/zig/kernels/cuda/glm_glue_attn.cuh b/zig/kernels/cuda/glm_glue_attn.cuh
+index 19752cd6..c2ecc16c 100644
+--- a/zig/kernels/cuda/glm_glue_attn.cuh
++++ b/zig/kernels/cuda/glm_glue_attn.cuh
+@@ -55,7 +55,9 @@ constexpr int wide_smem() {
+   return (HB * LW + 2 * KT * LW + HB * KT) * 2 + (HB * 4 + 2 * HB) * 4;
+ }
+ 
+-template <int HB, bool FP8 = false>
++// PAGED8: an E4M3 cache on KV pages (pt, pstep bytes apart): a dense chunk is one page, a sparse key's logical token goes
++// through the table to its page; codes and scales then load as on a window, so the arithmetic is the window's.
++template <int HB, bool FP8 = false, bool PAGED8 = false>
+ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
+                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
+                             float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr) {
+@@ -79,6 +81,8 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+   constexpr int UPT = KT * (LW / 8) / CHUNK_THREADS;  // units a thread moves a tile
+   uint2 raw[FP8 ? UPT : 1];
+   float rsc[FP8 ? UPT : 1];
++  // on pages: a dense chunk's page (its 512 keys are that page's rows), found once
++  const int64_t dense_page = PAGED8 && !sparse && live ? (int64_t)pt[c] * pstep : 0;
+   auto fetch8 = [&](int tile) {
+     const unsigned char* codes = reinterpret_cast<const unsigned char*>(lc);
+     const int64_t first = start + tile * KT;
+@@ -88,8 +92,16 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+       const int64_t ki = first + key;
+       const bool ok = sparse ? ki < n : ki <= limit;
+       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+-      raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes + src * LW + u * 8)) : make_uint2(0u, 0u);
+-      rsc[i] = ok ? __ldg(scales + src) : 1.0f;
++      if constexpr (PAGED8) {
++        const int64_t page = sparse ? (ok ? (int64_t)pt[src / CH] * pstep : 0) : dense_page;
++        const int64_t row = src % CH;
++        const float* row_scale = reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(scales) + page) + row;
++        raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes + page + row * LW + u * 8)) : make_uint2(0u, 0u);
++        rsc[i] = ok ? __ldg(row_scale) : 1.0f;
++      } else {
++        raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes + src * LW + u * 8)) : make_uint2(0u, 0u);
++        rsc[i] = ok ? __ldg(scales + src) : 1.0f;
++      }
+     }
+   };
+   auto store8 = [&](int tile) {
+@@ -288,6 +300,22 @@ extern "C" __global__ void __launch_bounds__(256)
+                                  po, pm, pl, rows, heads, w, scale, sparse, nullptr, 0, scales);
+ }
+ 
++// The E4M3 variants on KV pages: the stream's table `pt`, its pages `pstep` bytes apart (codes and scales in each).
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_chunks_16_fp8_paged(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
++                               const int* tok, const int* cnt, float* po, float* pm, float* pl, int64_t rows,
++                               int64_t heads, int64_t w, float scale, int sparse, const int* pt, int64_t pstep) {
++  glm_attn::chunks_wide<16, true, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
++                                       po, pm, pl, rows, heads, w, scale, sparse, pt, pstep, scales);
++}
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_chunks_32_fp8_paged(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
++                               const int* tok, const int* cnt, float* po, float* pm, float* pl, int64_t rows,
++                               int64_t heads, int64_t w, float scale, int sparse, const int* pt, int64_t pstep) {
++  glm_attn::chunks_wide<32, true, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
++                                       po, pm, pl, rows, heads, w, scale, sparse, pt, pstep, scales);
++}
++
+ // latent._merge, block (row, head), 128 threads: chunks merged in order, o / l by div.full; skips sparse count-0 rows.
+ extern "C" __global__ void __launch_bounds__(128)
+     tf_glm_merge(const float* po, const float* pm, const float* pl, __nv_bfloat16* out, const int* cnt, int64_t rows,
+diff --git a/zig/kernels/cuda/glm_glue_latent.cuh b/zig/kernels/cuda/glm_glue_latent.cuh
+index 2abdd961..ba91db6f 100644
+--- a/zig/kernels/cuda/glm_glue_latent.cuh
++++ b/zig/kernels/cuda/glm_glue_latent.cuh
+@@ -93,3 +93,16 @@ extern "C" __global__ void __launch_bounds__(512)
+   __shared__ float red[16];
+   tf_kv_fp8::quant_row<512, true>(__bfloat162float(lat[r * stride + d]), d, cache + at * 512, scales + at, red);
+ }
++
++// The same row on KV pages: page pt[at / 512] holds its codes at row at % 512 of this cache's part (from `cache`) and its
++// scale at that row of the part's scales (from `scales`), the pages `ps` bytes apart; the rounding is the window's.
++extern "C" __global__ void __launch_bounds__(512)
++    tf_glm_lat_write_fp8_paged(const __nv_bfloat16* lat, int64_t stride, unsigned char* cache, float* scales,
++                               const int* pos, const int* pt, int64_t ps) {
++  const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
++  const int64_t page = (int64_t)pt[at / 512] * ps, row = at % 512;
++  const int d = threadIdx.x;
++  __shared__ float red[16];
++  float* s = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(scales) + page) + row;
++  tf_kv_fp8::quant_row<512, true>(__bfloat162float(lat[r * stride + d]), d, cache + page + row * 512, s, red);
++}
+-- 
+2.53.0
+

@@ -1,0 +1,428 @@
+integ5 0073 = patches/glue5/0068-glm-mm-two-problem-decode-launches.patch (overnight 2026-10-31), renumbered for the integrated stack on 3f94715d.
+integ5 resolution: glm_mm_policy_host.zig keeps pdl5 0067's TF_GLM_PDL_CHAIN test before this patch's test; cuda_mm.zig Kernels.load keeps `k.chain = Chain.read();` beside the TF_GLM_MM_TWO read.
+
+glm cuda: two decode projections of one width in one glm_mm launch, each keeping its own K slices (T3 candidate 2, glue5)
+
+- glm_mm.cu: glm_mm{16,4,6,8}_{16,32,64}t (MmTwo): x runs problem 0's column tiles times its slices, then problem 1's;
+  each block is the block a lone glm_mm{B}_{BM} launch runs for its (column tile, slice): mm_kernel gains an `xtile`
+  argument beside `zslice` (unset, the SASS of all 34 existing glm_mm kernels is unchanged, cuobjdump diff per
+  function). glm_mm_reduce_two adds each problem's slices in slice order and rounds once, glm_mm_reduce's sums.
+- cuda_mm.matmulTwo: launches them for two decode problems (rows <= 64, one width, splitK of each shape as `matmul`
+  takes it, PDL as `matmul`'s matmuls, the reduce an ordinary launch); refuses (false, nothing launched) when the
+  kernels, TF_GLM_MM_TWO (=0: off), the rows, widths, shapes or the scratch do not fit.
+- cuda_dsa_block.prepareProfile (decode windows, shared windows and the MTP head): [q_a | kv_a] with the indexer's kw
+  (both on the layer's rows, SK 8 and 8 at TP2), and q_b with the indexer's qb on the q rows (SK 2 and 4, sparse rows
+  only). Codex's correction is kept: the problems are not concatenated into one N, so neither changes its K slices.
+- cuda_state: a decode buffer's mm_part holds both problems' slices (twoPartBytes; the q_b + qb pair needs 128 KiB a row
+  at TP2 against 64 KiB before: +1 MiB on the 16-row window buffer, +2 MiB on the 32-row shared one; prompt buffers
+  unchanged); dsa_block.Scratch.mm_part_bytes carries the size (0 elsewhere: the two-call path).
+- Exact: every output and partial is computed by the same block code in the same order; host test for the dispatch
+  (glm_mm_policy_host.zig) and the scratch (cuda_state.zig).
+
+diff --git a/zig/glm_mm_policy_host.zig b/zig/glm_mm_policy_host.zig
+index 2a065ebc..7a6edf4f 100644
+--- a/zig/glm_mm_policy_host.zig
++++ b/zig/glm_mm_policy_host.zig
+@@ -101,3 +101,78 @@ test "TF_GLM_PDL_CHAIN: a K-sliced call's reduce launches as the matmul's depend
+     try std.testing.expectEqual(mm.Chain{ .hc = true }, mm.Chain.parse("hc").?);
+     try std.testing.expect(mm.Chain.parse("reduce,hc,x") == null);
+ }
++
++test "decode two-problem launches keep each problem's split K, one reduce for both, and refuse what matmul would not run" {
++    var k = kernels;
++    var two: [4][3]cuda.Function = undefined;
++    for (&two, 0..) |*ws, wi| for (ws, 0..) |*f, i| {
++        f.* = .{ .id = @intCast(10000 + wi * 10 + i) };
++    };
++    k.two = two;
++    k.reduce_two = .{ .id = 20000 };
++    k.pdl = true;
++    // GLM-5.3-Flash TP2's DSA pairs: [q_a | kv_a] 2048 x 4096 (SK 8) with kw 160 x 4096 (SK 8); q_b 8192 x 1536 (SK 2)
++    // with qb 4096 x 1536 (SK 4)
++    const pairs = [_][4]usize{ .{ 2048, 4096, 160, 4096 }, .{ 8192, 1536, 4096, 1536 } };
++    for (pairs) |sh| for ([_]u8{ 16, 4, 6, 8 }) |bits| for ([_]usize{ 1, 2, 16, 17, 32, 33, 64 }) |rows| {
++        const p = [2]mm.Two{
++            .{ .x = 4096, .ldx = sh[1], .w = .{ .w = 8192, .s = 12288, .n = sh[0], .k = sh[1], .bits = bits }, .out = 1 << 20 },
++            .{ .x = 4096, .ldx = sh[3], .w = .{ .w = 16384, .s = 20480, .n = sh[2], .k = sh[3], .bits = bits }, .out = 1 << 21 },
++        };
++        const need = mm.twoPartBytes(rows, sh[0], sh[1], sh[2], sh[3]);
++        cuda.count = 0;
++        try std.testing.expect(try mm.matmulTwo(&k, .{}, p, 1 << 24, need, rows));
++        try std.testing.expectEqual(@as(usize, 2), cuda.count);
++        const sk0 = mm.splitK(sh[0], sh[1]);
++        const sk1 = mm.splitK(sh[2], sh[3]);
++        const i: usize = if (rows <= 16) 0 else if (rows <= 32) 1 else 2;
++        const wi: usize = switch (bits) {
++            16 => 0,
++            4 => 1,
++            6 => 2,
++            else => 3,
++        };
++        try std.testing.expectEqual(@as(u32, @intCast(10000 + wi * 10 + i)), cuda.symbols[0]);
++        try std.testing.expectEqual(@as(u32, @intCast((sh[0] + 63) / 64 * sk0 + (sh[2] + 63) / 64 * sk1)), cuda.configs[0].grid.x);
++        try std.testing.expectEqual(@as(u32, 1), cuda.configs[0].grid.y);
++        try std.testing.expectEqual(@as(u32, 1), cuda.configs[0].grid.z);
++        try std.testing.expectEqual(@as(u32, if (rows <= 32) 128 else 256), cuda.configs[0].block.x);
++        try std.testing.expectEqual(mm.sharedBytes(bits, @as(usize, 16) << @intCast(i)), cuda.configs[0].shared);
++        try std.testing.expect(cuda.configs[0].pdl);
++        try std.testing.expectEqual(@as(u32, 20000), cuda.symbols[1]);
++        try std.testing.expectEqual(@as(u32, @intCast((rows * sh[0] + 255) / 256 + (rows * sh[2] + 255) / 256)), cuda.configs[1].grid.x);
++        try std.testing.expect(!cuda.configs[1].pdl); // as glm_mm_reduce: an ordinary launch
++        // the two problems' slices never overlap, and the scratch they need is no less than both calls' own
++        try std.testing.expect(mm.partBytes(rows, p[0].w) + mm.partBytes(rows, p[1].w) <= need);
++        // refusals: nothing launched
++        cuda.count = 0;
++        try std.testing.expect(!try mm.matmulTwo(&k, .{}, p, 1 << 24, need - 4, rows)); // scratch short
++        var q = p;
++        q[1].w.bits = if (bits == 8) 6 else 8;
++        try std.testing.expect(!try mm.matmulTwo(&k, .{}, q, 1 << 24, need, rows)); // two widths
++        q = p;
++        q[1].x += 2;
++        try std.testing.expect(!try mm.matmulTwo(&k, .{}, q, 1 << 24, need, rows)); // rows not 16-byte aligned
++        try std.testing.expectEqual(@as(usize, 0), cuda.count);
++    };
++    const p = [2]mm.Two{
++        .{ .x = 4096, .ldx = 4096, .w = .{ .w = 8192, .s = 12288, .n = 2048, .k = 4096, .bits = 8 }, .out = 1 << 20 },
++        .{ .x = 4096, .ldx = 4096, .w = .{ .w = 16384, .s = 20480, .n = 160, .k = 4096, .bits = 8 }, .out = 1 << 21 },
++    };
++    cuda.count = 0;
++    try std.testing.expect(!try mm.matmulTwo(&k, .{}, p, 1 << 24, 1 << 30, 65)); // past a decode launch's 64 rows
++    try std.testing.expect(!try mm.matmulTwo(&k, .{}, p, 1 << 24, 1 << 30, 0));
++    var off = k;
++    off.two_on = false; // TF_GLM_MM_TWO=0
++    try std.testing.expect(!try mm.matmulTwo(&off, .{}, p, 1 << 24, 1 << 30, 4));
++    try std.testing.expect(!try mm.matmulTwo(&kernels, .{}, p, 1 << 24, 1 << 30, 4)); // kernels without them
++    try std.testing.expectEqual(@as(usize, 0), cuda.count);
++    // problems of one slice each (192+ column tiles): their blocks write the outputs, no reduce
++    const wide = [2]mm.Two{
++        .{ .x = 4096, .ldx = 4096, .w = .{ .w = 8192, .s = 12288, .n = 12288, .k = 4096, .bits = 8 }, .out = 1 << 20 },
++        .{ .x = 4096, .ldx = 4096, .w = .{ .w = 16384, .s = 20480, .n = 12576, .k = 4096, .bits = 8 }, .out = 1 << 21 },
++    };
++    try std.testing.expect(try mm.matmulTwo(&k, .{}, wide, 1 << 24, 4, 4));
++    try std.testing.expectEqual(@as(usize, 1), cuda.count);
++    try std.testing.expectEqual(@as(u32, 192 + 197), cuda.configs[0].grid.x);
++}
+diff --git a/zig/kernels/cuda/glm_mm.cu b/zig/kernels/cuda/glm_mm.cu
+index 840875af..aa844b65 100644
+--- a/zig/kernels/cuda/glm_mm.cu
++++ b/zig/kernels/cuda/glm_mm.cu
+@@ -88,13 +88,15 @@ struct Tile {
+ template <int BITS, int BM, int WM, int STAGES, bool ROWS_FIRST = false>
+ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, long long ldx,
+         const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part,
+-        int f32, int M, int N, int K, int SK, int zslice = -1) {
++        int f32, int M, int N, int K, int SK, int zslice = -1, int xtile = -1) {
+     using T = Tile<BITS, BM, WM, STAGES>;
+     extern __shared__ __align__(128) unsigned char buf[];
+     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+     const int wm = warp / T::WN, wn = warp % T::WN;
+     const int KG = K >> 6, per = KG / SK, N8 = N >> 3;
+-    const int n0 = (ROWS_FIRST ? blockIdx.y : blockIdx.x) * T::BN, m0 = (ROWS_FIRST ? blockIdx.x : blockIdx.y) * BM;
++    // a two-problem launch passes the block's column tile (xtile) and slice (zslice) of its problem
++    const int n0 = (xtile >= 0 ? (unsigned)xtile : (ROWS_FIRST ? blockIdx.y : blockIdx.x)) * T::BN,
++              m0 = (ROWS_FIRST ? blockIdx.x : blockIdx.y) * BM;
+     const int slice = zslice >= 0 ? zslice : (int)blockIdx.z, g0 = slice * per;  // a pair launch's z is its problem
+     const int t0 = n0 >> 3;                                   // the block's first column tile
+     auto stage = [&](int st) { return buf + st * T::STAGE; };
+@@ -283,6 +285,58 @@ GLM_MM_PAIR(6)
+ GLM_MM_PAIR(8)
+ GLM_MM_PAIR(16)
+ 
++// Two decode problems of one width in one launch, each with its own shape and its own K slices: x runs problem 0's
++// column tiles times its slices, then problem 1's, and each block is the block a lone glm_mm{B}_{BM} launch runs for
++// that (column tile, slice), so partials and outputs are two launches' bit for bit (GLM's DSA [q_a | kv_a] with the
++// indexer's kw on the layer's rows, and q_b with the indexer's qb on the q rows).
++struct MmTwo {
++    const __nv_bfloat16* x[2];
++    long long ldx[2];
++    const uint32_t* w[2];
++    const __half* s[2];
++    void* out[2];
++    float* part[2];
++    int N[2], K[2], SK[2], cols[2];
++    int blocks0, f32, M;
++};
++template <int B, int BM, int WM>
++__device__ __forceinline__ void mm_two(const MmTwo& p) {
++    const int b = (int)blockIdx.x, z = b >= p.blocks0 ? 1 : 0, l = b - (z ? p.blocks0 : 0), c = p.cols[z];
++    mm_kernel<B, BM, WM, 3>(p.x[z], p.ldx[z], p.w[z], p.s[z], p.out[z], p.part[z], p.f32, p.M, p.N[z], p.K[z], p.SK[z],
++                            l / c, l % c);
++}
++#define GLM_MM_TWO(B)                                                                                                   \
++    extern "C" __global__ void __launch_bounds__(128) glm_mm##B##_16t(const MmTwo p) { mm_two<B, 16, 1>(p); }          \
++    extern "C" __global__ void __launch_bounds__(128) glm_mm##B##_32t(const MmTwo p) { mm_two<B, 32, 1>(p); }          \
++    extern "C" __global__ void __launch_bounds__(256) glm_mm##B##_64t(const MmTwo p) { mm_two<B, 64, 2>(p); }
++GLM_MM_TWO(4)
++GLM_MM_TWO(6)
++GLM_MM_TWO(8)
++GLM_MM_TWO(16)
++
++// Both problems' K slices added in slice order, then rounded once: glm_mm_reduce's sums for each (x: problem 0's
++// blocks, then problem 1's; a problem of one slice has none).
++struct MmReduceTwo {
++    const float* part[2];
++    void* out[2];
++    long long total[2];
++    int SK[2];
++    int blocks0, f32;
++};
++extern "C" __global__ void glm_mm_reduce_two(const MmReduceTwo r) {
++    qmm_frag::grid_launch();
++    const int z = (int)blockIdx.x >= r.blocks0 ? 1 : 0;
++    const long long i = (long long)((int)blockIdx.x - (z ? r.blocks0 : 0)) * blockDim.x + threadIdx.x;
++    const long long total = r.total[z];
++    if (i >= total) return;
++    const float* part = r.part[z];
++    const int SK = r.SK[z];
++    float acc = part[i];
++    for (int sl = 1; sl < SK; ++sl) acc = acc + part[sl * total + i];
++    if (r.f32) reinterpret_cast<float*>(r.out[z])[i] = acc;
++    else reinterpret_cast<__nv_bfloat16*>(r.out[z])[i] = __float2bfloat16_rn(acc);
++}
++
+ // -- tiling at load: ops.cu's packed rows and fp16 scales [N][K / 64] -> the tiled chunks and scales ---------------
+ template <int BITS>
+ __device__ __forceinline__ void tile_packed(const uint32_t* __restrict__ src, const __half* __restrict__ ss,
+diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda_dsa_block.zig
+index dc6a61e6..039f8642 100644
+--- a/zig/src/families/glm/cuda_dsa_block.zig
++++ b/zig/src/families/glm/cuda_dsa_block.zig
+@@ -68,6 +68,7 @@ pub const Scratch = struct {
+     counts: u64, // i32 [rows]
+     mm_part: u64, // fp32 split-K partials
+     at: u64, // an i32: a prompt block's first position (pos + its first row)
++    mm_part_bytes: usize = 0, // mm_part's size: a decode window's two-problem launches need both problems' slices
+ };
+ 
+ /// The kernels: the captured Triton set and glm_ops (the token lists and position offsets).
+@@ -107,18 +108,23 @@ pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
+ pub fn prepareProfile(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, qi: bool, profile: ?*prof.Prof) !void {
+     var stamp = prof.span(profile, stream, .replicated_qakva);
+     const width = l.q_lora + l.lw;
+-    try projection.matmul(set, stream, l.proj, x, x_stride, s.dp, s.mm_part, rows, width, l.dims, false);
++    const ix = l.index;
++    const kw_n = ix.d + ix.heads;
++    // a decode window's [q_a | kv_a] and the indexer's kw read the same rows: one launch, each its own K slices
++    const two_kw = try projection.matmulTwo(set, stream, .{ l.proj, ix.kw }, .{ x, x }, .{ x_stride, x_stride }, .{ s.dp, s.ikr }, .{ width, kw_n }, .{ l.dims, l.dims }, s.mm_part, s.mm_part_bytes, rows);
++    if (!two_kw) try projection.matmul(set, stream, l.proj, x, x_stride, s.dp, s.mm_part, rows, width, l.dims, false);
+     try glue.rmsnorm(set, stream, s.dp, width, l.q_norm, s.qr, l.q_lora, s.xs_qr, l.eps, rows, l.q_lora);
+     try glue.rmsnorm(set, stream, s.dp + l.q_lora * 2, width, l.kv_norm, s.lat, l.lw, s.xs_lat, l.eps, rows, l.lw);
+     stamp.end();
+     stamp = prof.span(profile, stream, .projections);
+     defer stamp.end();
+-    try projection.matmul(set, stream, l.q_b, s.qr, l.q_lora, s.q, s.mm_part, rows, l.heads * l.qk, l.q_lora, false);
+-    const ix = l.index;
+-    try projection.matmul(set, stream, ix.kw, x, x_stride, s.ikr, s.mm_part, rows, ix.d + ix.heads, l.dims, false);
++    // and q_b with the indexer's qb (sparse rows only) on the q rows, likewise
++    const two_qb = if (qi) try projection.matmulTwo(set, stream, .{ l.q_b, ix.qb }, .{ s.qr, s.qr }, .{ l.q_lora, l.q_lora }, .{ s.q, s.qi }, .{ l.heads * l.qk, ix.heads * ix.d }, .{ l.q_lora, l.q_lora }, s.mm_part, s.mm_part_bytes, rows) else false;
++    if (!two_qb) try projection.matmul(set, stream, l.q_b, s.qr, l.q_lora, s.q, s.mm_part, rows, l.heads * l.qk, l.q_lora, false);
++    if (!two_kw) try projection.matmul(set, stream, ix.kw, x, x_stride, s.ikr, s.mm_part, rows, kw_n, l.dims, false);
+     try glue.router(set, stream, x, x_stride, ix.gate, s.igr, s.router_part, rows, l.dims, ix.d);
+     try latent.absorbQ(set, stream, s.q, l.wk, s.qa, rows, l.heads, l.qk, l.lw);
+-    if (qi) try projection.matmul(set, stream, ix.qb, s.qr, l.q_lora, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
++    if (qi and !two_qb) try projection.matmul(set, stream, ix.qb, s.qr, l.q_lora, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
+ }
+ 
+ /// One sequence's rows r0..r0 + rows at pos: latent and index keys written, dense then sparse attention into s.ol.
+diff --git a/zig/src/families/glm/cuda_mm.zig b/zig/src/families/glm/cuda_mm.zig
+index 0197d8d2..1aed3d1f 100644
+--- a/zig/src/families/glm/cuda_mm.zig
++++ b/zig/src/families/glm/cuda_mm.zig
+@@ -85,6 +85,9 @@ pub const Kernels = struct {
+     q8: cuda.Function, // glm_q8_rows: a prompt's bf16 rows to int8 with a scale per row and 64- or 32-group (TF_GLM_W8A8)
+     mm8a8: [2][2]cuda.Function, // [64-, 32-groups][glm_mm8a8_64s3r (to 1024 rows), _128s3r]: int8 rows by the 8-bit codes
+     a8: ?A8 = null, // TF_GLM_W8A8=1: the int8 rows' scratch; null: packed prompts stay on bf16 rows (the default)
++    two: ?[4][3]cuda.Function = null, // glm_mm{16,4,6,8}_{16,32,64}t: two decode problems a launch, each its own K slices
++    reduce_two: ?cuda.Function = null, // glm_mm_reduce_two: both problems' slices, glm_mm_reduce's sums
++    two_on: bool = true, // TF_GLM_MM_TWO=0: the two problems take their own launches (the same bits either way)
+ 
+     pub fn load(m: cuda.Module) !Kernels {
+         var k: Kernels = .{ .by_rows = undefined, .packed_rows = undefined, .packed_prompt = undefined, .pair = undefined, .tile_packed = undefined, .prompt = try m.function("glm_mm16_rows"), .reduce = try m.function("glm_mm_reduce"), .tile = try m.function("glm_mm_tile16"), .pdl = true, .q8 = try m.function("glm_q8_rows"), .mm8a8 = .{
+@@ -105,13 +108,21 @@ pub const Kernels = struct {
+             k.packed_prompt[wi] = try m.function(std.fmt.comptimePrint("glm_mm{d}_128s2", .{b}));
+             try k.packed_prompt[wi].allowDynamicShared(sharedBytesStages(b, 128, 2));
+         }
++        var two: [4][3]cuda.Function = undefined;
+         inline for (widths, 0..) |b, wi| {
+             k.pair[wi] = try m.function(std.fmt.comptimePrint("glm_mm{d}_16x2", .{b}));
+             try k.pair[wi].allowDynamicShared(sharedBytes(b, 16));
++            inline for (.{ 16, 32, 64 }, 0..) |bm, i| {
++                two[wi][i] = try m.function(std.fmt.comptimePrint("glm_mm{d}_{d}t", .{ b, bm }));
++                try two[wi][i].allowDynamicShared(sharedBytes(b, bm));
++            }
+         }
++        k.two = two;
++        k.reduce_two = try m.function("glm_mm_reduce_two");
+         try k.prompt.allowDynamicShared(smem(128));
+         if (std.c.getenv("TF_GLM_PDL")) |v| k.pdl = !std.mem.eql(u8, std.mem.span(v), "0");
+         k.chain = Chain.read();
++        if (std.c.getenv("TF_GLM_MM_TWO")) |v| k.two_on = !std.mem.eql(u8, std.mem.span(v), "0");
+         return k;
+     }
+ };
+@@ -290,6 +301,75 @@ pub fn matmulPair(k: *const Kernels, s: cuda.Stream, x0: u64, x1: u64, ldx: usiz
+     return true;
+ }
+ 
++/// One problem of a two-problem decode launch: x [m][w.k] (`ldx` apart) by `w` -> out [m][w.n] bf16.
++pub const Two = struct { x: u64, ldx: usize, w: Tiled, out: u64 };
++
++/// glm_mm.cu's MmTwo and MmReduceTwo, as the kernels take them by value.
++const MmTwo = extern struct { x: [2]u64, ldx: [2]i64, w: [2]u64, s: [2]u64, out: [2]u64, part: [2]u64, n: [2]c_int, k: [2]c_int, sk: [2]c_int, cols: [2]c_int, blocks0: c_int, f32: c_int, m: c_int };
++const MmReduceTwo = extern struct { part: [2]u64, out: [2]u64, total: [2]i64, sk: [2]c_int, blocks0: c_int, f32: c_int };
++
++/// Where problem 1's partials start in a two-problem call's scratch: after problem 0's, 256-aligned.
++fn twoSecond(m: usize, n0: usize, k0: usize) usize {
++    const sk0 = splitK(n0, k0);
++    return if (sk0 > 1) std.mem.alignForward(usize, sk0 * m * n0 * 4, 256) else 0;
++}
++
++/// Bytes of fp32 partials a two-problem call of `m` decode rows needs (each problem keeps its own K slices).
++pub fn twoPartBytes(m: usize, n0: usize, k0: usize, n1: usize, k1: usize) usize {
++    const r = @min(m, 64);
++    const sk1 = splitK(n1, k1);
++    return twoSecond(r, n0, k0) + (if (sk1 > 1) sk1 * r * n1 * 4 else 0);
++}
++
++/// Two decode linears of one width in one launch (DSA's [q_a | kv_a] with the indexer's kw, q_b with the indexer's
++/// qb), each with its own shape and its own K slices (splitK of its shape, as `matmul` takes them): the launch's
++/// blocks are the two calls' blocks and one reduce adds each problem's slices as glm_mm_reduce does, so outputs are two
++/// `matmul` calls' bit for bit. `part` holds `part_bytes`; false (nothing launched) when the kernels, the switch
++/// (TF_GLM_MM_TWO), the rows (a decode window's, at most 64), the widths, the shapes or the scratch do not fit.
++pub fn matmulTwo(k: *const Kernels, s: cuda.Stream, p: [2]Two, part: u64, part_bytes: usize, m: usize) !bool {
++    const fs = k.two orelse return false;
++    const red = k.reduce_two orelse return false;
++    if (!k.two_on or m == 0 or m > 64 or p[0].w.bits != p[1].w.bits) return false;
++    for (p) |q| if (q.w.k % 64 != 0 or q.w.n % 8 != 0 or q.x % 16 != 0 or q.ldx % 8 != 0) return false;
++    if (twoPartBytes(m, p[0].w.n, p[0].w.k, p[1].w.n, p[1].w.k) > part_bytes) return false;
++    const wi = widthIndex(p[0].w.bits) catch return false;
++    const i: usize = if (m <= 16) 0 else if (m <= 32) 1 else 2;
++    const bm = bucket(i);
++    var t: MmTwo = undefined;
++    var r: MmReduceTwo = undefined;
++    for (p, 0..) |q, z| {
++        const sk = splitK(q.w.n, q.w.k);
++        t.x[z] = q.x;
++        t.ldx[z] = @intCast(q.ldx);
++        t.w[z] = q.w.w;
++        t.s[z] = q.w.s;
++        t.out[z] = q.out;
++        t.part[z] = part + if (z == 0) 0 else twoSecond(m, p[0].w.n, p[0].w.k);
++        t.n[z] = @intCast(q.w.n);
++        t.k[z] = @intCast(q.w.k);
++        t.sk[z] = @intCast(sk);
++        t.cols[z] = @intCast((q.w.n + 63) / 64);
++        r.part[z] = t.part[z];
++        r.out[z] = q.out;
++        r.total[z] = if (sk > 1) @intCast(m * q.w.n) else 0; // a problem of one slice writes its outputs itself
++        r.sk[z] = @intCast(sk);
++    }
++    t.blocks0 = t.cols[0] * t.sk[0];
++    t.f32 = 0;
++    t.m = @intCast(m);
++    var a: cuda.Args = .{};
++    a.add(t);
++    const blocks: u32 = @intCast(t.blocks0 + t.cols[1] * t.sk[1]);
++    try cuda.launch.launch(fs[wi][i], .{ .grid = .{ .x = blocks }, .block = .{ .x = if (bm <= 32) 128 else 256 }, .shared = sharedBytes(p[0].w.bits, bm), .pdl = k.pdl }, s, &a);
++    if (r.total[0] + r.total[1] == 0) return true;
++    r.blocks0 = @intCast(@divTrunc(r.total[0] + 255, 256));
++    r.f32 = 0;
++    var b: cuda.Args = .{};
++    b.add(r);
++    try cuda.launch.launch(red, .{ .grid = .{ .x = @intCast(r.blocks0 + @divTrunc(r.total[1] + 255, 256)) }, .block = .{ .x = 256 } }, s, &b);
++    return true;
++}
++
+ /// Packed rows (cuda_qpack's) and fp16 scales [n][k / 64] at `src`, `ss` tiled into `dst`, `ds` (`bits` 4/6/8).
+ pub fn tilePacked(k: *const Kernels, s: cuda.Stream, bits: u8, src: u64, ss: u64, dst: u64, ds: u64, n: usize, kk: usize) !void {
+     const wi = try widthIndex(bits);
+diff --git a/zig/src/families/glm/cuda_proj.zig b/zig/src/families/glm/cuda_proj.zig
+index b6117f87..f99958b9 100644
+--- a/zig/src/families/glm/cuda_proj.zig
++++ b/zig/src/families/glm/cuda_proj.zig
+@@ -24,6 +24,25 @@ pub fn matmul(set: glue.Set, stream: cuda.Stream, w: Proj, x: u64, x_stride: usi
+     }
+ }
+ 
++/// Two bf16-stored projections of a decode window in one glm_mm launch, each with its own shape and K slices
++/// (cuda_mm.matmulTwo): out[z] [m][n[z]] bf16 = x[z] . w[z], `matmul`'s bits. False (nothing launched) unless both are
++/// tiled linears of one width, the window is a decode one, and `part` (`part_bytes`) holds both problems' slices.
++pub fn matmulTwo(set: glue.Set, stream: cuda.Stream, w: [2]Proj, x: [2]u64, x_stride: [2]usize, out: [2]u64, n: [2]usize, k: [2]usize, part: u64, part_bytes: usize, m: usize) !bool {
++    const mk = set.mm orelse return false;
++    if (set.prompt) return false;
++    const mm = @import("cuda_mm.zig");
++    var p: [2]mm.Two = undefined;
++    for (&p, w, x, x_stride, out, n, k) |*q, wz, xz, sz, oz, nz, kz| {
++        const b = switch (wz) {
++            .bf16 => |b| b,
++            .fp8g, .mxfp8 => return false,
++        };
++        if (kz % b16.bk != 0) return false;
++        q.* = .{ .x = xz, .ldx = sz, .w = if (set.packs) |pk| pk.tiled(b, nz, kz) else .{ .w = b, .n = nz, .k = kz }, .out = oz };
++    }
++    return mm.matmulTwo(mk, stream, p, part, part_bytes, m);
++}
++
+ /// error.SlicePartialsNotHeld when `matmul` would refuse `w` on `lane` at some row count: the loader's check.
+ pub fn fits(lane: *const cuda.qmmf.Lane, w: cuda.qmmf.Weight) error{SlicePartialsNotHeld}!void {
+     // one row stands for all: under qmmf.fused_rows the plan is the same for every row count, and over it none reduces
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index 008eebe2..14b09845 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -132,6 +132,36 @@ fn b16Shapes(w: *const weights.Weights) [12][2]usize {
+     };
+ }
+ 
++/// The DSA layer's two-problem decode launches: [q_a | kv_a] with the indexer's kw, q_b with the indexer's qb (n, k each).
++fn twoShapes(w: *const weights.Weights) [2][4]usize {
++    const c = &w.config;
++    const s = &w.share;
++    return .{
++        .{ c.q_lora + c.kv_lora, c.hidden, c.i_dim + c.i_heads, c.hidden },
++        .{ s.mla.len() * c.nope, c.q_lora, c.i_heads * c.i_dim, c.q_lora },
++    };
++}
++
++test "GLM TP3: decode scratch holds both problems' K slices of the DSA two-problem launches, worlds 1 to 4" {
++    const c = @import("config.zig").Config{};
++    const Share = @import("cuda_shard.zig").Share;
++    const mm_mod = @import("cuda_mm.zig");
++    for ([_]usize{ 1, 2, 3, 4 }) |world| for (0..world) |rank| {
++        const w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = try Share.of(&c, rank, world) };
++        for ([_]usize{ 1, 2, 8, 16, 17, 32 }) |rows| {
++            var mm: usize = 4;
++            for (b16Shapes(&w)) |sh_| mm = @max(mm, b16.partBytes(@min(rows, b16.rows_from - 1), sh_[0], sh_[1]));
++            for (twoShapes(&w)) |t| mm = @max(mm, mm_mod.twoPartBytes(rows, t[0], t[1], t[2], t[3]));
++            for (twoShapes(&w)) |t| {
++                // each problem alone fits too (the fallback's two calls), and two problems' slices never overlap
++                try std.testing.expect(mm_mod.partBytes(rows, .{ .w = 0, .n = t[0], .k = t[1] }) <= mm);
++                try std.testing.expect(mm_mod.partBytes(rows, .{ .w = 0, .n = t[2], .k = t[3] }) <= mm);
++                try std.testing.expect(mm_mod.partBytes(rows, .{ .w = 0, .n = t[0], .k = t[1] }) + mm_mod.partBytes(rows, .{ .w = 0, .n = t[2], .k = t[3] }) <= mm_mod.twoPartBytes(rows, t[0], t[1], t[2], t[3]));
++            }
++        }
++    };
++}
++
+ test "GLM TP3: existing scratch covers raw projections through the 127-row split-K boundary" {
+     const c = @import("config.zig").Config{};
+     const Share = @import("cuda_shard.zig").Share;
+@@ -232,6 +262,10 @@ pub const Buffers = struct {
+         var mm: usize = 4;
+         // windows under rows_from rows keep their K slices apart (a prompt's tail chunk on the prefill buffers too)
+         for (b16Shapes(w)) |sh_| mm = @max(mm, b16.partBytes(@min(rows, b16.rows_from - 1), sh_[0], sh_[1]));
++        // a decode window's two-problem DSA launches (cuda_mm.matmulTwo) hold both problems' slices at once
++        if (!prefill) for (twoShapes(w)) |t| {
++            mm = @max(mm, @import("cuda_mm.zig").twoPartBytes(rows, t[0], t[1], t[2], t[3]));
++        };
+         var x3: [4]usize = @splat(4); // EXL3 experts: each layer's path (the prompt kernels', or the grouped one) sizes it
+         for (w.layers) |l| if (l.ffn == .moe) if (l.ffn.moe.exl3) |x| exl3.mostScratch(&x3, rows, D, ew, prefill, x);
+         if (w.mtp) |m| if (m.layer.ffn == .moe) if (m.layer.ffn.moe.exl3) |x| exl3.mostScratch(&x3, rows, D, ew, prefill, x);
+@@ -320,6 +354,7 @@ pub const Buffers = struct {
+                 .counts = p[41],
+                 .mm_part = p[42],
+                 .at = p[43],
++                .mm_part_bytes = mm,
+             },
+             .dense = .{ .tmp = p[44], .gu = p[45], .act = p[46], .xs_act = p[47], .mm_part = p[42] },
+             .moe = .{ .mlog = p[48], .router_part = p[26], .pick = p[49], .wts = p[50], .plan = .{ .members = p[51], .items = p[52], .counts = p[53], .rank = p[54], .hist = p[55] }, .eact = p[56], .ey = p[57], .sgu = p[58], .sact = p[59], .sxs = p[60], .sy = p[61], .mm_part = p[42] },

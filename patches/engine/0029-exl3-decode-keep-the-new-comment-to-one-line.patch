@@ -1,0 +1,28 @@
+From ebc2ca70aa92cdbffdbe6afea8f9fa004ec3bbfb Mon Sep 17 00:00:00 2001
+From: Adam Hillson <598804+BadAd84@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 13:51:33 +0000
+Subject: [PATCH 29/63] exl3 decode: keep the new comment to one line
+
+The lean check allows one comment line of at most 120 columns, and the helper's comment was two lines, which the
+gate reported as one new problem (428 against 427 on the base). One line, same content.
+---
+ zig/kernels/cuda/exl3_decode.cuh | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/zig/kernels/cuda/exl3_decode.cuh b/zig/kernels/cuda/exl3_decode.cuh
+index 982cb7e2..b271bbbd 100644
+--- a/zig/kernels/cuda/exl3_decode.cuh
++++ b/zig/kernels/cuda/exl3_decode.cuh
+@@ -51,8 +51,7 @@ __device__ __forceinline__ void load_lane_words(const uint32_t* tile, int lane,
+     for (int i = 0; i < lane_words<K2>(); ++i) w[i] = tile[(word + i) % tile_words<K2>()];
+ }
+ 
+-// A trellis word through the read-only path without allocating in L1: the weight stream is read once, so a
+-// line kept in L1 evicts something that will be reused. Same value as __ldg, cache policy only.
++// The weight stream is read once, so do not allocate L1 for it: same value as __ldg, cache policy only.
+ __device__ __forceinline__ uint32_t ldg_stream_u32(const uint32_t* p) {
+     uint32_t v;
+     asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];" : "=r"(v) : "l"(p));
+-- 
+2.53.0
+

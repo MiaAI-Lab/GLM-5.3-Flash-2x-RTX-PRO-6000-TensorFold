@@ -1,0 +1,108 @@
+integ5 0072 = patches/glue5/0067-glm-greedy-rows-one-launch.patch (overnight 2026-10-31), renumbered for the integrated stack on 3f94715d.
+
+glm cuda: a window's greedy picks in one launch, and a shared window's in one pick (T3 candidate 1, glue5)
+
+- tf_glm_top1_rows (glm_glue_rows.cuh): block r runs tf_glm_top1's body on row r (rows `ld` apart, words 4 apart),
+  so each row's (value, id) words are a per-row launch's bit for bit.
+- cuda_engine_pick.greedyRows: one tf_glm_top1_rows launch for the window's rows instead of a tf_glm_top1 launch a
+  row; the gather, sync, read and chance.pick per row are unchanged.
+- Engine.verifyShared: when no part is structured or sampled (the same on every rank: Engine.structured comes with
+  the step's header, a stream's sampling with its begin), every part's rows take one greedyRows call (one launch, one
+  gather of world x rows x 16 B, one sync, one read) instead of one per part; each part's rows_at is bound as before.
+  Mixed or sampled windows keep the per-part draws.
+- Exact: the same tokens from the same words; no arithmetic changes. Collectives per shared round drop from one per
+  part to one, on every rank alike (both ranks run this binary).
+
+diff --git a/zig/kernels/cuda/glm_glue_rows.cuh b/zig/kernels/cuda/glm_glue_rows.cuh
+index d3c5923c..7eb5142a 100644
+--- a/zig/kernels/cuda/glm_glue_rows.cuh
++++ b/zig/kernels/cuda/glm_glue_rows.cuh
+@@ -246,6 +246,12 @@ extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1_sums(const unsign
+                                                                      unsigned lo, unsigned* out) {
+   glm_top1<true>(logits, n, lo, out);
+ }
++// A window's greedy picks in one launch: block r runs tf_glm_top1 on row r (rows `ld` logits apart, words 4 apart),
++// so each row's words are a per-row launch's bit for bit.
++extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1_rows(const unsigned short* logits, int64_t n,
++                                                                     int64_t ld, unsigned lo, unsigned* out) {
++  glm_top1<false>(logits + static_cast<int64_t>(blockIdx.x) * ld, n, lo, out + static_cast<int64_t>(blockIdx.x) * 4);
++}
+ 
+ // The leader's step for the other ranks, written to the link's buffer from launch arguments (cuda_follow's Link.send).
+ struct tf_glm_words {
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 1248a1f0..71e29d10 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -620,6 +620,20 @@ pub const Engine = struct {
+         const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .taps = if (e.drafter) |dr| dr.taps(false) else null, .side = e.side, .moe_fuse = e.moe_fuse };
+         try f.run(@ptrCast(ids[0..rows]));
+         if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
++        // every part greedy (no grammar, no sampled stream; the same on every rank): all rows in one pick, one launch,
++        // one gather, one sync and one read, each row's token as its part's own draw picks it
++        var all_greedy = !e.structured;
++        for (parts) |p| all_greedy = all_greedy and e.seqs.items[p.slot].?.sampling == null;
++        if (all_greedy) {
++            var outs: [shared_rows]u32 = undefined;
++            for (parts, segs[0..parts.len]) |p, g| {
++                try e.bind(p.slot);
++                e.cur.rows_at = b.fnormed + g.row0 * e.c.hidden * 2;
++            }
++            try @import("cuda_engine_pick.zig").greedyRows(e, b.logits, rows, outs[0..rows]);
++            for (parts, segs[0..parts.len]) |p, g| @memcpy(p.out[0..g.rows], outs[g.row0..][0..g.rows]);
++            return;
++        }
+         for (parts, segs[0..parts.len]) |p, g| {
+             try e.bind(p.slot);
+             e.cur.rows_at = b.fnormed + g.row0 * e.c.hidden * 2;
+diff --git a/zig/src/families/glm/cuda_engine_pick.zig b/zig/src/families/glm/cuda_engine_pick.zig
+index 17a96515..24f7e3a8 100644
+--- a/zig/src/families/glm/cuda_engine_pick.zig
++++ b/zig/src/families/glm/cuda_engine_pick.zig
+@@ -13,23 +13,23 @@ pub fn greedyChance(e: *Engine, logits: u64) !chance.Pick {
+     return pick(e, logits, true);
+ }
+ 
+-/// Greedy picks of a window's `rows` rows: a top-1 launch a row, then one gather of every rank's words, one sync and
+-/// one read (rank order [world][rows]), each row picked as `greedy` picks it. A follower's verify rows
+-/// (Engine.discard_draws) join the gather and stop there: rank 0 alone reads the tokens.
++/// Greedy picks of a window's `rows` rows (logits rows V apart): one top-1 launch of a block a row (tf_glm_top1_rows,
++/// tf_glm_top1's words for each), then one gather of every rank's words, one sync and one read (rank order
++/// [world][rows]), each row picked as `greedy` picks it. A follower's verify rows (Engine.discard_draws) join the
++/// gather and stop there: rank 0 alone reads the tokens.
+ pub fn greedyRows(e: *Engine, logits: u64, rows: usize, out: []u32) !void {
+     if (rows == 0) return;
+     if (rows > @import("cuda_engine.zig").pick_rows) return error.WindowTooWide;
+     const world = e.share.world;
+     const V = e.share.vocab.len();
+     const mine = e.pairs.ptr + e.share.rank * rows * pair_bytes;
+-    for (0..rows) |r| {
+-        var a: cuda.Args = .{};
+-        a.add(logits + r * V * 2);
+-        a.add(@as(i64, @intCast(V)));
+-        a.add(@as(u32, @intCast(e.share.vocab.lo)));
+-        a.add(mine + r * pair_bytes);
+-        try cuda.launch.launch(e.m.glue.top1, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, e.stream, &a);
+-    }
++    var a: cuda.Args = .{};
++    a.add(logits);
++    a.add(@as(i64, @intCast(V)));
++    a.add(@as(i64, @intCast(V))); // the rows' stride
++    a.add(@as(u32, @intCast(e.share.vocab.lo)));
++    a.add(mine);
++    try cuda.launch.launch(e.m.glue.top1_rows, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, e.stream, &a);
+     const stamp = @import("cuda_prof.zig").span(e.profiling_prompt, e.stream, .token_gather);
+     if (e.group) |g| try g.allGather(e.stream, mine, e.pairs.ptr, rows * pair_bytes) else try e.lib.check(e.lib.api.ncclAllGather(mine, e.pairs.ptr, rows * pair_bytes, .u8, e.comm, e.stream.handle), "ncclAllGather");
+     stamp.end();
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index d57cf202..a40f9af5 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -28,6 +28,7 @@ pub const Kernels = struct {
+     slice_sum: cuda.Function,
+     top1: cuda.Function,
+     top1_sums: cuda.Function,
++    top1_rows: cuda.Function, // a window's greedy picks, a block a row: tf_glm_top1's words for each
+     put_words: cuda.Function,
+     p2p_gather: cuda.Function, // the TP group's peer-store all-gather (cuda/p2p_gather.zig)
+     embed_b16: cuda.Function,

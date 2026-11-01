@@ -1,0 +1,53 @@
+From 906ffa38ebd443edfe73f6ea90824ed49905bd80 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 14:35:09 +0200
+Subject: [PATCH 08/13] glm cuda: no target MTP prompt pass beside a drafter
+
+With --drafter (DFlash2) every draft is the drafter block's (cuda_lanes draftFn ->
+draftBlock), and the target MTP layer's caches are never read: f.mtp runs only in the prompt
+paths and in Engine.draft, which DFlash2 never reaches. A prompt chunk still absorbed every
+row into those caches, a whole DSA + MoE layer a pass. prefillChunk and prefillMany now skip
+it when a drafter is loaded; mtp_len stays 0, as snapshots and the next prompt expect.
+Replies do not change.
+
+Measured from nsys at 2x RTX PRO 6000: the MTP pass took 28-41 ms of a 830-935 ms traced
+2048-row pass (3.4-4.4%).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNmHb8tWDWv2KnBDVCM
+---
+ zig/src/families/glm/cuda_engine.zig  | 4 +++-
+ zig/src/families/glm/cuda_prompts.zig | 2 +-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 99de5870..d1a1a50f 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -403,7 +403,9 @@ pub const Engine = struct {
+         if (f.prof) |p| p.mark(e.stream, .draw);
+         if (last) try e.holdPrompt(e.bp.fnormed + (rows - 1) * e.c.hidden * 2);
+         stamp = prof_mod.span(f.prof, e.stream, .mtp);
+-        if (e.mtp) {
++        // With a drafter (DFlash2) every draft is its block's (cuda_lanes draftFn); the target MTP layer's caches are never
++        // read, so the prompt does not absorb into them (mtp_len stays 0, as snapshots and the next prompt expect).
++        if (e.mtp and e.drafter == null) {
+             const nxt = as_i32[1..];
+             if (nxt.len > 0) { // decode._absorb_rows
+                 const mp = f.prof;
+diff --git a/zig/src/families/glm/cuda_prompts.zig b/zig/src/families/glm/cuda_prompts.zig
+index b66392f4..6e6f3032 100644
+--- a/zig/src/families/glm/cuda_prompts.zig
++++ b/zig/src/families/glm/cuda_prompts.zig
+@@ -53,7 +53,7 @@ pub fn pass(e: anytype, parts: []const engine.Prompt, firsts: []u32, comptime Fo
+     for (parts, segs[0..parts.len]) |p, g| {
+         one[0] = .{ .w = &e.w, .st = g.st, .b = &e.bp };
+         // decode._absorb_rows; the head's pass writes final-norm row 0, which the hold rows above already copied
+-        if (e.mtp and g.rows > 1) {
++        if (e.mtp and e.drafter == null and g.rows > 1) { // with a drafter the target MTP caches are never read (cuda_engine)
+             try f.mtp(@ptrCast(p.ids[1..]), &.{e.bp.fnormed + g.row0 * D * 2});
+             try g.st.setMtpLen(e.stream, g.st.mtp_len + g.rows - 1);
+         }
+-- 
+2.53.0
+

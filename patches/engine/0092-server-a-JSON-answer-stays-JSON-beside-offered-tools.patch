@@ -1,0 +1,310 @@
+From: SvangenStudios <svangenstudios@outlook.com>
+Subject: server: a JSON answer stays JSON beside offered tools
+
+response_format (json_object, json_schema), guided_json and structured_outputs' json constrain the reply to JSON. When
+the same request also offered tools (agent clients always send theirs), the finished JSON still went through the
+tool-call path: a schema answer shaped like {"name": ..., "arguments": ...} came back as tool_calls with its content
+removed, and the streamed path hid or held back text that only quotes tool-call markers. chat.prepare now picks the
+reply's channel from the built request.structure; on the JSON channel the output side treats the answer as data. The
+tools stay in the prompt, so prompts are unchanged. tool_choice required (a structural tag), guided_regex, guided_choice
+and ordinary replies keep their path.
+
+Adapted to this engine by Mia's AI Lab from SvangenStudios' 0042 on
+https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold (PR #31); the test is new.
+
+diff --git a/zig/build/server.zig b/zig/build/server.zig
+index c5a6cd76..2db41f9b 100644
+--- a/zig/build/server.zig
++++ b/zig/build/server.zig
+@@ -69,6 +69,10 @@ pub fn toolHostTests(b: *std.Build, parser: *std.Build.Module, server: *std.Buil
+     const http = b.addRunArtifact(b.addTest(.{ .root_module = server, .filters = &.{"tool visibility HTTP:"} }));
+     http.has_side_effects = true;
+     b.step("test-tool-visibility-http-host", "Rejected tool envelopes survive actual chat JSON and SSE replies").dependOn(&http.step);
++    const json_answer = b.addRunArtifact(b.addTest(.{ .root_module = server, .filters = &.{"JSON answer:"} }));
++    json_answer.has_side_effects = true;
++    all.dependOn(&json_answer.step);
++    b.step("test-json-answer-host", "A JSON answer stays JSON beside offered tools, in actual chat JSON and SSE replies").dependOn(&json_answer.step);
+     const deepseek = b.addRunArtifact(b.addTest(.{ .root_module = server, .filters = &.{"DeepSeek chat:"} }));
+     deepseek.has_side_effects = true;
+     all.dependOn(&deepseek.step);
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 41ce3580..c4c9dc2b 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -46,7 +46,11 @@ pub const Sink = struct {
+     begin: ?*const fn (ctx: *anyopaque, prompt_len: usize) error{Closed}!void = null,
+ };
+ 
++/// A JSON answer is data; offered tools still belong in its prompt.
++pub const ResponseChannel = enum { automatic, structured_json };
++
+ pub const Reply = struct {
++    response_channel: ResponseChannel = .automatic,
+     content: []const u8,
+     stop_sequence: ?[]const u8,
+     reasoning: ?[]const u8,
+@@ -107,6 +111,7 @@ fn flag(f: Value, key: []const u8) ?bool {
+ 
+ /// A request rendered and checked but not submitted; it holds the preparing count until generate or release.
+ pub const Prepared = struct {
++    response_channel: ResponseChannel = .automatic,
+     input: Input,
+     request: api.Request,
+     prompt_len: usize,
+@@ -199,7 +204,11 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+     }
+     if (input.logprobs) |count| request.logprobs = try @import("logprobs.zig").admit(srv, cx, thinking, request.think_budget, count);
+     request.prompt_logprobs = input.prompt_logprobs;
+-    return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .token_ids = flag(f, "return_token_ids") orelse false, .stops = stops_opt, .preparing = preparing };
++    const response_channel: ResponseChannel = if (request.structure) |st| switch (st.kind) {
++        .json, .json_schema => .structured_json,
++        else => .automatic,
++    } else .automatic;
++    return .{ .response_channel = response_channel, .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .token_ids = flag(f, "return_token_ids") orelse false, .stops = stops_opt, .preparing = preparing };
+ }
+ 
+ /// Submit a prepared request and collect its reply; ``sink`` hears the stream (null: not streamed).
+@@ -243,12 +252,12 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+     };
+     srv.release(preparing, null); // a background request waits only while a foreground one prepares
+     preparing = false;
+-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop };
++    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .response_channel = prepared.response_channel, .tools = if (prepared.response_channel == .structured_json) &.{} else input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop };
+     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
+     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
+     const result: Failure!Reply = blk: {
+         if (sink) |s| if (s.begin) |begin| begin(s.ctx, prepared.prompt_len) catch break :blk error.Cancelled;
+-        if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
++        if (sink != null and gen.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, gen.tools) catch |e| break :blk e;
+         gen.loop(gone) catch |e| break :blk e;
+         break :blk gen.finish(cx, prepared.prompt_len, received, thinking, effort, prepared.sampled, prepared.drafts);
+     };
+@@ -287,7 +296,8 @@ const Generation = struct {
+     ignore_eos: bool,
+     max_tokens: u32,
+     token_ids: bool, // "return_token_ids": the response's tensorfold block carries the reply's token ids
+-    tools: []const Value,
++    response_channel: ResponseChannel = .automatic,
++    tools: []const Value, // none on the JSON channel: the answer is data, whatever it looks like
+     calls: ?tool_stream.Streamer = null,
+     collected: std.ArrayList(u32) = .empty,
+     visible: reply_text.Incremental = .{},
+@@ -370,7 +380,7 @@ const Generation = struct {
+         }
+         answer = try tool_lfm2.dsml(g.a, answer, g.tools, false); // the answer only, so a call the reasoning mentions is not made
+         const shown = if (g.calls != null) try reply_text.hideInto(g.a, &g.hidden, answer, false, true) else answer;
+-        const vis = reply_text.heldBack(reply_text.streamingVisible(shown), g.calls != null);
++        const vis = if (g.response_channel == .structured_json) shown else reply_text.heldBack(reply_text.streamingVisible(shown), g.calls != null);
+         const copied = @intFromPtr(vis.ptr) >= @intFromPtr(g.hidden.items.ptr) and @intFromPtr(vis.ptr) <= @intFromPtr(g.hidden.items.ptr) + g.hidden.items.len;
+         const delta = g.streamed.after(vis, !copied);
+         if (delta.len > 0) {
+@@ -488,7 +498,7 @@ const Generation = struct {
+             const r = reply_text.pyStrip(split.reasoning);
+             reasoning = if (r.len > 0) r else null;
+             content = split.answer;
+-        } else {
++        } else if (g.response_channel != .structured_json) {
+             const h = reply_text.parseHarmony(text);
+             content = h.content;
+             reasoning = h.reasoning;
+@@ -560,6 +570,7 @@ const Generation = struct {
+         };
+         const think_end: ?u32 = if (thinking) g.srv.text.tokenId(g.srv.markers.close) else null;
+         const reply: Reply = .{
++            .response_channel = g.response_channel,
+             .content = content,
+             .stop_sequence = g.stops.matched(raw),
+             .reasoning = reasoning,
+diff --git a/zig/src/server/json_answer_test.zig b/zig/src/server/json_answer_test.zig
+new file mode 100644
+index 00000000..ac356bef
+--- /dev/null
++++ b/zig/src/server/json_answer_test.zig
+@@ -0,0 +1,137 @@
++//! A JSON answer stays JSON beside offered tools: response_format and guided_json replies are data, never tool calls,
++//! whole or streamed. Other replies keep their tool-call path. No GPU or xgrammar library: the compiler is a stub.
++const std = @import("std");
++const api = @import("engine_api");
++const server = @import("root.zig");
++const json = server.json;
++const late = @import("late_system_test.zig");
++const t = std.testing;
++
++const Compile = struct {
++    fn compiler(c: *Compile) api.grammar.Compiler {
++        var out: api.grammar.Compiler = undefined;
++        out.h = c;
++        out.words = 4;
++        out.mutex = .init;
++        out.f.compile = compile;
++        out.f.free = free;
++        out.f.close = free;
++        return out;
++    }
++    fn compile(ptr: *anyopaque, _: c_int, _: [*]const u8, _: usize, _: [*]u8, _: usize) callconv(.c) ?*anyopaque {
++        return ptr;
++    }
++    fn free(_: *anyopaque) callconv(.c) void {}
++};
++
++const head =
++    \\{"model":"m","max_tokens":128,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{}}}}]
++;
++// Short replies: the fixture emits a byte a token, and its unread socket holds about 40 SSE deltas.
++const looks_like_call = "{\"name\":\"f\",\"arguments\":{}}";
++const json_forms = [_][]const u8{
++    \\"response_format":{"type":"json_object"}
++    ,
++    \\"response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{"type":"object"}}}
++    ,
++    \\"guided_json":{"type":"object"}
++    ,
++    \\"structured_outputs":{"json":{"type":"object"}}
++    ,
++};
++
++const Seen = struct { content: []const u8, calls: usize, finish: []const u8 };
++
++fn ask(a: std.mem.Allocator, form: []const u8, reply: []const u8, streaming: bool) !Seen {
++    var text: late.DropLate = .{};
++    var backend: late.Capture = .{ .reply = reply };
++    defer t.allocator.free(backend.prompt);
++    const srv = try server.Server.init(t.allocator, t.io, backend.engine(), text.text(), .{
++        .served_name = "m",
++        .model_ids = &.{"m"},
++        .enable_thinking = false,
++        .use_drafts = false,
++    }, null);
++    defer srv.deinit();
++    srv.info.structures = true;
++    var compile: Compile = .{};
++    var compiler = compile.compiler();
++    srv.grammars = &compiler;
++    const body = try std.mem.concat(a, u8, &.{ head, if (form.len > 0) "," else "", form, if (streaming) ",\"stream\":true}" else "}" });
++    const got = try late.exchange(srv, "/v1/chat/completions", body);
++    defer t.allocator.free(got.body);
++    try t.expectEqual(@as(u16, 200), got.status);
++    if (!streaming) {
++        const choice = (try json.parse(a, got.body)).ok.get("choices").?.array[0];
++        const message = choice.get("message").?;
++        const content = message.get("content");
++        const calls = message.get("tool_calls");
++        return .{
++            .content = if (content != null and content.? == .string) try a.dupe(u8, content.?.string) else "",
++            .calls = if (calls != null and calls.? == .array) calls.?.array.len else 0,
++            .finish = try a.dupe(u8, choice.get("finish_reason").?.string),
++        };
++    }
++    var content: std.ArrayList(u8) = .empty;
++    var calls: usize = 0;
++    var finish: []const u8 = "";
++    var lines = std.mem.splitScalar(u8, got.body, '\n');
++    while (lines.next()) |line| {
++        if (!std.mem.startsWith(u8, line, "data: ")) continue;
++        const data = std.mem.trim(u8, line[6..], "\r");
++        if (std.mem.eql(u8, data, "[DONE]")) continue;
++        for ((try json.parse(a, data)).ok.get("choices").?.array) |choice| {
++            const delta = choice.get("delta").?;
++            if (delta.get("content")) |part| if (part == .string) try content.appendSlice(a, part.string);
++            // a call streams its name once, then its arguments
++            if (delta.get("tool_calls")) |c| for (c.array) |call| {
++                if (call.get("function").?.get("name") != null) calls += 1;
++            };
++            if (choice.get("finish_reason")) |reason| if (reason == .string) {
++                finish = try a.dupe(u8, reason.string);
++            };
++        }
++    }
++    return .{ .content = content.items, .calls = calls, .finish = finish };
++}
++
++fn staysJson(reply: []const u8) !void {
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    for (json_forms) |form| for ([_]bool{ false, true }) |streaming| {
++        const seen = try ask(arena.allocator(), form, reply, streaming);
++        try t.expectEqualStrings(reply, seen.content);
++        try t.expectEqual(@as(usize, 0), seen.calls);
++        try t.expectEqualStrings("stop", seen.finish);
++    };
++}
++
++fn staysCall(form: []const u8, reply: []const u8) !void {
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    for ([_]bool{ false, true }) |streaming| {
++        const seen = try ask(arena.allocator(), form, reply, streaming);
++        try t.expectEqual(@as(usize, 1), seen.calls);
++        try t.expectEqualStrings("tool_calls", seen.finish);
++    }
++}
++
++test "JSON answer: one shaped like a tool call stays the content, whole and streamed" {
++    try staysJson(looks_like_call);
++}
++
++test "JSON answer: tool-call markers inside its strings are neither parsed nor hidden" {
++    try staysJson("{\"a\":\"<tool_call>x</tool_call>\"}");
++}
++
++test "JSON answer: think markers inside its strings stay" {
++    try staysJson("{\"a\":\"<think>x</think>\"}");
++}
++
++test "JSON answer: an ordinary reply beside tools keeps its tool call" {
++    try staysCall("", looks_like_call);
++}
++
++test "JSON answer: a guided_regex reply is not on the JSON channel" {
++    try staysCall("\"guided_regex\":\".*\"", looks_like_call);
++}
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index 975b31ab..74e6c22d 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -330,6 +330,7 @@ const Run = struct {
+ 
+     /// ``ToolCallPolicy.finish``: the reply's calls parsed out of its content.
+     fn attachCalls(r: *Run, reply: *chat.Reply) Allocator.Error!?[]Value {
++        if (reply.response_channel == .structured_json) return null;
+         const tools = r.plan.input.tools;
+         if (tools.len == 0) return null;
+         const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
+@@ -505,21 +506,22 @@ const Run = struct {
+ 
+     fn stream(r: *Run, gone: Gone, field: []const u8) void {
+         const a = r.a;
+-        const tools = r.plan.input.tools.len > 0;
++        const has_tools = r.plan.input.tools.len > 0;
+         var cx: Cx = .{ .a = a };
+         // Context-window refusals stay streamed; other pre-admission refusals retain their HTTP status.
+         var compaction: ?compact.Stamp = null;
+         const prepared = if (r.srv.config.compact_at == null) chat.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
+-            if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
++            if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, has_tools, field);
+             return r.unsent(&cx, e, field);
+         } else blk: {
+             const ready = compact.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
+-                if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
++                if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, has_tools, field);
+                 return r.unsent(&cx, e, field);
+             };
+             compaction = ready.stamp;
+             break :blk ready.prepared;
+         };
++        const tools = has_tools and prepared.response_channel != .structured_json;
+         var handed = false; // generate gives the preparing count back from here on
+         defer if (!handed) r.srv.release(prepared.preparing, prepared.request);
+         var sink_state: StreamSink = .{ .run = r, .tools = tools, .prompt_len = prepared.prompt_len };
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index b1752587..956d7413 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -46,6 +46,7 @@ test {
+     _ = @import("tool_grammar_lfm2.zig");
+     _ = @import("tool_grammar_lfm2_test.zig");
+     _ = @import("tool_required_test.zig");
++    _ = @import("json_answer_test.zig");
+     _ = @import("grammar.zig");
+     _ = @import("pyrepr.zig");
+     _ = @import("metrics.zig");

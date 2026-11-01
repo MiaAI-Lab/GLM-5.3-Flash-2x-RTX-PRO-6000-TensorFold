@@ -1,0 +1,80 @@
+integ5 0071 = patches/pdl5/0069-glm-pdl-p2p-gather.patch (overnight 2026-10-31), renumbered for the integrated stack on 3f94715d.
+
+pdl5 0069: the P2P all-gather waits, lets the next grid launch, then exchanges (TF_GLM_PDL_CHAIN's p2p).
+- glm_glue_p2p.cuh: tf_glm_p2p_gather calls pdl_wait (for the grid that wrote mine, and so every earlier one) before it
+  touches memory, then pdl_trigger, then the unchanged exchange: flags, fences, parities, epoch and abort/timeout.
+  Its dependents (hc_post) still wait for it to complete before they read the gathered rows.
+- p2p_gather.zig: Gather.pdl (default false) on the launch; cuda_p2p.zig sets it from the chain after open.
+Needs 0068 (pdl_wait in glm_triton.cuh) and 0067 (Chain). Exact by construction.
+
+diff --git a/zig/kernels/cuda/glm_glue_p2p.cuh b/zig/kernels/cuda/glm_glue_p2p.cuh
+index e8172531..5b122412 100644
+--- a/zig/kernels/cuda/glm_glue_p2p.cuh
++++ b/zig/kernels/cuda/glm_glue_p2p.cuh
+@@ -3,6 +3,8 @@
+ 
+ #include <stdint.h>
+ 
++#include "glm_triton.cuh"
++
+ namespace glm_p2p {
+ 
+ constexpr int kMaxBlocks = 32;  // p2p_gather.zig max_blocks: a flag line per block and parity
+@@ -36,6 +38,9 @@ __device__ __forceinline__ uint64_t now_ns() {
+ // releases its flag there, acquires its own flag, then copies the peer's share from its inbox to all[peer].
+ // A rank reaches epoch e + 2 only after the peer's e + 1 flag, so a parity's slot is never written while read.
+ // A wait past timeout_ns or a raised abort word (status[0]) writes the epoch to status[1]; the host checks it.
++// Dependent launch: the gather waits for the grid that wrote `mine` (and so for every earlier one) before it touches
++// any memory, then lets the next grid launch, whose weights stream in during the exchange; that grid still waits for
++// this one to complete before it reads `all`. Flags, parities and abort handling are unchanged.
+ extern "C" __global__ void __launch_bounds__(512) tf_glm_p2p_gather(const uint4* mine, uint4* all, int64_t n16,
+                                                                      int rank, int copy_mine, uint4* peer_inbox,
+                                                                      uint32_t* peer_flags, const uint4* my_inbox,
+@@ -43,6 +48,8 @@ extern "C" __global__ void __launch_bounds__(512) tf_glm_p2p_gather(const uint4*
+                                                                      uint32_t epoch, uint64_t timeout_ns,
+                                                                      uint32_t* status) {
+   using namespace glm_p2p;
++  glm_triton::pdl_wait();
++  glm_triton::pdl_trigger();
+   const int b = blockIdx.x;
+   const int64_t per = (n16 + gridDim.x - 1) / gridDim.x;
+   const int64_t lo = min(n16, (int64_t)b * per), hi = min(n16, lo + per);
+diff --git a/zig/src/cuda/p2p_gather.zig b/zig/src/cuda/p2p_gather.zig
+index d0ece46a..4b7d91c1 100644
+--- a/zig/src/cuda/p2p_gather.zig
++++ b/zig/src/cuda/p2p_gather.zig
+@@ -54,6 +54,9 @@ pub const Gather = struct {
+     timeout_ns: u64,
+     epoch: u32 = 1,
+     gathers: u64 = 0,
++    // a dependent launch: the kernel waits for the grid before it (which wrote `mine`), then lets the next grid launch
++    // before it exchanges; that grid waits for the gather to complete before it reads `all` (the owner sets it)
++    pdl: bool = false,
+ 
+     /// Both ranks call it; it returns a gather only when both wanted it and both mapped the other's region.
+     pub fn open(gpa: std.mem.Allocator, d: *const Driver, g: *const tp_group.Group, s: Stream, f: Function, wanted: bool, cap: usize, timeout_ns: u64) !?*Gather {
+@@ -124,7 +127,7 @@ pub const Gather = struct {
+         a.add(x.epoch);
+         a.add(x.timeout_ns);
+         a.add(x.status_dev);
+-        try launch.launch(x.f, .{ .grid = .{ .x = blocksFor(bytes) }, .block = .{ .x = threads } }, s, &a);
++        try launch.launch(x.f, .{ .grid = .{ .x = blocksFor(bytes) }, .block = .{ .x = threads }, .pdl = x.pdl }, s, &a);
+         x.epoch = nextEpoch(x.epoch);
+         x.gathers += 1;
+     }
+diff --git a/zig/src/families/glm/cuda_p2p.zig b/zig/src/families/glm/cuda_p2p.zig
+index 3c7bfdca..93a0cf4e 100644
+--- a/zig/src/families/glm/cuda_p2p.zig
++++ b/zig/src/families/glm/cuda_p2p.zig
+@@ -38,7 +38,10 @@ pub fn open(gpa: std.mem.Allocator, d: *const cuda.Driver, g: *cuda.tp_group.Gro
+         break :blk Settings{ .on = false };
+     };
+     try g.openP2p(gpa, d, s, f, set.on, set.cap, set.timeout_ns);
+-    if (g.p2p) |p| std.log.info("p2p gather: the engine stream's all-gathers up to {d} KiB a rank by peer stores (TF_GLM_P2P_GATHER=0: NCCL)", .{p.cap >> 10}) else std.log.info("p2p gather: off ({s}); NCCL carries every all-gather", .{if (set.on) "a rank could not map the other's memory" else "TF_GLM_P2P_GATHER=0 on a rank"});
++    if (g.p2p) |p| {
++        p.pdl = @import("cuda_mm.zig").Chain.read().p2p; // TF_GLM_PDL_CHAIN's p2p: a rank's own launches, no agreement needed
++        std.log.info("p2p gather: the engine stream's all-gathers up to {d} KiB a rank by peer stores (TF_GLM_P2P_GATHER=0: NCCL){s}", .{ p.cap >> 10, if (p.pdl) "; dependent launch" else "" });
++    } else std.log.info("p2p gather: off ({s}); NCCL carries every all-gather", .{if (set.on) "a rank could not map the other's memory" else "TF_GLM_P2P_GATHER=0 on a rank"});
+ }
+ 
+ test "settings: on by default at 512 KiB, each knob checked" {

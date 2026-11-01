@@ -1,0 +1,254 @@
+From 197eb0c305d0aae9fbaa1700c3a8c0db70149059 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 18:27:57 +0200
+Subject: [PATCH 45/63] native: beside GLM's host tier, a device prompt cache
+ under one state goes to the KV pages
+
+Production (4 bpw, fp8 pages, reserve 3.5, --context 864,256, 4 streams) left the device prompt cache 0.176 GiB, under
+the 0.215 GiB of the smallest state (2,048 tokens), and warned at every start that the cache "cannot keep one state",
+though the 8 GiB pinned host tier a rank kept them all along: the warning priced the card's share alone.
+
+- A family that keeps states past the card (snap_host_tier: GLM) no longer funds a device share that holds no state
+  of its own: the plan gives it to the KV pages (Plan.skipped) and the store keeps states in the host tier alone. At
+  production's shape the pool grows from 1,692 to 1,749 pages (866,304 to 895,488 tokens) and the store's budget from
+  8.18 to 8.0 GiB a rank. A share that holds one state stays on the card; other families are unchanged; a cache
+  turned off (--prompt-cache-gib 0, --keep 0) skips nothing and makes no store, as before.
+- The startup warning and the prompt_cache_* metrics read the store's real budget (storeBudget: the card's share and
+  the host tier), so production's 0.18 + 8.0 GiB is quiet; a card's share alone under one state still warns.
+- The startup line says where the states went: ", the prompt cache in pinned host memory alone (the 0.18 GiB the card
+  had left it holds no state: the KV pages took it)".
+
+Why the pages and not the card (measured on this machine, both GPUs, another engine running): a 180 MiB slice of a
+kept state restores device-to-device in 0.29 ms and from pinned host pages in 7.9 ms (22 GiB/s), in the 2 MiB copies
+cuda_snapshot_pages.move issues; so the 0.18 GiB device share saves at most ~7.6 ms on one restore of the one state
+that sits on it (a 125K hit's TTFT is ~480 ms), against 57 pages (29,184 tokens) more for every stream. The KV pool
+was exactly one --context window plus 3 pages, so a request near the cap left no room beside it.
+
+Test (kv merge): production's shape gives 1,692 pages and a 0.176 GiB share without the rule, 1,749 pages and the
+host tier alone with it; storeBudget is 8 GiB then (0 with the cache off, share + host without the rule); the
+warning is quiet for both, loud for the share alone; a share of one state, or a family without a host tier, keeps it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj6TMcvsfVhxuBcBLg
+---
+ zig/src/core/kv_pool.zig        |   5 +-
+ zig/src/native/cuda.zig         |  16 +++--
+ zig/src/native/cuda_kv_pool.zig | 100 +++++++++++++++++++++++++++++---
+ 3 files changed, 106 insertions(+), 15 deletions(-)
+
+diff --git a/zig/src/core/kv_pool.zig b/zig/src/core/kv_pool.zig
+index c817bf82..a1e0cbc0 100644
+--- a/zig/src/core/kv_pool.zig
++++ b/zig/src/core/kv_pool.zig
+@@ -58,8 +58,9 @@ pub const Budget = struct {
+     engine_paged: bool = false,
+ };
+ 
+-/// The streams served, the cache's slots and copied-KV bytes, and the pages left for the streams.
+-pub const Plan = struct { lanes: u32, snaps: usize, copied: u64, pages: usize };
++/// The streams served, the cache's slots and copied-KV bytes, and the pages left for the streams; `skipped`: cache bytes
++/// a family's rule gave the pages instead (native's plan: a device share too small for one of its states).
++pub const Plan = struct { lanes: u32, snaps: usize, copied: u64, pages: usize, skipped: u64 = 0 };
+ 
+ /// The prompt cache's split: slots for its snapshots, the rest for their copied KV rows (no slot: no cache).
+ pub fn split(cache: u64, snap_bytes: u64, named: ?usize) struct { snaps: usize, copied: u64 } {
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 0e9fc899..068c4e60 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -371,8 +371,11 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     const layout = wrapped.layout;
+     var paged: ?kv_pages.Plan = null;
+     const streams = if (layout) |l| blk: {
+-        // the reserve the room was measured past, for a refusal's fit
+-        const facts: kv_pages.Facts = .{ .reserve = .{ .bytes = after.reserve, .least = @intFromFloat(budget.floor(after.unified).least * (1 << 30)), .limited = after.limit != null } };
++        // the reserve the room was measured past, for a refusal's fit; the smallest state, for the device cache's rule
++        const facts: kv_pages.Facts = .{
++            .reserve = .{ .bytes = after.reserve, .least = @intFromFloat(budget.floor(after.unified).least * (1 << 30)), .limited = after.limit != null },
++            .min_state = if (comptime @hasDecl(F, "snap_min_bytes")) F.snap_min_bytes(loaded.target) else 0,
++        };
+         paged = try kv_pages.plan(F, a, l, wrapped.room, o, @intCast(window), problem, host_cache, kv_pages.enginePaged(loaded), facts) orelse return null;
+         break :blk paged.?.lanes;
+     } else budget.admit(grow, served.stream_bytes, free, o.lanes, o.lanes_fixed) catch |e| {
+@@ -407,22 +410,23 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     h.readiness(F);
+     const held = served.stream_bytes * (streams -| free);
+     const kept = kv_pages.kept(F, loaded, paged, o, room, held, host_budget, host_cache);
+-    const cache = kept.copied;
+-    const cache_capacity = kv_pages.capacity(F, loaded, kept, @intCast(window));
++    var cache_capacity = kv_pages.capacity(F, loaded, kept, @intCast(window));
+     const shown = try kv_pages.text(F, a, served.stream_bytes, layout, paged, kv_pages.enginePaged(loaded), @intCast(window), kept, o.kv8);
+     h.startup = try std.fmt.allocPrint(gpa, @import("cuda_startup.zig").format, .{
+         capability, device,                                                                                                       name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(learn_bytes)}) else "", streams, if (streams == 1) "" else "s", shown[0], toGib(room), toGib(after.reserve), @import("cuda_startup.zig").rows(F, loaded), if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
+         shown[1],   if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
+     });
+     errdefer gpa.free(h.startup);
+-    if (@hasDecl(F, "snap_save") and cache > 0) {
++    const kept_budget: u64 = if (comptime @hasDecl(F, "snap_save")) try kv_pages.storeBudget(F, loaded.target, kept) else 0; // card and host tier
++    if (cache_capacity) |*c| c.budget_bytes = kept_budget; // the startup warning and metrics read what the store keeps in
++    if (@hasDecl(F, "snap_save") and kept_budget > 0) {
+         const pc = api.prompt_cache;
+         const store = try gpa.create(pc.Store);
+         errdefer gpa.destroy(store);
+         // rules and budget from the family's snap_* declarations (cuda_snaps.zig)
+         const image: ?*const pc.rows.Image = if (F == nemotron.native) &cuda_disk.image else if (comptime cuda_disk.keptDisk(F)) |K| &K.image else null;
+         const copies: pc.Snapshots = .{ .ptr = loaded.target, .vtable = &snaps.Snaps(F, image).vtable };
+-        store.* = pc.Store.init(gpa, copies, snaps.passRules(F, @import("cuda_startup.zig").rows(F, loaded)), if (@hasDecl(F, "snap_slots")) cache else try snaps.cacheBudget(F, loaded.target, cache));
++        store.* = pc.Store.init(gpa, copies, snaps.passRules(F, @import("cuda_startup.zig").rows(F, loaded)), kept_budget);
+         errdefer {
+             const disk = store.disk;
+             store.deinit();
+diff --git a/zig/src/native/cuda_kv_pool.zig b/zig/src/native/cuda_kv_pool.zig
+index 6c43331a..79a66909 100644
+--- a/zig/src/native/cuda_kv_pool.zig
++++ b/zig/src/native/cuda_kv_pool.zig
+@@ -77,18 +77,28 @@ fn fits(comptime F: type, loaded: anytype, o: api.Open, room: u64, window: u64,
+ /// TENSORFOLD_CUDA_MEMORY_LIMIT_GB bounds the room, so a smaller reserve may not widen it.
+ pub const Reserve = struct { bytes: u64, least: u64, limited: bool = false };
+ 
+-/// What a plan reads beside the budget: the reserve its refusals price a fit by (null: none named).
+-pub const Facts = struct { reserve: ?Reserve = null };
++/// What a plan reads beside the budget: the reserve its refusals price a fit by (null: none named), and the family's
++/// smallest kept state (0: no rule), under which a device prompt cache beside a host tier holds nothing.
++pub const Facts = struct { reserve: ?Reserve = null, min_state: u64 = 0 };
+ 
+ /// The pool beside the engine's own sequence (in `model`: a window, or on pages its fixed part); null: see `problem`.
++/// A family that keeps states past the card (`snap_host_tier`) gives the pages a device share under one state
++/// (`facts.min_state`): it would hold none of its own, and the states go to the host tier (Plan.skipped says how much).
+ pub fn plan(comptime F: type, a: Allocator, l: kv_pool.Layout, room: u64, o: api.Open, window: u64, problem: *[]const u8, host_mode: bool, engine_paged: bool, facts: Facts) !?Plan {
+     const rows: u64 = if (comptime @hasDecl(F, "window_rows")) F.window_rows else 0;
+     const want = if (host_mode) 0 else budget.cacheBytes(o.prompt_cache_gib, std.math.maxInt(u64), 0);
+-    const b: kv_pool.Budget = .{ .room = room, .engine = 0, .lanes = o.lanes, .fixed = o.lanes_fixed, .cache = want, .snaps = named(o), .window = window + rows, .engine_paged = engine_paged };
+-    return kv_pool.plan(l, b) catch |e| {
++    var b: kv_pool.Budget = .{ .room = room, .engine = 0, .lanes = o.lanes, .fixed = o.lanes_fixed, .cache = want, .snaps = named(o), .window = window + rows, .engine_paged = engine_paged };
++    var p = kv_pool.plan(l, b) catch |e| {
+         problem.* = try refusal(a, l, b, e, window, rows, facts.reserve);
+         return null;
+     };
++    if (comptime @hasDecl(F, "snap_host_tier")) if (p.copied > 0 and p.copied < facts.min_state) {
++        b.cache = 0; // the same streams: neither refusal reads the cache
++        const skipped = p.copied;
++        p = kv_pool.plan(l, b) catch unreachable;
++        p.skipped = skipped;
++    };
++    return p;
+ }
+ 
+ /// A refused plan's words: what it needs and the room it has, then what would fit. The fit clause's format, for the
+@@ -144,17 +154,27 @@ pub fn attach(comptime F: type, a: Allocator, ctx: *anyopaque, paged: ?Plan, pro
+ }
+ 
+ /// The cache's snapshot slots and copied rows' bytes (`snaps` 0: a family without slots keeps its cache whole).
+-pub const Kept = struct { snaps: usize, copied: u64, snap_bytes: u64, host: bool = false, most: usize = std.math.maxInt(usize) };
++/// `skipped`: the device share the plan gave the pages (it held no state); the family's host tier keeps them instead.
++pub const Kept = struct { snaps: usize, copied: u64, snap_bytes: u64, host: bool = false, most: usize = std.math.maxInt(usize), skipped: u64 = 0 };
+ 
+ pub fn kept(comptime F: type, loaded: anytype, paged: ?Plan, o: api.Open, room: u64, held: u64, host_budget: u64, host_mode: bool) Kept {
+     if (host_mode) return .{ .snaps = 0, .copied = hostBudget(o, host_budget), .snap_bytes = stagingBytes(F, loaded, hostBudget(o, host_budget)), .host = true, .most = named(o) orelse std.math.maxInt(usize) };
+     // on pages the plan set the cache aside already; `held` counts every stream at a whole window
+-    if (comptime !@hasDecl(F, "snap_slots")) return .{ .snaps = 0, .copied = if (!@hasDecl(F, "snap_save")) 0 else if (paged) |p| p.copied else budget.cacheBytes(o.prompt_cache_gib, room, held), .snap_bytes = 0 };
++    if (comptime !@hasDecl(F, "snap_slots")) return .{ .snaps = 0, .copied = if (!@hasDecl(F, "snap_save")) 0 else if (paged) |p| p.copied else budget.cacheBytes(o.prompt_cache_gib, room, held), .snap_bytes = 0, .skipped = if (paged) |p| p.skipped else 0 };
+     const b: u64 = loaded.snap_bytes;
+     const s = if (paged) |p| kv_pool.split(p.snaps * b + p.copied, b, p.snaps) else kv_pool.split(budget.cacheBytes(o.prompt_cache_gib, room, held), b, named(o));
+     return .{ .snaps = s.snaps, .copied = s.copied, .snap_bytes = b };
+ }
+ 
++/// The store's budget: the card's share, less what the family sets aside for its states, plus the host tier it made
++/// (cuda_snaps.cacheBudget; this runs the family's snap_ready). A share the plan gave the pages (`k.skipped`) leaves
++/// the host tier alone; 0: no store.
++pub fn storeBudget(comptime F: type, target: anytype, k: Kept) !u64 {
++    if (comptime !@hasDecl(F, "snap_save")) return 0;
++    if (k.copied == 0 and k.skipped == 0) return 0; // no cache asked, or none the room left
++    return if (comptime @hasDecl(F, "snap_slots")) k.copied else @import("cuda_snaps.zig").cacheBudget(F, target, k.copied);
++}
++
+ /// The store keeps a state a slot, the slots made now in one device buffer; a family without them, its own budget.
+ pub fn store(comptime F: type, s: *api.prompt_cache.Store, target: anytype, k: Kept) !void {
+     if (comptime !@hasDecl(F, "snap_slots")) return;
+@@ -167,7 +187,7 @@ pub fn store(comptime F: type, s: *api.prompt_cache.Store, target: anytype, k: K
+ pub fn text(comptime F: type, a: Allocator, stream_bytes: u64, l: ?kv_pool.Layout, paged: ?Plan, engine_paged: bool, window: u64, k: Kept, kv8: bool) ![2][]const u8 {
+     const shape = if (paged) |p| (if (engine_paged) try std.fmt.allocPrint(a, "the engine's own and {d} more taking {d} pages of {d} rows ({d:.2} GiB) as they need them (enough for one at a {d}-token window), {d:.0} MiB fixed each", .{ p.lanes - 1, p.pages, l.?.page_tokens, toGib(p.pages * l.?.pageBytes()), window, @as(f64, @floatFromInt(l.?.fixed_bytes)) / (1 << 20) }) else try std.fmt.allocPrint(a, "the engine's own at a {d}-token window ({d:.2} GiB, in the model's), {d} more taking {d} pages of {d} rows ({d:.2} GiB) as they need them, {d:.0} MiB fixed each", .{ window, toGib(stream_bytes), p.lanes - 1, p.pages, l.?.page_tokens, toGib(p.pages * l.?.pageBytes()), @as(f64, @floatFromInt(l.?.fixed_bytes)) / (1 << 20) })) else try std.fmt.allocPrint(a, "{d:.2} GiB each at a {d}-token window{s}", .{ toGib(stream_bytes), window, if (kv8) " (fp8 caches)" else "" });
+     const placed = comptime @hasDecl(F, "snap_place"); // the startup line says where its prompt states went, and why
+-    const cache = if (k.copied == 0) ", no prompt cache" else if (k.host) try std.fmt.allocPrint(a, ", {s}a {d:.1} GiB prompt cache in host memory with {d:.0} MiB of device staging", .{ if (placed) "prompt states on host, the cache doesn't fit on the card: " else "", toGib(k.copied), @as(f64, @floatFromInt(k.snap_bytes)) / (1 << 20) }) else if (comptime @hasDecl(F, "snap_slots")) try std.fmt.allocPrint(a, ", {s}a prompt cache of {d} snapshot slots ({d:.1} GiB) and {d:.1} GiB of copied rows", .{ if (placed) "prompt states on device: " else "", k.snaps, toGib(k.snaps * k.snap_bytes), toGib(k.copied) }) else try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(k.copied)});
++    const cache = if (k.copied == 0 and k.skipped > 0) try std.fmt.allocPrint(a, ", the prompt cache in pinned host memory alone (the {d:.2} GiB the card had left it holds no state: the KV pages took it)", .{toGib(k.skipped)}) else if (k.copied == 0) ", no prompt cache" else if (k.host) try std.fmt.allocPrint(a, ", {s}a {d:.1} GiB prompt cache in host memory with {d:.0} MiB of device staging", .{ if (placed) "prompt states on host, the cache doesn't fit on the card: " else "", toGib(k.copied), @as(f64, @floatFromInt(k.snap_bytes)) / (1 << 20) }) else if (comptime @hasDecl(F, "snap_slots")) try std.fmt.allocPrint(a, ", {s}a prompt cache of {d} snapshot slots ({d:.1} GiB) and {d:.1} GiB of copied rows", .{ if (placed) "prompt states on device: " else "", k.snaps, toGib(k.snaps * k.snap_bytes), toGib(k.copied) }) else try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(k.copied)});
+     return .{ shape, cache };
+ }
+ 
+@@ -327,8 +347,74 @@ test "KV admission: a refusal prices the running states beside the fixed part an
+ const Glm = struct {
+     pub const snap_save = 1;
+     pub const window_rows = 8;
++    pub fn snap_ready(_: *u8, _: u64) !u64 {
++        return 0; // the store accounts both tiers' pages itself
++    }
++    pub fn snap_host_tier(_: *u8) u64 {
++        return 8 << 30; // auto: a quarter of 64 GiB available, over two ranks
++    }
+ };
+ const glm_layout: kv_pool.Layout = .{ .fixed_bytes = 378 << 20, .token_bytes = 6380, .page_tokens = 512, .snap_bytes = 0 };
++const glm_min_state: u64 = 230_686_720; // the 2,048-token state the warning named (0.215 GiB)
++
++test "kv merge: beside a host tier, a device share under one state goes to the KV pages; one that holds a state stays" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var problem: []const u8 = "";
++    const l = glm_layout;
++    const page = l.pageBytes();
++    const o: api.Open = .{ .dir = "", .model_type = "glm5_next", .lanes = 4, .lanes_fixed = true };
++    const own = l.pages(864_256 + 8) * page; // the engine's own 864,256-token window: 1,689 pages
++    const share: u64 = 188_753_152; // the 0.176 GiB production's room left the device cache
++    const room = own + 3 * l.fixed_bytes + 3 * page + share;
++    const before = (try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{})).?; // no state size: as before
++    try std.testing.expectEqual(share, before.copied);
++    try std.testing.expectEqual(@as(usize, 1692), before.pages); // production's pool: 866,304 tokens
++    const p = (try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{ .min_state = glm_min_state })).?;
++    try std.testing.expectEqual(@as(u64, 0), p.copied);
++    try std.testing.expectEqual(share, p.skipped);
++    try std.testing.expectEqual(@as(usize, 1692 + share / page), p.pages); // 57 pages more: 895,488 tokens
++    try std.testing.expectEqual(before.lanes, p.lanes);
++    // the store then runs on the host tier alone; the startup line says where the states go
++    const k = kept(Glm, .{}, p, o, room, 0, 0, false);
++    try std.testing.expectEqual(@as(u64, 0), k.copied);
++    try std.testing.expectEqual(share, k.skipped);
++    const shown = (try text(Glm, a, 0, l, p, true, 864_256, k, true))[1];
++    try std.testing.expect(std.mem.indexOf(u8, shown, "pinned host memory alone") != null);
++    try std.testing.expect(std.mem.indexOf(u8, shown, "0.18 GiB") != null);
++    // the store keeps states in the host tier alone, so the startup warning (it counts the store's budget) is quiet
++    var target: u8 = 0;
++    const budget_bytes = try storeBudget(Glm, &target, k);
++    try std.testing.expectEqual(@as(u64, 8 << 30), budget_bytes);
++    try std.testing.expectEqual(@as(u64, 0), try storeBudget(Glm, &target, .{ .snaps = 0, .copied = 0, .snap_bytes = 0 })); // off
++    try std.testing.expectEqual(share + (8 << 30), try storeBudget(Glm, &target, kept(Glm, .{}, before, o, room, 0, 0, false)));
++    const Quiet = struct {
++        var warned: usize = 0;
++        pub fn warn(comptime _: []const u8, _: anytype) void {
++            warned += 1;
++        }
++    };
++    warnCapacity(.{ .budget_bytes = budget_bytes, .minimum_state_bytes = glm_min_state }, false, Quiet);
++    warnCapacity(.{ .budget_bytes = share + (8 << 30), .minimum_state_bytes = glm_min_state }, false, Quiet); // as production is
++    try std.testing.expectEqual(@as(usize, 0), Quiet.warned);
++    warnCapacity(.{ .budget_bytes = share, .minimum_state_bytes = glm_min_state }, false, Quiet); // the card's share alone
++    try std.testing.expectEqual(@as(usize, 1), Quiet.warned);
++    // a share that holds one state stays on the card, as does any share of a family without a host tier
++    const roomy = room - share + glm_min_state;
++    const held = (try plan(Glm, a, l, roomy, o, 864_256, &problem, false, true, .{ .min_state = glm_min_state })).?;
++    try std.testing.expectEqual(glm_min_state, held.copied);
++    try std.testing.expectEqual(@as(u64, 0), held.skipped);
++    const NoHost = struct {
++        pub const snap_save = 1;
++        pub const window_rows = 8;
++    };
++    try std.testing.expectEqual(share, (try plan(NoHost, a, l, room, o, 864_256, &problem, false, true, .{ .min_state = glm_min_state })).?.copied);
++    // a cache turned off (--prompt-cache-gib 0) skips nothing
++    const off: api.Open = .{ .dir = "", .model_type = "glm5_next", .lanes = 4, .lanes_fixed = true, .prompt_cache_gib = 0 };
++    const none = (try plan(Glm, a, l, room, off, 864_256, &problem, false, true, .{ .min_state = glm_min_state })).?;
++    try std.testing.expectEqual(@as(u64, 0), none.copied + none.skipped);
++}
+ 
+ /// The values a refusal's fit clause names (none: null), parsed as the recipe's start script would.
+ fn fitOf(problem: []const u8) !struct { parallel: ?u32, reserve: ?f64, context: ?u64 } {
+-- 
+2.53.0
+

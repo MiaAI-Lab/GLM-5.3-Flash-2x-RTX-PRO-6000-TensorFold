@@ -1,0 +1,239 @@
+integ5 0086 = patches/glue5/0071-glm-decode-hc-finish-split.patch (overnight 2026-10-31), renumbered for the integrated stack on 3f94715d.
+
+glm cuda: hc_pre's finish for decode rows with Sinkhorn beside the collapse (T3 candidate 6, glue5; exact, switchable)
+
+- c6, glm_glue_hc.cuh: tf_glm_hc_finish_split / _f32w_split (glm_hc::finish_split): warp 0 sums the 16 K blocks
+  (unrolled), publishes the pre and post weights (bar.arrive 1), then runs the 20-iteration Sinkhorn alone; warps
+  1..7 (bar.sync 1) collapse, RMS-norm and store, warp 1 also for warp 0's columns, loaded by it with the same lane
+  mapping; block_sum<8>'s two butterflies run on the same values in the same lanes (bar.sync 2, 224). finish's
+  collapse and output code is factored into glm_hc::collapse / emit, used by the split kernel only (finish itself
+  and the SASS of every existing glm_glue kernel unchanged). cuda_glue.hcPre takes it for decode rows (< 64) when
+  Set.hc_split (TF_GLM_HC_SPLIT=0: off, read once at load).
+- Exact: split finish against tf_glm_hc_finish byte for byte (normed rows, 64-sums, post, comb; rows 1-32; bf16 and
+  float32 norm weights; 12 input sets; glue5/bench_hcfin2.cu). Measured: 4.29 -> 3.37 us a site at 1 row (-0.74 to
+  -0.98 us at 2-32 rows), about -83 us a plain step (90 sites).
+- (Candidate 7, a staged decode router, measured slower than tf_glm_router_tile and is not in this patch.)
+
+diff --git a/zig/kernels/cuda/glm_glue_hc.cuh b/zig/kernels/cuda/glm_glue_hc.cuh
+index 5c6f6993..bd814c0d 100644
+--- a/zig/kernels/cuda/glm_glue_hc.cuh
++++ b/zig/kernels/cuda/glm_glue_hc.cuh
+@@ -237,6 +237,153 @@ __device__ __forceinline__ void finish(const __nv_bfloat16* x, const float* part
+ 
+ }  // namespace glm_hc
+ 
++namespace glm_hc {
++
++// finish's collapse of one thread's columns (column thread `ct`): its 16 collapsed values and their sum of squares,
++// finish's ops in finish's order.
++__device__ __forceinline__ void collapse(const uint4 (&xu)[2][4], float p0, float p1, float p2, float p3, float (&c)[16],
++                                         float& acc) {
++  for (int k = 0; k < 16; ++k) {
++    const __nv_bfloat16* h0 = reinterpret_cast<const __nv_bfloat16*>(&xu[k / 8][0]);
++    const __nv_bfloat16* h1 = reinterpret_cast<const __nv_bfloat16*>(&xu[k / 8][1]);
++    const __nv_bfloat16* h2 = reinterpret_cast<const __nv_bfloat16*>(&xu[k / 8][2]);
++    const __nv_bfloat16* h3 = reinterpret_cast<const __nv_bfloat16*>(&xu[k / 8][3]);
++    const float x0 = bf(h0[k % 8]), x1 = bf(h1[k % 8]), x2 = bf(h2[k % 8]), x3 = bf(h3[k % 8]);
++    float m = k % 2 == 0 ? __fmaf_rn(p1, x1, __fmul_rn(p0, x0)) : __fmaf_rn(p0, x0, __fmul_rn(p1, x1));
++    m = __fmaf_rn(p2, x2, m);
++    c[k] = rbf(__fmaf_rn(p3, x3, m));
++  }
++  acc = __fmaf_rn(c[0], c[0], __fmul_rn(c[1], c[1]));
++  for (int k = 2; k < 16; ++k) acc = k % 2 == 0 ? __fmaf_rn(c[k], c[k], acc) : fadd(fmul(c[k], c[k]), acc);
++}
++
++// finish's normed output and 64-sums of column thread `ct`'s values (the 8-lane groups of its warp).
++template <typename W>
++__device__ __forceinline__ void emit(const float (&c)[16], const Weights<W>& wu, float rinv, __nv_bfloat16* out,
++                                     float* xs, int64_t r, int ct) {
++  constexpr int D = 4096;
++  for (int rep = 0; rep < 2; ++rep) {
++    float y[8];
++    uint4 ou;
++    __nv_bfloat16* oh = reinterpret_cast<__nv_bfloat16*>(&ou);
++    for (int j = 0; j < 8; ++j) {
++      const __nv_bfloat16 o = __float2bfloat16_rn(__fmul_rn(wu.at(rep, j), rbf(__fmul_rn(rinv, c[rep * 8 + j]))));
++      oh[j] = o;
++      y[j] = bf(o);
++    }
++    *reinterpret_cast<uint4*>(out + r * D + rep * 2048 + ct * 8) = ou;
++    float g = y[0] + y[1];
++    for (int j = 2; j < 8; ++j) g = y[j] + g;
++    for (int o = 4; o > 0; o >>= 1) g = g + __shfl_xor_sync(0xffffffffu, g, o);
++    if ((ct & 7) == 0) xs[r * (D / 64) + rep * 32 + ct / 8] = g;
++  }
++}
++
++__device__ __forceinline__ void bar_sync(int id, int n) { asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(n) : "memory"); }
++__device__ __forceinline__ void bar_arrive(int id, int n) { asm volatile("bar.arrive %0, %1;" ::"r"(id), "r"(n) : "memory"); }
++
++// finish with warp 0's Sinkhorn beside the collapse: warp 0 sums the K blocks (NB of them, unrolled), publishes the
++// pre and post weights, then runs Sinkhorn alone, while warps 1..7 collapse, norm and store, warp 1 also for warp 0's
++// columns (loaded by it with the same lane mapping, its sums through the same butterflies). block_sum<8>'s two
++// butterflies run on the same values in the same lanes, so every output is finish's bit for bit.
++template <typename W, int NB>
++__device__ __forceinline__ void finish_split(const __nv_bfloat16* x, const float* part, const float* base,
++                                             const float* scale, const W* nw, __nv_bfloat16* out, float* xs,
++                                             float* post, float* comb, float eps, float hc_eps, int iters) {
++  constexpr int D = 4096, S = 4;
++  __shared__ float smem[8];
++  __shared__ float pre[4];
++  __shared__ float tot;
++  const int64_t r = blockIdx.x;
++  const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
++  const __nv_bfloat16* row = x + r * S * D;
++  if (warp == 0) {
++    const float* p = part + r * NB * 32;
++    float mix = 0.0f, ss = 0.0f;
++#pragma unroll
++    for (int b = 0; b < NB; ++b) {
++      mix = mix + p[b * 32 + lane];
++      ss = ss + p[b * 32 + 24];
++    }
++    const float rinv = div_full(1.0f, sqrt_approx(eps + div_full(ss, (float)(S * D))));
++    mix = __fmul_rn(mix, rinv);
++    const int k = lane & 3, idx = lane & 15;
++    const float bpre = base[k], bpost = base[4 + k], bcomb = base[8 + idx];
++    const float mpre = __shfl_sync(0xffffffffu, mix, k), mpost = __shfl_sync(0xffffffffu, mix, 4 + k);
++    const float mcomb = __shfl_sync(0xffffffffu, mix, 8 + idx);
++    const float pr = hc_eps + glm_hc::sigmoid(__fmaf_rn(mpre, scale[0], bpre));
++    const float sp = glm_hc::sigmoid(__fmaf_rn(mpost, scale[1], bpost));
++    if (lane < 4) {
++      post[r * S + lane] = sp + sp;
++      pre[lane] = pr;
++    }
++    bar_arrive(1, 256);  // the pre weights: warps 1..7 collapse while this warp runs Sinkhorn
++    const float cl = __fmaf_rn(mcomb, scale[2], bcomb);
++    float cmax = fmaxf(cl, __shfl_xor_sync(0xffffffffu, cl, 2));
++    cmax = fmaxf(cmax, __shfl_xor_sync(0xffffffffu, cmax, 1));
++    const float ce = exp_approx(cl - cmax);
++    float cm = fadd(hc_eps, div_full(ce, glm_hc::row4(ce)));
++    cm = div_full(cm, hc_eps + glm_hc::col4(cm));
++    for (int it = 1; it < iters; ++it) {
++      cm = div_full(cm, hc_eps + glm_hc::row4(cm));
++      cm = div_full(cm, hc_eps + glm_hc::col4(cm));
++    }
++    if (lane < 16) comb[r * 16 + lane] = cm;
++    return;
++  }
++  // warps 1..7: this thread's columns, and warp 1 warp 0's (thread `lane`'s)
++  uint4 xu[2][S], xz[2][S];
++  Weights<W> wu, wz;
++  for (int rep = 0; rep < 2; ++rep) {
++    for (int st = 0; st < S; ++st) xu[rep][st] = *reinterpret_cast<const uint4*>(row + st * D + rep * 2048 + t * 8);
++    wu.load(nw, rep, t);
++    if (warp == 1) {
++      for (int st = 0; st < S; ++st) xz[rep][st] = *reinterpret_cast<const uint4*>(row + st * D + rep * 2048 + lane * 8);
++      wz.load(nw, rep, lane);
++    }
++  }
++  bar_sync(1, 256);
++  const float p0 = pre[0], p1 = pre[1], p2 = pre[2], p3 = pre[3];
++  float c[16], cz[16], acc, accz = 0.0f;
++  collapse(xu, p0, p1, p2, p3, c, acc);
++  if (warp == 1) collapse(xz, p0, p1, p2, p3, cz, accz);
++  // block_sum<8>: each warp's butterfly, then lanes 0..7's
++  for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
++  if (lane == 0) smem[warp] = acc;
++  if (warp == 1) {
++    for (int o = 16; o > 0; o >>= 1) accz += __shfl_xor_sync(0xffffffffu, accz, o);
++    if (lane == 0) smem[0] = accz;
++  }
++  bar_sync(2, 224);
++  if (warp == 1) {
++    float v = lane < 8 ? smem[lane] : 0.0f;
++    for (int o = 4; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
++    if (lane == 0) tot = v;
++  }
++  bar_sync(2, 224);
++  const float rinv = div_full(1.0f, sqrt_approx(eps + div_full(tot, (float)D)));
++  emit(c, wu, rinv, out, xs, r, t);
++  if (warp == 1) emit(cz, wz, rinv, out, xs, r, lane);
++}
++
++}  // namespace glm_hc
++
++// tf_glm_hc_finish with the split schedule (glm_hc::finish_split): the same outputs bit for bit; 16 K blocks.
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_hc_finish_split(const __nv_bfloat16* x, const float* part, const float* base, const float* scale,
++                           const __nv_bfloat16* nw, __nv_bfloat16* out, float* xs, float* post, float* comb, float eps,
++                           float hc_eps, int nb, int iters) {
++  if (nb != 16) __trap();  // the host launches it with glue.hc_blocks only
++  glm_hc::finish_split<__nv_bfloat16, 16>(x, part, base, scale, nw, out, xs, post, comb, eps, hc_eps, iters);
++}
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_hc_finish_f32w_split(const __nv_bfloat16* x, const float* part, const float* base, const float* scale,
++                                const float* nw, __nv_bfloat16* out, float* xs, float* post, float* comb, float eps,
++                                float hc_eps, int nb, int iters) {
++  if (nb != 16) __trap();
++  glm_hc::finish_split<float, 16>(x, part, base, scale, nw, out, xs, post, comb, eps, hc_eps, iters);
++}
++
+ extern "C" __global__ void __launch_bounds__(256)
+     tf_glm_hc_finish(const __nv_bfloat16* x, const float* part, const float* base, const float* scale,
+                      const __nv_bfloat16* nw, __nv_bfloat16* out, float* xs, float* post, float* comb, float eps,
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 3fb4a759..e76c8592 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -52,6 +52,7 @@ pub const Modules = struct {
+     q4: q4.Kernels,
+     topk_sum: bool = true, // TF_GLM_TOPK_SUM=0: a decode window's grouped select reads the summed logits (the same bits)
+     shared_segs: bool = true, // TF_GLM_SHARED_SEGS=0: a shared window's segments take their own launches (the same bits)
++    hc_split: bool = true, // TF_GLM_HC_SPLIT=0: hc_pre's finish on the one-warp schedule (the same bits)
+ 
+     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
+         const k = cuda.kernels;
+@@ -91,6 +92,7 @@ pub const Modules = struct {
+         m.packs = null; // `m` starts undefined: the field default does not apply
+         m.topk_sum = if (std.c.getenv("TF_GLM_TOPK_SUM")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+         m.shared_segs = if (std.c.getenv("TF_GLM_SHARED_SEGS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
++        m.hc_split = if (std.c.getenv("TF_GLM_HC_SPLIT")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+         return m;
+     }
+ 
+@@ -220,7 +222,7 @@ pub const Forward = struct {
+     absorb_mma: bool = false, // TF_GLM_ABSORB_MMA=1: a prompt pass's absorb_q and expand_v on tensor cores
+ 
+     pub fn set(f: *const Forward) glue.Set {
+-        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .absorb_mma = f.absorb_mma and f.ranks[0].b.prefill, .dsel = f.m.dsel, .pdl_hc = f.m.mm.chain.hc and !f.ranks[0].b.prefill, .pdl_moe = f.m.mm.chain.moe and !f.ranks[0].b.prefill };
++        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .absorb_mma = f.absorb_mma and f.ranks[0].b.prefill, .dsel = f.m.dsel, .pdl_hc = f.m.mm.chain.hc and !f.ranks[0].b.prefill, .pdl_moe = f.m.mm.chain.moe and !f.ranks[0].b.prefill, .hc_split = f.m.hc_split };
+     }
+ 
+     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index e234e982..c3965e55 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -10,7 +10,8 @@ const index_mod = @import("cuda_index.zig");
+ /// `dsel`: a decode window's DSA select on many CTAs (tf_glm_dsel_*, cuda_sparse; TF_GLM_DSEL, default on).
+ /// `pdl_hc`: a decode window's hc_post, hc_partial8 and hc_finish launch as dependents (TF_GLM_PDL_CHAIN's hc).
+ /// `pdl_moe`: a decode window's slice_sum, topk_group and topk_group_sum launch as dependents (TF_GLM_PDL_CHAIN's moe).
+-pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false, pdl_hc: bool = false, pdl_moe: bool = false };
++/// `hc_split`: hc_pre's finish on the split schedule (TF_GLM_HC_SPLIT=0: off), the same bits.
++pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false, pdl_hc: bool = false, pdl_moe: bool = false, hc_split: bool = false };
+ 
+ /// A hidden-size norm's weight: bf16, or float32 (FP4-Local's) read as float32 by the _f32w kernels.
+ pub const Norm = union(enum) { bf16: u64, f32: u64 };
+@@ -46,6 +47,8 @@ pub const Kernels = struct {
+     hc_partial8: cuda.Function,
+     hc_finish: cuda.Function,
+     hc_finish_f32w: cuda.Function,
++    hc_finish_split: cuda.Function, // the same outputs with warp 0's Sinkhorn beside the collapse (Set.hc_split)
++    hc_finish_f32w_split: cuda.Function,
+     absorb_q: cuda.Function,
+     expand_v: cuda.Function,
+     lat_write: cuda.Function,
+@@ -288,9 +291,10 @@ pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale:
+         a.add(i64of(rows));
+         try cuda.launch.launch(set.glue.hc_partial, .{ .grid = .{ .x = cdiv(rows, 4), .y = hc_blocks }, .block = .{ .x = 128 } }, stream, &a);
+     }
++    const split = set.hc_split and rows < 64; // decode windows: a row's latency; prompt rows keep the one-warp schedule
+     const f, const w = switch (norm) {
+-        .bf16 => |p| .{ set.glue.hc_finish, p },
+-        .f32 => |p| .{ set.glue.hc_finish_f32w, p },
++        .bf16 => |p| .{ if (split) set.glue.hc_finish_split else set.glue.hc_finish, p },
++        .f32 => |p| .{ if (split) set.glue.hc_finish_f32w_split else set.glue.hc_finish_f32w, p },
+     };
+     var b: cuda.Args = .{};
+     inline for (.{ x, part, base, scale, w, out, xs, post, comb, eps, hc_eps, @as(c_int, hc_blocks), cint(iters) }) |v| b.add(v);

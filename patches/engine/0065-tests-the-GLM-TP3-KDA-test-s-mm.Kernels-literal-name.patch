@@ -1,0 +1,32 @@
+From 06da32e64fc18c7e29b323d083e4368acc227e1d Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 20:25:52 +0200
+Subject: [PATCH 65/66] tests: the GLM TP3 KDA test's mm.Kernels literal names
+ packed_prompt, q8 and mm8a8
+
+The literal predates 0009's packed_prompt field, so the GLM module's host tests (cuda.zig root, test-cuda-host)
+did not compile on 0f67821f; W8A8's q8 and mm8a8 fields need naming too. With it, the module's tests build and pass
+(the remaining test-cuda-host failure, draft sources' DFlash2 head check, is the base's own).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj6TMcvsfVhxuBcBLg
+---
+ zig/src/families/glm/cuda_kda_tp3_test.zig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_kda_tp3_test.zig b/zig/src/families/glm/cuda_kda_tp3_test.zig
+index f4b63414..c61e460e 100644
+--- a/zig/src/families/glm/cuda_kda_tp3_test.zig
++++ b/zig/src/families/glm/cuda_kda_tp3_test.zig
+@@ -52,7 +52,7 @@ test "GLM TP3: real KDA projections accept uneven shares and retain aligned tile
+     var d: cuda.Driver = undefined;
+     d.api.cuLaunchKernel = Capture.launch;
+     const stream: cuda.Stream = .{ .d = &d, .handle = null };
+-    var kernels: mm.Kernels = .{ .by_rows = @splat(function(&d, 1)), .prompt = function(&d, 2), .reduce = function(&d, 3), .pdl = false, .packed_rows = undefined, .packed_prompt = undefined, .pair = @splat(function(&d, 7)), .tile = undefined, .tile_packed = undefined };
++    var kernels: mm.Kernels = .{ .by_rows = @splat(function(&d, 1)), .prompt = function(&d, 2), .reduce = function(&d, 3), .pdl = false, .packed_rows = undefined, .packed_prompt = undefined, .pair = @splat(function(&d, 7)), .tile = undefined, .tile_packed = undefined, .q8 = undefined, .mm8a8 = undefined };
+     var raw: glue.Kernels = undefined;
+     raw.bmm_decode = function(&d, 4);
+     raw.bmm_rows = function(&d, 5);
+-- 
+2.53.0
+

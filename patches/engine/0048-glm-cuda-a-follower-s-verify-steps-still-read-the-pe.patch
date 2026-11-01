@@ -1,0 +1,42 @@
+From b6ba2119869df3bcdbad77a222e6bf88b6fd031f Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 19:37:43 +0200
+Subject: [PATCH 48/63] glm cuda: a follower's verify steps still read the
+ peer-store gathers' failure word
+
+decode4 lets a follower's verify and shared steps skip the sync and read of their draws (rank 0 alone reads the
+tokens), and with them Engine.checkGathers. comm3's P2P gather reports a wait the GPU gave up on (the peer never wrote,
+or an abort) only through that check, so a follower would have gone on from garbage partials until some later step
+checked. The follower now reads the status words after each such step: no sync (atomic loads of host-mapped words), so
+it catches a failure the GPU already recorded, this step's or an earlier one's, and the follower stops every rank as
+on any step error. No GPU work or ordering changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj6TMcvsfVhxuBcBLg
+---
+ zig/src/families/glm/cuda_follow.zig | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/zig/src/families/glm/cuda_follow.zig b/zig/src/families/glm/cuda_follow.zig
+index 8a9c333c..49425c00 100644
+--- a/zig/src/families/glm/cuda_follow.zig
++++ b/zig/src/families/glm/cuda_follow.zig
+@@ -415,6 +415,7 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
+             e.discard_draws = true;
+             defer e.discard_draws = false;
+             try e.verify(ids_in, s.sampled[0..ids_in.len], 0);
++            try e.checkGathers(); // no sync now: a peer-store wait the GPU gave up on (this step's or earlier) stops here
+         },
+         .redraw => _ = try e.redrawFirst(@intCast(h.a), 0),
+         .shared => {
+@@ -434,6 +435,7 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
+             e.discard_draws = true;
+             defer e.discard_draws = false;
+             try e.verifyShared(parts[0..k]);
++            try e.checkGathers(); // as for .verify
+         },
+         .many => {
+             var parts: [engine.max_together]engine.Prompt = undefined;
+-- 
+2.53.0
+

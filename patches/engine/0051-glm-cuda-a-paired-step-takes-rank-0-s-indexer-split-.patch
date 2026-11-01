@@ -1,0 +1,61 @@
+From 515e47db9755b720c4097c05a52920497f208111 Mon Sep 17 00:00:00 2001
+From: Bizuayeu <30091157+Bizuayeu@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 22:57:14 +0900
+Subject: [PATCH 51/63] glm cuda: a paired step takes rank 0's indexer split
+ for both chunks and counts it once (#1404)
+
+Engine.prefillChunk reads and clears the split flag before it hands a paired step to prompt_pair.prefill, which never
+set it on its two forwards, so with #1404 a paired step ran the indexer whole on every rank. The step's flag now
+reaches both chunks: the header carries the one choice rank 0 makes at the step's start, and index_splits counts the
+step once. The twin buffers already share the first chunk's select scratch, whose pools hold #1404's world rows more.
+---
+ zig/src/families/glm/cuda_engine.zig      | 2 +-
+ zig/src/families/glm/cuda_prompt_pair.zig | 5 ++++-
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 2cd4f1b3..a58d18bc 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -422,7 +422,7 @@ pub const Engine = struct {
+         if ((from != null or start == 0) and try e.prefillStart(len, from) != start) return error.BadChunk;
+         if (start >= len or start % fw.prefill_rows != 0) return error.BadChunk;
+         const rows = @min(len - start, fw.prefill_rows);
+-        if (part.len > rows + 1) return prompt_pair.prefill(e, part, start, len, cancel, marks);
++        if (part.len > rows + 1) return prompt_pair.prefill(e, part, start, len, cancel, marks, split);
+         if (part.len != @min(len - start, rows + 1)) return error.BadChunk;
+         var one: [1]fw.Rank = undefined;
+         var f = e.view(&e.bp, &one);
+diff --git a/zig/src/families/glm/cuda_prompt_pair.zig b/zig/src/families/glm/cuda_prompt_pair.zig
+index 0a1c7f9e..763bf5bc 100644
+--- a/zig/src/families/glm/cuda_prompt_pair.zig
++++ b/zig/src/families/glm/cuda_prompt_pair.zig
+@@ -48,7 +48,7 @@ pub fn pairedAt(e: *const Engine, start: usize, len: usize, marks: ?engine.Marks
+ }
+ 
+ /// Engine.prefillChunk of two chunks (`part`: both, then the next id): one pass, then each chunk's MTP rows and commit.
+-pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: ?engine.Cancel, marks: ?engine.Marks) !?u32 {
++pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: ?engine.Cancel, marks: ?engine.Marks, split: bool) !?u32 {
+     const ra: usize = fw.prefill_rows;
+     if (len <= start + ra) return error.BadChunk;
+     const rb: usize = @min(len - start - ra, fw.prefill_rows);
+@@ -65,6 +65,8 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel:
+     var fb = e.view(&pair.bp, &two);
+     fa.prof = null;
+     fb.prof = null;
++    fa.index_split = split; // the step's choice (TF_GLM_INDEX_SPLIT) for both chunks
++    fb.index_split = split;
+     const st = &e.cur.st;
+     try st.ready(e.stream, ra + rb); // one rebase for both chunks, before b's view copies the rings' base
+     var sb = st.*;
+@@ -78,6 +80,7 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel:
+     try cuda.copy_source.enqueue(e.d, pair.bp.ids, std.mem.sliceAsBytes(ids[ra .. ra + rb]), e.stream);
+     try fw.Forward.pairBody(&fa, &fb, ra, rb);
+     pair.steps += 1;
++    e.index_splits += @intFromBool(split);
+     try mtpRows(e, &fa, ids[1 .. ra + 1], e.bp.fnormed);
+     try fa.commit(ra);
+     st.pending = rb;
+-- 
+2.53.0
+

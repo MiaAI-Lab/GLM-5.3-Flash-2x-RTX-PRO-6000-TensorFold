@@ -1,0 +1,179 @@
+From 314f7a7be57e0cf9cdcb743a78a983043ac5407c Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 14:34:11 +0200
+Subject: [PATCH 06/13] glm cuda: a decode window's shared expert on a side
+ stream beside the routed experts
+
+The MoE block ran the shared expert after the routed experts on one stream. A decode
+window (not a prompt chunk) now forks the shared expert's gate/up, SwiGLU, down and
+put_slot onto a second stream right after the block's input is ready, and the fill joins
+it before the slot combine. The kernels, their inputs and the combine's order are
+unchanged, so the bits are the same; only the overlap changes. Engine.side holds the
+stream and events, made at init; TF_GLM_SHARED_SIDE=0 keeps one stream.
+
+Measured on an RTX PRO 6000 (sm_120, bench_overlap): 70.6 -> 60.6 us a MoE layer at one
+row, 96.5 -> 84.9 us at two.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNmHb8tWDWv2KnBDVCM
+---
+ zig/src/families/glm/cuda_engine.zig  | 27 ++++++++++++++++++++---
+ zig/src/families/glm/cuda_forward.zig |  3 ++-
+ zig/src/families/glm/cuda_moe.zig     | 31 +++++++++++++++++++++++++--
+ 3 files changed, 55 insertions(+), 6 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 9716f9f7..99de5870 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -67,6 +67,7 @@ pub const Engine = struct {
+     m: fw.Modules,
+     stream: cuda.Stream,
+     pieces: fw.Pieces,
++    side: ?@import("cuda_moe.zig").Side = null, // decode windows' shared expert stream and events (TF_GLM_SHARED_SIDE=0: none)
+     w: weights.Weights,
+     bp: fw.Buffers, // prompt chunks
+     bd: fw.Buffers, // verify windows
+@@ -140,10 +141,12 @@ pub const Engine = struct {
+         errdefer m.deinit();
+         var pieces = try fw.Pieces.init(d, o.settings.pieces);
+         errdefer pieces.deinit();
++        var side = try sideStream(d);
++        errdefer if (side) |*x| freeSide(x);
+         if (o.settings.layers > c.layers) return error.BadLayers;
+         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
+         for (layers, 0..) |*l, i| l.* = @intCast(i);
+-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .mtp = o.mtp };
++        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .side = side, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .mtp = o.mtp };
+         const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
+         if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
+         const Tile = struct {
+@@ -229,6 +232,7 @@ pub const Engine = struct {
+         e.seqs.deinit(e.gpa);
+         e.w.deinit();
+         e.pieces.deinit();
++        if (e.side) |*x| freeSide(x);
+         e.m.deinit();
+         e.stream.deinit();
+         e.gpa.free(e.spans);
+@@ -245,7 +249,24 @@ pub const Engine = struct {
+     fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
+         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
+         const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
+-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null };
++        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .side = if (b == &e.bp) null else e.side };
++    }
++
++    /// The decode windows' side stream for the MoE shared expert, unless TF_GLM_SHARED_SIDE=0.
++    fn sideStream(d: *const cuda.Driver) !?@import("cuda_moe.zig").Side {
++        if (std.c.getenv("TF_GLM_SHARED_SIDE")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return null;
++        var s = try cuda.Stream.init(d, false);
++        errdefer s.deinit();
++        var fork = try cuda.Event.init(d, false);
++        errdefer fork.deinit();
++        return .{ .s = s, .fork = fork, .join = try cuda.Event.init(d, false) };
++    }
++
++    fn freeSide(x: *@import("cuda_moe.zig").Side) void {
++        x.s.synchronize() catch {};
++        x.join.deinit();
++        x.fork.deinit();
++        x.s.deinit();
+     }
+ 
+     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
+@@ -500,7 +521,7 @@ pub const Engine = struct {
+             rows += p.ids.len;
+         }
+         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
+-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(false) else null };
++        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(false) else null, .side = e.side };
+         try f.run(@ptrCast(ids[0..rows]));
+         if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
+         for (parts, segs[0..parts.len]) |p, g| {
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index b0ca6430..c0d12864 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -193,6 +193,7 @@ pub const Forward = struct {
+     prof: ?*prof_mod.Prof = null, // TF_GLM_PROF=1: events between the sections
+     taps: ?taps_mod.Taps = null, // DFlash2 (--drafter): the tapped layers' rows, after each such layer
+     index_split: bool = false, // TF_GLM_INDEX_SPLIT: this prompt chunk's indexer rows split across the ranks (rank 0's choice)
++    side: ?moe.Side = null, // a decode window's MoE shared expert on a second stream (TF_GLM_SHARED_SIDE, default on)
+ 
+     pub fn set(f: *const Forward) glue.Set {
+         return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows };
+@@ -301,7 +302,7 @@ pub const Forward = struct {
+     }
+ 
+     fn moeKernels(f: *const Forward) moe.Kernels {
+-        return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .put_slot = f.m.put_slot, .prof = f.prof };
++        return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .put_slot = f.m.put_slot, .prof = f.prof, .side = if (f.ranks[0].b.prefill) null else f.side };
+     }
+ 
+     pub const Site = enum { mixer, ffn };
+diff --git a/zig/src/families/glm/cuda_moe.zig b/zig/src/families/glm/cuda_moe.zig
+index 0056be32..c215b8f8 100644
+--- a/zig/src/families/glm/cuda_moe.zig
++++ b/zig/src/families/glm/cuda_moe.zig
+@@ -40,8 +40,18 @@ pub const Scratch = struct {
+     x3: exl3.Scratch = .{ .picks = 0, .xg = 0, .xu = 0, .z = 0 }, // EXL3 experts (eact holds their down inputs)
+ };
+ 
++/// A decode window's second stream: the shared expert runs there beside the router and the routed experts (the same
++/// kernels on the same rows, so the same bits); `fork` and `join` order it after the block's input and before combine.
++pub const Side = struct { s: cuda.Stream, fork: cuda.Event, join: cuda.Event };
++
+ /// The kernels the block runs: the captured Triton set, the grouped NVFP4 experts, the plan, and glm_ops.
+-pub const Kernels = struct { set: glue.Set, experts: *const experts.Kernels, exl3: *const exl3.Kernels, put_slot: cuda.Function, prof: ?*prof_mod.Prof = null };
++/// `side`: a decode window's shared expert on its own stream (null: on the block's stream, as before).
++pub const Kernels = struct { set: glue.Set, experts: *const experts.Kernels, exl3: *const exl3.Kernels, put_slot: cuda.Function, prof: ?*prof_mod.Prof = null, side: ?Side = null };
++
++/// Whether this call forks the shared expert: decode windows with a side stream (prompt chunks fill by row pieces).
++fn forks(k: Kernels, prompt: bool) bool {
++    return k.side != null and !prompt;
++}
+ 
+ /// forward.moe_block: out [rows][dims] fp32 partial; `prompt`: 64-pair items, the prompt kernels, bf16 slot rows.
+ pub fn block(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool, out: u64) !void {
+@@ -54,6 +64,13 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
+     const d = l.routed.dims;
+     const slots = l.top_k + 1;
+     const shared_id: i32 = @intCast(l.count);
++    if (forks(k, prompt)) { // the shared expert of every row on the side stream, from the block's input as it stands now
++        const sd = k.side.?;
++        try sd.fork.record(stream);
++        try sd.s.wait(sd.fork);
++        try sharedRows(k, sd.s, l, s, x, x_stride, 0, rows, prompt);
++        try sd.join.record(sd.s);
++    }
+     var stamp = prof_mod.span(k.prof, stream, .router);
+     try glue.router(k.set, stream, x, x_stride, l.router, s.mlog, s.router_part, rows, d, l.count);
+     try glue.select(k.set, stream, s.mlog, l.bias, s.pick, s.wts, rows, l.top_k, l.count, l.scale, l.norm);
+@@ -78,6 +95,17 @@ pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
+     const n = hi - lo;
+     const bf16_slots = prompt and l.exl3 == null; // the slot rows: bf16 in an NVFP4 prompt chunk, else fp32
+     const eb: usize = if (bf16_slots) 2 else 4;
++    if (forks(k, prompt)) try stream.wait(k.side.?.join) else try sharedRows(k, stream, l, s, x, x_stride, lo, hi, prompt);
++    try glue.combine(k.set, stream, s.ey + lo * slots * d * eb, !bf16_slots, s.wts + lo * slots * 4, out, n, d, slots);
++}
++
++/// The shared expert of rows lo..hi on `stream`: [gate | up], SwiGLU, down, then its rows into the last slot of `ey`.
++fn sharedRows(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize, prompt: bool) !void {
++    const d = l.routed.dims;
++    const slots = l.top_k + 1;
++    const n = hi - lo;
++    const bf16_slots = prompt and l.exl3 == null;
++    const eb: usize = if (bf16_slots) 2 else 4;
+     try projection.matmul(k.set, stream, l.shared_gu, x + lo * x_stride * 2, x_stride, s.sgu + lo * 2 * l.shared * 2, s.mm_part, n, 2 * l.shared, d, false);
+     try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, s.sact + lo * l.shared * 2, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
+     try projection.matmul(k.set, stream, l.shared_down, s.sact + lo * l.shared * 2, l.shared, s.sy + lo * d * 4, s.mm_part, n, d, l.shared, true);
+@@ -86,5 +114,4 @@ pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
+     a.add(s.ey + lo * slots * d * eb);
+     for ([_]usize{ n, d, slots, l.top_k, @intFromBool(bf16_slots) }) |v| a.add(@as(c_int, @intCast(v)));
+     try cuda.launch.launch(k.put_slot, .{ .grid = .{ .x = @intCast((n * d + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
+-    try glue.combine(k.set, stream, s.ey + lo * slots * d * eb, !bf16_slots, s.wts + lo * slots * 4, out, n, d, slots);
+ }
+-- 
+2.53.0
+

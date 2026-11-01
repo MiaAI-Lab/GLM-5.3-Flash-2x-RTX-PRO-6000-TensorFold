@@ -1,0 +1,67 @@
+From 8435fa8496b92233d78768c0f894dc19cb9a8814 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 16:44:56 +0200
+Subject: [PATCH 59/63] glm cuda: prompts pair from three chunks on
+ (TF_GLM_PROMPT_PAIR_MIN)
+
+A prompt of two chunks is one paired step with nothing after it whose exchanges it could hide.
+On 2x RTX PRO 6000 with DFlash2 it measured about 3% slower paired at 4K, while 16K and 64K
+gained 5.7% and 8.8% over unpaired. pairedAt now pairs only a prompt of at least
+2 * prefill_rows + 1 ids (three chunks); TF_GLM_PROMPT_PAIR_MIN overrides it in ids, and 0
+pairs wherever a step can, as before. It is rank 0's choice, and the other ranks take the
+steps it sends, so no rank setting or fingerprint changes. glm-pair-check counts the pairs it
+expects by the same rule.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj6TMcvsfVhxuBcBLg
+---
+ zig/src/families/glm/cuda_prompt_pair.zig | 12 ++++++++++++
+ zig/tests/cuda/glm_pair_tests.zig         |  2 +-
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_prompt_pair.zig b/zig/src/families/glm/cuda_prompt_pair.zig
+index ddee4525..7c7ae408 100644
+--- a/zig/src/families/glm/cuda_prompt_pair.zig
++++ b/zig/src/families/glm/cuda_prompt_pair.zig
+@@ -12,6 +12,17 @@ const Engine = engine.Engine;
+ /// The fewest rows a paired step's second chunk takes: a shorter one's sites end before the first's exchanges do.
+ pub const min_rows = fw.prefill_rows / 4;
+ 
++/// The shortest prompt (ids) whose steps pair: three chunks or more by default. A prompt of two chunks is one paired
++/// step with nothing after it to hide, and measured ~3% slower paired at 4K (2x RTX PRO 6000, DFlash2); from 16K on a
++/// pair is ahead. TF_GLM_PROMPT_PAIR_MIN overrides it in ids (0: pair wherever a step can). Rank 0's choice, so the
++/// other ranks need no setting: they take the steps it sends.
++pub const default_min_len = 2 * fw.prefill_rows + 1;
++
++pub fn minLen() usize {
++    const v = std.c.getenv("TF_GLM_PROMPT_PAIR_MIN") orelse return default_min_len;
++    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch default_min_len;
++}
++
+ /// A paired step's second chunk: twins of the prompt buffers, pieces on their side stream, and its first position.
+ pub const Pair = struct {
+     bp: fw.Buffers,
+@@ -63,6 +74,7 @@ pub fn ringsAgree(base: usize, ring: usize, start: usize, rb: usize) bool {
+ pub fn pairedAt(e: *const Engine, start: usize, len: usize, from: ?engine.Resume, marks: ?engine.Marks) bool {
+     if (e.pair == null or !e.settings.pair or !drafterFits(e) or e.prompt_logprobs != null or e.prompt_profs[3] != null) return false;
+     if (e.pieces.count == 1 and !e.settings.split) return false; // run takes such a chunk whole
++    if (len < minLen()) return false; // too short to gain from a pair
+     if (!takesTwo(start, len, e.share.world, if (marks) |m| m.at else &.{})) return false;
+     // a resumed step restores its kept state, and the rings' base, after this choice
+     const base = if (from) |r| (e.snaps.get(r.id) orelse return false).bases[0] else e.cur.st.base;
+diff --git a/zig/tests/cuda/glm_pair_tests.zig b/zig/tests/cuda/glm_pair_tests.zig
+index 633e1d9c..e86b55a9 100644
+--- a/zig/tests/cuda/glm_pair_tests.zig
++++ b/zig/tests/cuda/glm_pair_tests.zig
+@@ -89,7 +89,7 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
+         var base: usize = 0;
+         var at: usize = 0;
+         while (at < len) {
+-            const two = glm.prompt_pair.takesTwo(at, len, e.share.world, case.marks) and glm.prompt_pair.ringsAgree(base, st.ring_rows, at, @min(len - at - C, C));
++            const two = len >= glm.prompt_pair.minLen() and glm.prompt_pair.takesTwo(at, len, e.share.world, case.marks) and glm.prompt_pair.ringsAgree(base, st.ring_rows, at, @min(len - at - C, C));
+             const rows = @min(len - at, @as(usize, if (two) 2 * C else C));
+             if (at + rows > base + st.ring_rows) base = at; // State.ready rebases at the step's start, a whole pool
+             want += @intFromBool(two);
+-- 
+2.53.0
+

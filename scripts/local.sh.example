@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Copy to scripts/local.sh (gitignored). Exported environment values take precedence over it.
+# Every setting and its default is in scripts/config.sh; the README's settings table explains them.
+GPUS=0,1                     # rank 0 (HTTP server, vision tower) on GPU 0, rank 1 on GPU 1 (the desktop's GPU)
+PORT=8020
+# The first start downloads the pinned 4 bpw checkpoint into DATA_DIR/model. To serve a checkpoint you already have instead:
+# MODEL_SOURCE=local
+# MODEL_DIR=/path/to/GLM-5.3-Flash-EXL3-checkpoint   # read-only, never downloaded
+# ABLIT=1                      # the gated Ablit weights instead (README "Ablit weights"); needs HF_TOKEN below
+# HF_TOKEN=hf_...              # a Hugging Face read token whose account agreed to the Ablit model's terms
+DRAFTER=dflash2              # mtp: the checkpoint's MTP head (no non-commercial weights); none: no drafts
+PARALLEL=4
+CONTEXT=auto                 # or a token count up to 1048576
+KV=fp8                       # bf16: exact caches on shared KV pages
+DENSE=q8                     # bf16: the checkpoint's dense weights as stored (about 4-5 GiB more a GPU)
+MEMORY_RESERVE_GIB=4
+MAX_GPU_USED_MIB=4096        # tolerate a desktop on one of the GPUs
+# THINKING=1
+# VISION=0
+# PROMPT_CACHE_GIB=8
+# SERVE_EXTRA_ARGS='--top-k 20'
+# Keep downloads, the drafter and the engine's digest cache outside the checkout:
+# DATA_DIR=/mnt/models/glm53
+# TENSORFOLD_API_KEY and HF_TOKEN may be exported; never commit them.

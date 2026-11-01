@@ -1,0 +1,107 @@
+From b56eb676ca9f077bcddfae1a14554864a682970f Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 16:52:37 +0200
+Subject: [PATCH 23/25] glm cuda: paged E4M3 chunks load a dense chunk as the
+ window does and a sparse key by shift and mask
+
+6423db15's paged chunks took every key through int64 signed / 512, % 512 and a table step, the dense chunk's
+included: 456 more SASS instructions than the window (+21%, mostly IMAD and SHF in the three unrolled fetch8 sites).
+Measured on the engine-flag fatbin (opt/pk-kernels/bench_paged_fp8.cu: pages 3.27 MB apart, shuffled table) that
+made them 7-24% slower than the window, with pages back to back as well, so the cost was the arithmetic, not the
+translations.
+
+Now:
+- A dense chunk is one page, so its codes and scales are the window's at bases moved once per block (as BF16's
+  keys_at), and its keys load with the window's arithmetic.
+- A sparse key's logical token is a visible position (0 <= s < 2^31): its page pt[s >> 9], its row s & 511, its
+  codes and scale at page * pstep from the part's codes and scales in page 0.
+
+The loaded bytes are the same, so every partial is too. The window's and BF16's SASS are unchanged (byte-compared
+against 6423db15), as are lat_write_fp8_paged's.
+
+Bitwise, paged vs window, every timed shape at 65,747 and 409,677 keys (partial last pages): decode 1/2/4/8 rows
+hb16 dense and sparse, 2,048-row sparse prompt hb32, the dense prompt (4 x 512 rows hb32), empty sparse rows at hb16
+and hb32, 1,000 keys at hb16 and hb32. All equal (po, pm, pl), as is opt/mem2-wt/check_paged_fp8.cu at 513, 2,047,
+9,000 and 30,000 keys.
+
+Median kernel time, paged / window, before -> after (RTX PRO 6000, live server up):
+- sparse decode 1-8 rows: 1.07-1.24 -> 0.86-1.04
+- dense decode 1-8 rows: 1.11-1.16 -> 0.86-0.92
+- sparse prompt 2,048 rows: 1.21 / 1.16 -> 0.96 / 0.99 (64K / 400K keys)
+- dense prompt: 1.06 -> 0.94
+
+Registers, nvcc 13.3, sm_80/86/89/120/121, no spills on any:
+- chunks_16_fp8_paged: 164/164/156/125/125 (was 178/178/128/128/128)
+- chunks_32_fp8_paged: 202/202/198/159/159 (was 218/218/196/159/159)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj6TMcvsfVhxuBcBLg
+---
+ zig/kernels/cuda/glm_glue_attn.cuh | 43 +++++++++++++++++++++---------
+ 1 file changed, 30 insertions(+), 13 deletions(-)
+
+diff --git a/zig/kernels/cuda/glm_glue_attn.cuh b/zig/kernels/cuda/glm_glue_attn.cuh
+index c2ecc16c..7e51b830 100644
+--- a/zig/kernels/cuda/glm_glue_attn.cuh
++++ b/zig/kernels/cuda/glm_glue_attn.cuh
+@@ -81,27 +81,44 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+   constexpr int UPT = KT * (LW / 8) / CHUNK_THREADS;  // units a thread moves a tile
+   uint2 raw[FP8 ? UPT : 1];
+   float rsc[FP8 ? UPT : 1];
+-  // on pages: a dense chunk's page (its 512 keys are that page's rows), found once
+-  const int64_t dense_page = PAGED8 && !sparse && live ? (int64_t)pt[c] * pstep : 0;
++  // on pages, a dense chunk is one page: its codes and scales are the window's at bases moved once (as keys_at above),
++  // so its keys load with the window's arithmetic; a sparse key's logical token goes through the table to its page.
++  const unsigned char* codes8 = reinterpret_cast<const unsigned char*>(lc);
++  const float* scales8 = scales;
++  if constexpr (PAGED8) {
++    if (!sparse && live) {
++      const int64_t page = (int64_t)pt[c] * pstep;
++      codes8 += page - start * LW;
++      scales8 = reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(scales) + page) - start;
++    }
++  }
+   auto fetch8 = [&](int tile) {
+-    const unsigned char* codes = reinterpret_cast<const unsigned char*>(lc);
+     const int64_t first = start + tile * KT;
++    if constexpr (PAGED8) {
++      if (sparse) {
++        const unsigned char* scale_bytes = reinterpret_cast<const unsigned char*>(scales);
++#pragma unroll
++        for (int i = 0; i < UPT; ++i) {
++          const int idx = t + i * CHUNK_THREADS, key = idx / (LW / 8), u = idx % (LW / 8);
++          const int64_t ki = first + key;
++          const bool ok = ki < n;
++          const int s = ok ? tok[r * w + ki] : 0;  // a visible position: 0 <= s < 2^31
++          const int64_t page = ok ? (int64_t)pt[s >> 9] * pstep : 0;  // CH = 512 rows a page
++          const int row = s & (CH - 1);
++          raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes8 + page + (row * LW + u * 8))) : make_uint2(0u, 0u);
++          rsc[i] = ok ? __ldg(reinterpret_cast<const float*>(scale_bytes + page + row * 4)) : 1.0f;
++        }
++        return;
++      }
++    }
+ #pragma unroll
+     for (int i = 0; i < UPT; ++i) {
+       const int idx = t + i * CHUNK_THREADS, key = idx / (LW / 8), u = idx % (LW / 8);
+       const int64_t ki = first + key;
+       const bool ok = sparse ? ki < n : ki <= limit;
+       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+-      if constexpr (PAGED8) {
+-        const int64_t page = sparse ? (ok ? (int64_t)pt[src / CH] * pstep : 0) : dense_page;
+-        const int64_t row = src % CH;
+-        const float* row_scale = reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(scales) + page) + row;
+-        raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes + page + row * LW + u * 8)) : make_uint2(0u, 0u);
+-        rsc[i] = ok ? __ldg(row_scale) : 1.0f;
+-      } else {
+-        raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes + src * LW + u * 8)) : make_uint2(0u, 0u);
+-        rsc[i] = ok ? __ldg(scales + src) : 1.0f;
+-      }
++      raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes8 + src * LW + u * 8)) : make_uint2(0u, 0u);
++      rsc[i] = ok ? __ldg(scales8 + src) : 1.0f;
+     }
+   };
+   auto store8 = [&](int tile) {
+-- 
+2.53.0
+

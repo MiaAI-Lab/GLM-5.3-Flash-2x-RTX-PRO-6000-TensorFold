@@ -1,0 +1,93 @@
+From 4d8f4733729d2d735b0ea8c10951d230f4dbe72c Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 20:08:53 +1100
+Subject: [PATCH 26/63] exl3 cuda: the grouped experts kernel loads a tile
+ ahead
+
+warp_tiles issues the next k tile's lane words before decoding the current one (exllamav3's experts kernel at
+pf = 1). The decode, the mma chain and the warp sums are unchanged: same SASS arithmetic, same bits. On GB10,
+MiMo-V2.6-Flash's routed experts go from 110 to 97 us a layer step; GLM-5.3-Flash decodes the same tokens.
+Records: nvcc 13.0's measured on all five SMs (registers 145-168) and marked later_pending; nvcc 13.3's measured
+receipt in pending_133.zig; 13.2 stays pending (no 13.2 compiler here), and its stale grouped_1 override goes.
+---
+ zig/kernels/cuda/exl3_experts.cu                  | 15 ++++++++++++---
+ .../core/contract/measurements/pending_133.zig    |  3 +++
+ zig/src/core/contract/registry.zig                |  7 +++----
+ 3 files changed, 18 insertions(+), 7 deletions(-)
+
+diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
+index c5a0ed2e..e03bbbba 100644
+--- a/zig/kernels/cuda/exl3_experts.cu
++++ b/zig/kernels/cuda/exl3_experts.cu
+@@ -23,17 +23,26 @@ struct GroupedArgs {
+     int k, n, p, sk, maxm, slots, nexp_max, mats, ns, standard, skip;
+ };
+ 
+-// One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc: per-lane loads and the shared decode (same bits).
++// One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc: per-lane loads a tile ahead, the shared decode.
+ template <int CB, int K2, int NT>
+ __device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt0, int nkt, int nt0, const half* x0,
+                                            const half* x1, bool ok0, bool ok1, int lane, float (&acc)[NT][2][4]) {
+     constexpr int TW = tile_words<K2>(), LW = lane_words<K2>();
+     const size_t kstride = (size_t)ntiles * TW;
++    const uint32_t* tb = T + (size_t)kt0 * kstride + (size_t)nt0 * TW;
++    uint32_t nx[NT][LW];  // the next tile's words, in flight while this one decodes
++    if (nkt > 0)
++#pragma unroll
++        for (int j = 0; j < NT; ++j) ldg_lane_words<K2>(tb + j * TW, lane, nx[j]);
+     for (int i = 0; i < nkt; ++i) {
+-        const uint32_t* t0 = T + (size_t)(kt0 + i) * kstride + (size_t)nt0 * TW;
+         uint32_t w[NT][LW];
+ #pragma unroll
+-        for (int j = 0; j < NT; ++j) ldg_lane_words<K2>(t0 + j * TW, lane, w[j]);
++        for (int j = 0; j < NT; ++j)
++#pragma unroll
++            for (int l = 0; l < LW; ++l) w[j][l] = nx[j][l];
++        if (i + 1 < nkt)
++#pragma unroll
++            for (int j = 0; j < NT; ++j) ldg_lane_words<K2>(tb + (size_t)(i + 1) * kstride + j * TW, lane, nx[j]);
+         const int k = (kt0 + i) * 16;
+         const uint32_t a[4] = {ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k) : 0u,
+                                ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k) : 0u,
+diff --git a/zig/src/core/contract/measurements/pending_133.zig b/zig/src/core/contract/measurements/pending_133.zig
+index 6ab90d70..4acd0a3b 100644
+--- a/zig/src/core/contract/measurements/pending_133.zig
++++ b/zig/src/core/contract/measurements/pending_133.zig
+@@ -1,6 +1,9 @@
+ //! nvcc 13.3 receipts for pending launches: the five-SM fatbins' usage as kernel-contract-limits printed it.
+ const Override = @import("../registry.zig").Override;
+ pub const records = [_]Override{
++    .{ .name = "exl3_experts tf_exl3_grouped_0", .usage = .{ .{ .regs = 168, .static = 32832, .bound = 0 }, .{ .regs = 168, .static = 32832, .bound = 0 }, .{ .regs = 168, .static = 32832, .bound = 0 }, .{ .regs = 158, .static = 32832, .bound = 0 }, .{ .regs = 158, .static = 32832, .bound = 0 } } },
++    .{ .name = "exl3_experts tf_exl3_grouped_1", .usage = .{ .{ .regs = 165, .static = 32832, .bound = 0 }, .{ .regs = 165, .static = 32832, .bound = 0 }, .{ .regs = 165, .static = 32832, .bound = 0 }, .{ .regs = 158, .static = 32832, .bound = 0 }, .{ .regs = 158, .static = 32832, .bound = 0 } } },
++    .{ .name = "exl3_experts tf_exl3_grouped_2", .usage = .{ .{ .regs = 161, .static = 32832, .bound = 0 }, .{ .regs = 161, .static = 32832, .bound = 0 }, .{ .regs = 161, .static = 32832, .bound = 0 }, .{ .regs = 148, .static = 32832, .bound = 0 }, .{ .regs = 148, .static = 32832, .bound = 0 } } },
+     .{ .name = "GLM BF16 tf_ctl_glm_old_hc_finish", .usage = .{ .{ .regs = 64, .static = 48, .bound = 256 }, .{ .regs = 64, .static = 48, .bound = 256 }, .{ .regs = 64, .static = 48, .bound = 256 }, .{ .regs = 64, .static = 48, .bound = 256 }, .{ .regs = 64, .static = 48, .bound = 256 } } },
+     .{ .name = "GLM BF16 tf_ctl_glm_old_rmsnorm_1536", .usage = .{ .{ .regs = 40, .static = 16, .bound = 128 }, .{ .regs = 40, .static = 16, .bound = 128 }, .{ .regs = 40, .static = 16, .bound = 128 }, .{ .regs = 38, .static = 16, .bound = 128 }, .{ .regs = 38, .static = 16, .bound = 128 } } },
+     .{ .name = "GLM BF16 tf_ctl_glm_old_rmsnorm_4096", .usage = .{ .{ .regs = 40, .static = 32, .bound = 256 }, .{ .regs = 40, .static = 32, .bound = 256 }, .{ .regs = 40, .static = 32, .bound = 256 }, .{ .regs = 40, .static = 32, .bound = 256 }, .{ .regs = 40, .static = 32, .bound = 256 } } },
+diff --git a/zig/src/core/contract/registry.zig b/zig/src/core/contract/registry.zig
+index 7daeb12c..4fb8fc5c 100644
+--- a/zig/src/core/contract/registry.zig
++++ b/zig/src/core/contract/registry.zig
+@@ -179,9 +179,9 @@ pub const cuda = @import("flashnext_cuda_records.zig").cuda ++ [_]CudaRecord{
+     .{ .launch = .{ .name = "exl3_linear tf_exl3_linear_16_0_8", .symbol = "tf_exl3_linear_16_0_8", .image = "exl3_linear", .threads = 256, .dynamic = 32768 }, .usage = .{ .{ .regs = 220, .static = 16, .bound = 256 }, .{ .regs = 220, .static = 16, .bound = 256 }, .{ .regs = 220, .static = 16, .bound = 256 }, .{ .regs = 125, .static = 16, .bound = 256 }, .{ .regs = 125, .static = 16, .bound = 256 } } },
+     .{ .launch = .{ .name = "exl3_experts tf_exl3_group", .symbol = "tf_exl3_group", .image = "exl3_experts", .threads = 1024, .dynamic = 49152, .opt_in = true }, .usage = .{ .{ .regs = 32, .static = 128, .bound = 1024 }, .{ .regs = 42, .static = 128, .bound = 1024 }, .{ .regs = 42, .static = 128, .bound = 1024 }, .{ .regs = 42, .static = 128, .bound = 1024 }, .{ .regs = 42, .static = 128, .bound = 1024 } } },
+     .{ .launch = .{ .name = "exl3_experts tf_exl3_experts_rot_in", .symbol = "tf_exl3_experts_rot_in", .image = "exl3_experts", .threads = 32 }, .usage = .{ .{ .regs = 24, .static = 0, .bound = 0 }, .{ .regs = 24, .static = 0, .bound = 0 }, .{ .regs = 24, .static = 0, .bound = 0 }, .{ .regs = 19, .static = 0, .bound = 0 }, .{ .regs = 19, .static = 0, .bound = 0 } } },
+-    .{ .launch = .{ .name = "exl3_experts tf_exl3_grouped_0", .symbol = "tf_exl3_grouped_0", .image = "exl3_experts", .threads = 128 }, .usage = .{ .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 127, .static = 32832, .bound = 0 }, .{ .regs = 127, .static = 32832, .bound = 0 } } },
+-    .{ .launch = .{ .name = "exl3_experts tf_exl3_grouped_1", .symbol = "tf_exl3_grouped_1", .image = "exl3_experts", .threads = 128 }, .usage = .{ .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 127, .static = 32832, .bound = 0 }, .{ .regs = 127, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 } } },
+-    .{ .launch = .{ .name = "exl3_experts tf_exl3_grouped_2", .symbol = "tf_exl3_grouped_2", .image = "exl3_experts", .threads = 128 }, .usage = .{ .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 } } },
++    .{ .launch = .{ .name = "exl3_experts tf_exl3_grouped_0", .symbol = "tf_exl3_grouped_0", .image = "exl3_experts", .threads = 128 }, .usage = .{ .{ .regs = 168, .static = 32832, .bound = 0 }, .{ .regs = 168, .static = 32832, .bound = 0 }, .{ .regs = 168, .static = 32832, .bound = 0 }, .{ .regs = 149, .static = 32832, .bound = 0 }, .{ .regs = 149, .static = 32832, .bound = 0 } }, .later_pending = true },
++    .{ .launch = .{ .name = "exl3_experts tf_exl3_grouped_1", .symbol = "tf_exl3_grouped_1", .image = "exl3_experts", .threads = 128 }, .usage = .{ .{ .regs = 164, .static = 32832, .bound = 0 }, .{ .regs = 164, .static = 32832, .bound = 0 }, .{ .regs = 164, .static = 32832, .bound = 0 }, .{ .regs = 157, .static = 32832, .bound = 0 }, .{ .regs = 157, .static = 32832, .bound = 0 } }, .later_pending = true },
++    .{ .launch = .{ .name = "exl3_experts tf_exl3_grouped_2", .symbol = "tf_exl3_grouped_2", .image = "exl3_experts", .threads = 128 }, .usage = .{ .{ .regs = 161, .static = 32832, .bound = 0 }, .{ .regs = 161, .static = 32832, .bound = 0 }, .{ .regs = 161, .static = 32832, .bound = 0 }, .{ .regs = 145, .static = 32832, .bound = 0 }, .{ .regs = 145, .static = 32832, .bound = 0 } }, .later_pending = true },
+     .{ .launch = .{ .name = "exl3_experts tf_exl3_gateup_epilogue", .symbol = "tf_exl3_gateup_epilogue", .image = "exl3_experts", .threads = 32 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "exl3_experts tf_exl3_down_combine", .symbol = "tf_exl3_down_combine", .image = "exl3_experts", .threads = 1024 }, .usage = .{ .{ .regs = 32, .static = 16384, .bound = 0 }, .{ .regs = 40, .static = 16384, .bound = 0 }, .{ .regs = 40, .static = 16384, .bound = 0 }, .{ .regs = 44, .static = 16384, .bound = 0 }, .{ .regs = 44, .static = 16384, .bound = 0 } } },
+     .{ .launch = .{ .name = "exl3_experts tf_exl3_plan_rotate", .symbol = "tf_exl3_plan_rotate", .image = "exl3_experts", .threads = 32 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 33, .static = 0, .bound = 0 }, .{ .regs = 33, .static = 0, .bound = 0 }, .{ .regs = 31, .static = 0, .bound = 0 }, .{ .regs = 31, .static = 0, .bound = 0 } } },
+@@ -295,7 +295,6 @@ pub const cuda_sets = [_]CudaSet{
+         .{ .name = "experts3_prefill pair", .usage = .{ .{ .regs = 179, .static = 0, .bound = 256 }, .{ .regs = 179, .static = 0, .bound = 256 }, .{ .regs = 179, .static = 0, .bound = 256 }, .{ .regs = 150, .static = 0, .bound = 256 }, .{ .regs = 150, .static = 0, .bound = 256 } } },
+         .{ .name = "experts3 tf_experts3_widen", .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 34, .static = 0, .bound = 0 }, .{ .regs = 34, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 } } },
+         .{ .name = "exl3_experts tf_exl3_down_combine", .usage = .{ .{ .regs = 32, .static = 16384, .bound = 0 }, .{ .regs = 40, .static = 16384, .bound = 0 }, .{ .regs = 40, .static = 16384, .bound = 0 }, .{ .regs = 42, .static = 16384, .bound = 0 }, .{ .regs = 42, .static = 16384, .bound = 0 } } },
+-        .{ .name = "exl3_experts tf_exl3_grouped_1", .usage = .{ .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 } } },
+         .{ .name = "exl3_experts tf_exl3_plan_rotate", .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 33, .static = 0, .bound = 0 }, .{ .regs = 33, .static = 0, .bound = 0 }, .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 32, .static = 0, .bound = 0 } } },
+         .{ .name = "exl3_experts tf_exl3_plan_finish", .usage = .{ .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 42, .static = 0, .bound = 0 }, .{ .regs = 42, .static = 0, .bound = 0 } } },
+         .{ .name = "exl3_candidate tf_exl3_tc_1", .usage = .{ .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 127, .static = 8196, .bound = 256 }, .{ .regs = 127, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 } } },
+-- 
+2.53.0
+

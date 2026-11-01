@@ -1,0 +1,250 @@
+integ5 0082 = patches/exl3r/0068-exl3-decode-the-4-bit-chain-as-dependent-launches.patch (overnight 2026-10-31), renumbered for the integrated stack on 3f94715d.
+
+exl3 decode: the 4-bit read-once chain as dependent launches (rot_in, gate/up, epilogue, down) (exl3r c3, 2026-10-31)
+
+On 0067. The decode chain's kernels launch with programmatic stream serialization (cuda/exl3_experts.zig core: `.pdl`
+when both projections take the new kernels; TF_EXL3_PDL=0 turns it off, the same bits), so each one's launch and its
+prologue overlap the kernel before it. Hazard rules as pdl5's: before griddepcontrol.wait only immutable loads and the
+plan; every read of another grid's output and every scratch write after it; every CTA waits (no exit before a wait).
+- tf_exl3_experts_rot_in, tf_exl3_gateup_epilogue: wait, then trigger, at entry (no-ops in ordinary launches).
+- tf_exl3_grouped_1_k8r8p / _k8r16p (new; Load SHFL_PDL): before the wait the plan (ucount, uids, members: from the
+  router two launches back, finished because rot_in and the epilogue wait before they trigger), the trellis pointer and
+  width tables and the first k tile's words (immutable); the rows' A fragments and the partials after it; each early
+  exit waits first. sc.z: down writes its partials only after its wait, i.e. after the epilogue has read the gate/up's.
+- tf_exl3_down_combine (after the side stream's join event), tf_exl3_group and the prompt kernels: unchanged.
+pdl5's SASS gate: rot_in and the epilogue 0 pre-wait loads; the grouped p kernels 14 (the audited plan, table and
+first-tile loads), no stores or exits before a wait, the trigger after it.
+Measured [M, exl3r bench_pdl, GPU1, 400 W, cold 4-bit, the four kernels back to back in trains of 8]: the chain against
+production's rot_in + k8r8/nt4 + epilogue + k8r8/nt4: -6.9 / -8.2 / -7.0 / -10.7 / -13.7 / -14.5% at 1/2/4/8/16/32
+rows (0067 alone: -1.2 / -5.5 / -2.8 / -11.1 / -14.8 / -14.3%). Exactness: the dependent chain equals the plain one and
+production's in 108 of 108 cells (5 dependent runs a case, rows 1-32).
+
+diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
+index 1905a9de..ceacc4f4 100644
+--- a/zig/kernels/cuda/exl3_experts.cu
++++ b/zig/kernels/cuda/exl3_experts.cu
+@@ -53,6 +53,17 @@ extern "C" __global__ void tf_exl3_grouped_1_k8r16s(tf_exl3::GroupedArgs a) {
+     tf_exl3::grouped_body_v2<1, 4, 4, GROUPED_SHFL, 8, 16>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+ }
+ 
++// The same as dependent launches (cuda/exl3_experts.zig core's decode chain): plan, trellis pointers and first tile before
++// griddepcontrol.wait, the rows' inputs and the partials after it; launched without the attribute they are k8r8s/k8r16s.
++// Every SM builds the waits (a kernel without them must never launch as a dependent; below sm_90 they compile out).
++constexpr int GROUPED_SHFL_PDL = tf_exl3::SHFL_PDL;
++extern "C" __global__ void tf_exl3_grouped_1_k8r8p(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body_v2<1, 4, 4, GROUPED_SHFL_PDL, 8, 8>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++extern "C" __global__ void tf_exl3_grouped_1_k8r16p(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body_v2<1, 4, 4, GROUPED_SHFL_PDL, 8, 16>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
+ extern "C" __global__ void tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {  // mul1, any width (RED-SNOW's experts)
+     tf_exl3::grouped_body<2, 8, 4, GROUPED_LOAD>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+ }
+@@ -89,6 +100,8 @@ struct RotInArgs {
+ };
+ 
+ extern "C" __global__ void tf_exl3_experts_rot_in(const RotInArgs a) {
++    pdl_wait();  // a dependent launch on the decode chain: the picks are the grid before's; no-op otherwise
++    pdl_trigger();
+     const int p = blockIdx.x, blk = blockIdx.y, mat = blockIdx.z;
+     const int e = a.pick[p];
+     if (e < 0 || e >= a.experts) return;
+@@ -131,6 +144,8 @@ struct GateUpArgs {
+ };
+ 
+ extern "C" __global__ void tf_exl3_gateup_epilogue(const GateUpArgs a) {
++    pdl_wait();  // a dependent launch on the decode chain: z is the grid before's; no-op otherwise
++    pdl_trigger();
+     const int p = blockIdx.x, blk = blockIdx.y;
+     const int e = a.pick[p];
+     if (e < 0 || e >= a.experts) return;
+diff --git a/zig/kernels/cuda/exl3_grouped.cuh b/zig/kernels/cuda/exl3_grouped.cuh
+index c22734bd..88a39a6b 100644
+--- a/zig/kernels/cuda/exl3_grouped.cuh
++++ b/zig/kernels/cuda/exl3_grouped.cuh
+@@ -25,7 +25,20 @@ struct GroupedArgs {
+ 
+ // How a warp reads its k tiles: main's loop, or a tile ahead (sm_120 up); SKIP and STALE are the contract's faults;
+ // SHFL every word once, a tile ahead (warp_tiles_shfl, sm_120 up); SHFL_SRC and SHFL_A its planted faults.
+-enum Load : int { PLAIN = 0, AHEAD = 1, SKIP = 2, STALE = 3, SHFL = 4, SHFL_SRC = 5, SHFL_A = 6 };
++enum Load : int { PLAIN = 0, AHEAD = 1, SKIP = 2, STALE = 3, SHFL = 4, SHFL_SRC = 5, SHFL_A = 6, SHFL_PDL = 7 };
++
++// Dependent launches (sm_90 up; a no-op in a kernel not launched as a dependent): wait for the grids before this one
++// (their outputs visible after it), and let the next dependent launch begin.
++__device__ __forceinline__ void pdl_wait() {
++#if __CUDA_ARCH__ >= 900
++    asm volatile("griddepcontrol.wait;" ::: "memory");
++#endif
++}
++__device__ __forceinline__ void pdl_trigger() {
++#if __CUDA_ARCH__ >= 900
++    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
++#endif
++}
+ 
+ // One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc: per-lane loads and the shared decode (same bits).
+ template <int CB, int K2, int NT, int LOAD>
+@@ -113,17 +126,28 @@ __device__ __forceinline__ void warp_tiles_shfl(const uint32_t* T, int ntiles, i
+     const bool own = TW == 32 || lane < TW;
+     const uint32_t mask = 0x8FFF8FFFu | ((uint32_t)opq >> 8);  // exactly 0x8FFF8FFF (opq < 256), held in a register
+     uint32_t nx[NT], na[4];  // the next tile's word `lane` of each tile and its A fragment, in flight while this decodes
+-    auto load = [&](int i) {
++    auto words = [&](int i) {  // the trellis: immutable, so it may stream in before a dependent launch's wait
+         const uint32_t* t0 = tb + (size_t)i * kstride;
+ #pragma unroll
+         for (int j = 0; j < NT; ++j) nx[j] = own ? ldg_stream_u32(t0 + j * TW + lane) : 0u;
++    };
++    auto rows = [&](int i) {  // the rows' inputs: the grid before this one's outputs
+         const int k = (kt0 + i) * 16;
+         na[0] = ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k) : 0u;
+         na[1] = ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k) : 0u;
+         na[2] = ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k + 8) : 0u;
+         na[3] = ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k + 8) : 0u;
+     };
+-    if (nkt > 0) load(0);
++    auto load = [&](int i) {
++        words(i);
++        rows(i);
++    };
++    if (nkt > 0) words(0);
++    if constexpr (LOAD == SHFL_PDL) {  // a dependent launch: every input of this step and every write after the wait
++        pdl_wait();
++        pdl_trigger();
++    }
++    if (nkt > 0) rows(0);
+     for (int i = 0; i < nkt; ++i) {
+         uint32_t cur[NT], a[4];
+ #pragma unroll
+@@ -252,16 +276,26 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
+ 
+ // grouped_body at one trellis width K2F (no width switch: fewer registers) and RR reduction rows (a member tile of at
+ // most RR rows: decode windows); every column keeps its k slices and warp-order sum, so the bits are grouped_body's.
++// SHFL_PDL (a dependent launch): before its wait a block reads only the plan (uids, count, members: from the router two
++// launches back, done before the grid before this one passed its own wait) and the immutable trellis pointers, widths
++// and first tile; every exit waits first, so every CTA waits.
+ template <int CB, int NT, int W, int LOAD, int K2F, int RR>
+ __device__ __forceinline__ void grouped_body_v2(const GroupedArgs a, int u, int nblock, int zz) {
+-    if (u >= a.ucount[0]) return;
++    constexpr bool PDLW = LOAD == SHFL_PDL;
++    if (u >= a.ucount[0]) {
++        if constexpr (PDLW) pdl_wait();
++        return;
++    }
+     const int MT = (a.maxm + 15) / 16;
+     const int mtile = zz % MT;
+     const int split = (zz / MT) % a.sk;
+     const int mat = zz / MT / a.sk;
+     const half* X = mat ? a.x1 : a.x0;
+     const int e = a.standard ? a.uids[3 * u] : a.uids[u];
+-    if (a.standard && e == a.skip) return;
++    if (a.standard && e == a.skip) {
++        if constexpr (PDLW) pdl_wait();
++        return;
++    }
+     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? a.tp1[e] : a.tp0[e]);
+     const int k2 = mat ? a.k2_1[e] : a.k2_0[e];
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+@@ -277,7 +311,10 @@ __device__ __forceinline__ void grouped_body_v2(const GroupedArgs a, int u, int
+         rows_sh[threadIdx.x] = a.standard ? code : (code >= 0 ? (code >> 5) * a.slots + (code & 31) : -1);
+     }
+     __syncthreads();
+-    if (rows_sh[0] < 0) return; // members come first, so this tile is empty
++    if (rows_sh[0] < 0) { // members come first, so this tile is empty
++        if constexpr (PDLW) pdl_wait();
++        return;
++    }
+     const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
+     const half* x0 = X + (size_t)(r0 < 0 ? 0 : r0) * a.k + 2 * t;
+     const half* x1 = X + (size_t)(r1 < 0 ? 0 : r1) * a.k + 2 * t;
+diff --git a/zig/src/cuda/exl3_experts.zig b/zig/src/cuda/exl3_experts.zig
+index 483051ed..3aee81bf 100644
+--- a/zig/src/cuda/exl3_experts.zig
++++ b/zig/src/cuda/exl3_experts.zig
+@@ -114,7 +114,9 @@ pub const Experts = struct {
+     grouped_nt4: Function, // mcg at 4 tiles a block (the same bits as grouped[1])
+     grouped_r8: [2]Function, // mcg at one width (3-bit, 4-bit), 4 tiles, 8 reduction rows: windows of up to 8 rows
+     grouped_s: [2]Function = undefined, // 4-bit mcg, every trellis word read once: 8 and 16 reduction rows (k8r8s, k8r16s)
++    grouped_p: [2]Function = undefined, // the same as dependent launches (k8r8p, k8r16p: waits, triggers)
+     shfl: bool = true, // TF_EXL3_SHFL=0: 4-bit windows keep the lane-window loads (k8r8, nt4); the same bits either way
++    pdl: bool = true, // TF_EXL3_PDL=0: the read-once chain launches as ordinary launches; the same bits either way
+     gateup: Function,
+     down_combine: Function,
+     prompt: prompt.Kernels = undefined,
+@@ -148,7 +150,9 @@ pub const Experts = struct {
+         e.grouped_nt4 = try e.mod.function("tf_exl3_grouped_1_nt4");
+         e.grouped_r8 = .{ try e.mod.function("tf_exl3_grouped_1_k6r8"), try e.mod.function("tf_exl3_grouped_1_k8r8") };
+         e.grouped_s = .{ try e.mod.function("tf_exl3_grouped_1_k8r8s"), try e.mod.function("tf_exl3_grouped_1_k8r16s") };
++        e.grouped_p = .{ try e.mod.function("tf_exl3_grouped_1_k8r8p"), try e.mod.function("tf_exl3_grouped_1_k8r16p") };
+         e.shfl = envOn("TF_EXL3_SHFL");
++        e.pdl = envOn("TF_EXL3_PDL");
+         e.gateup = try e.mod.function("tf_exl3_gateup_epilogue");
+         e.down_combine = try e.mod.function("tf_exl3_down_combine");
+         return e;
+@@ -189,6 +193,11 @@ pub const Experts = struct {
+     /// (`group`, or a caller's fused grouping with tf_exl3_group's own code, as GLM's decode router does).
+     pub fn core(e: *const Experts, s: Stream, l: Layer, x: u64, x_stride: usize, x_dtype: DType, pick: u64, rows: usize, sc: Scratch) !void {
+         const g = try Geometry.of(l, rows, sc);
++        const gt = e.tilesFor(l, rows, .gate_up);
++        const dt = e.tilesFor(l, rows, .down);
++        // dependent launches when both projections take the kernels that wait (k8r8p/k8r16p): rot_in and the epilogue
++        // wait first and trigger; the grouped kernels read the plan, trellis pointers and first tile before their wait
++        const chain = gt.pdl and dt.pdl;
+         var r: launch_.Args = .{};
+         r.add(x);
+         r.add(i32d(x_stride));
+@@ -201,7 +210,7 @@ pub const Experts = struct {
+         r.add(i32d(g.d));
+         r.add(i32d(g.slots));
+         r.add(i32d(l.experts));
+-        try launch_.launch(e.rot_in, .{ .grid = .{ .x = @intCast(g.p), .y = @intCast(g.d / 128), .z = 2 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &r);
++        try launch_.launch(e.rot_in, .{ .grid = .{ .x = @intCast(g.p), .y = @intCast(g.d / 128), .z = 2 }, .block = .{ .x = 32, .y = 1, .z = 1 }, .pdl = chain }, s, &r);
+ 
+         var gu: launch_.Args = .{};
+         gu.add(sc.xg);
+@@ -225,8 +234,7 @@ pub const Experts = struct {
+         gu.add(i32d(l.gu_stride));
+         gu.add(@as(i32, 0));
+         gu.add(@as(i32, -1));
+-        const gt = e.tilesFor(l, rows, .gate_up);
+-        try launch_.launch(gt.f, .{ .grid = .{ .x = @intCast(g.maxu), .y = @intCast(g.w / (gt.nt * 16)), .z = @intCast(2 * g.g_sk * g.mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &gu);
++        try launch_.launch(gt.f, .{ .grid = .{ .x = @intCast(g.maxu), .y = @intCast(g.w / (gt.nt * 16)), .z = @intCast(2 * g.g_sk * g.mt) }, .block = .{ .x = 128, .y = 1, .z = 1 }, .pdl = chain }, s, &gu);
+ 
+         var ep: launch_.Args = .{};
+         ep.add(sc.z);
+@@ -241,7 +249,7 @@ pub const Experts = struct {
+         ep.add(i32d(l.experts));
+         ep.add(l.limit);
+         ep.add(l.act_mode);
+-        try launch_.launch(e.gateup, .{ .grid = .{ .x = @intCast(g.p), .y = @intCast(g.w / 128), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &ep);
++        try launch_.launch(e.gateup, .{ .grid = .{ .x = @intCast(g.p), .y = @intCast(g.w / 128), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 }, .pdl = chain }, s, &ep);
+ 
+         var dn: launch_.Args = .{};
+         dn.add(sc.xd);
+@@ -265,8 +273,7 @@ pub const Experts = struct {
+         dn.add(@as(i32, 0));
+         dn.add(@as(i32, 0));
+         dn.add(@as(i32, -1));
+-        const dt = e.tilesFor(l, rows, .down);
+-        try launch_.launch(dt.f, .{ .grid = .{ .x = @intCast(g.maxu), .y = @intCast(g.d / (dt.nt * 16)), .z = @intCast(g.d_sk * g.mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
++        try launch_.launch(dt.f, .{ .grid = .{ .x = @intCast(g.maxu), .y = @intCast(g.d / (dt.nt * 16)), .z = @intCast(g.d_sk * g.mt) }, .block = .{ .x = 128, .y = 1, .z = 1 }, .pdl = chain }, s, &dn);
+     }
+ 
+     /// The grouped kernel for a projection of `rows` rows and its tiles a block. Only the block's column span, the width
+@@ -275,12 +282,13 @@ pub const Experts = struct {
+     /// windows of up to 8 rows on a projection whose every expert is 3- or 4-bit take the one-width, 8-row form; wider
+     /// windows to 32 rows 4 tiles where it led (down at 1 or 8+ rows, gate/up from 3); else, and other codebooks, 8 tiles.
+     /// A projection the loader verified 4-bit takes the read-once loads at every window to 32 rows (exl3r's cold-weight
+-    /// bench, sm_120, 400 W: gate/up 0, -4, -6, -6, -10% and down 0, -1, -1, -5, -10% at 1, 2, 4, 8, 16 rows).
+-    fn tilesFor(e: *const Experts, l: Layer, rows: usize, which: enum { gate_up, down }) struct { f: Function, nt: usize } {
++    /// bench, sm_120, 400 W: gate/up -1, -5, -3, -10, -12% and down -2, -1, -7, -6, -14% at 1, 2, 4, 8, 16 rows).
++    /// `pdl`: the kernel waits before it reads the grid before's outputs, so it may launch as a dependent.
++    fn tilesFor(e: *const Experts, l: Layer, rows: usize, which: enum { gate_up, down }) struct { f: Function, nt: usize, pdl: bool = false } {
+         const n = if (which == .gate_up) l.width else l.dims;
+         if (l.codebook != .mcg or rows > 32 or n % 64 != 0) return .{ .f = e.grouped[@backingInt(l.codebook)], .nt = 8 };
+         const k2 = if (which == .gate_up) l.uniform_k2_gu else l.uniform_k2_d;
+-        if (e.shfl and k2 == 8) return .{ .f = e.grouped_s[@intFromBool(rows > 8)], .nt = 4 };
++        if (e.shfl and k2 == 8) return .{ .f = (if (e.pdl) e.grouped_p else e.grouped_s)[@intFromBool(rows > 8)], .nt = 4, .pdl = e.pdl };
+         if (rows <= 8 and (k2 == 6 or k2 == 8)) return .{ .f = e.grouped_r8[@intFromBool(k2 == 8)], .nt = 4 };
+         const four = switch (which) {
+             .gate_up => rows >= 3,

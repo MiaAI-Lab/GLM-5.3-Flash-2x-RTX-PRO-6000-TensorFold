@@ -1,0 +1,32 @@
+From 22e3e8d7b82e09bcc07a276cbdfed65dffd9b5cd Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 16:05:43 +0200
+Subject: [PATCH 39/63] glm cuda: decode windows of 16 rows, so a context copy
+ verifies up to 15 tokens a round
+
+window_rows sizes the decode, draft-head and shared-window buffers, each sequence's KDA saves, the sampler's rows and
+a verify window's limit. DFlash2 still drafts 7 a block; context copies (file rewrites, quoted context) take windows up
+to 15 drafts. The kernels loop over a window's rows; the dense matmuls use the same 16-row bucket as 8 rows did.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNmHb8tWDWv2KnBDVCM
+---
+ zig/src/families/glm/cuda_state.zig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index 933b8e6c..cbd681a7 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -18,7 +18,7 @@ const kda_block = @import("cuda_kda_block.zig");
+ /// A prompt chunk's rows (decode.PREFILL_ROWS).
+ pub const prefill_rows = 2048;
+ /// A decode window's rows (Engine's max_rows).
+-pub const window_rows = 8;
++pub const window_rows = 16;
+ /// Prompts one prompt pass takes together (cuda_prompts): a prompt buffer's logits rows, one a prompt.
+ pub const prompt_heads = 16;
+ /// The context the buffers' dense attention partials reach (Buffers' min(capacity, 2560)).
+-- 
+2.53.0
+

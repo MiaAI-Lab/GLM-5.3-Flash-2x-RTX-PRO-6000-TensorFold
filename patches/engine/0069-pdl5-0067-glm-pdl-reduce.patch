@@ -1,0 +1,154 @@
+integ5 0069 = patches/pdl5/0067-glm-pdl-reduce.patch (overnight 2026-10-31), renumbered for the integrated stack on 3f94715d.
+
+pdl5 0067: glm_mm_reduce waits for its matmul and launches as its dependent (TF_GLM_PDL_CHAIN).
+- glm_mm.cu: glm_mm_reduce calls griddepcontrol.wait (qmm_frag::grid_wait) right after its existing trigger, before it
+  reads part, writes out or exits; native sm_120 SASS: ACQBULK at instr 7, nothing but PREEXIT before it.
+- cuda_mm.zig: Chain {reduce, hc, p2p} from TF_GLM_PDL_CHAIN (unset or 1: all, 0: none, or a comma list; TF_GLM_PDL=0
+  turns it off with glm_mm's own PDL); mm.Kernels.chain; the K-slice reduce launches with .pdl = chain.reduce.
+- cuda_moe.zig: the shared expert's side stream gets a copy of the kernels with no chain (side stream excluded).
+- glm_mm_policy_host.zig: the reduce's attribute follows chain.reduce at 1/8/32 rows; Chain.parse's values.
+Exact by construction: same kernels, same arithmetic; every access to another grid's data after the wait.
+
+diff --git a/zig/glm_mm_policy_host.zig b/zig/glm_mm_policy_host.zig
+index 57b20641..2a065ebc 100644
+--- a/zig/glm_mm_policy_host.zig
++++ b/zig/glm_mm_policy_host.zig
+@@ -82,3 +82,22 @@ test "TF_GLM_W8A8: only packed 8-bit prompt calls inside the scratch quantize th
+         try std.testing.expectEqual(@as(u32, 256), cuda.symbols[0]);
+     }
+ }
++
++test "TF_GLM_PDL_CHAIN: a K-sliced call's reduce launches as the matmul's dependent only with chain.reduce" {
++    for ([_]bool{ false, true }) |on| for ([_]usize{ 1, 8, 32 }) |rows| {
++        var k = kernels;
++        k.pdl = true;
++        k.chain.reduce = on;
++        cuda.count = 0;
++        try mm.matmul(&k, .{}, 4096, 2048, .{ .w = 8192, .s = 12288, .n = 4096, .k = 2048, .bits = 8 }, 16384, 32768, rows, false, false);
++        try std.testing.expectEqual(@as(usize, 2), cuda.count);
++        try std.testing.expect(cuda.configs[0].pdl); // the matmul's own, as before
++        try std.testing.expectEqual(@as(u32, 1024), cuda.symbols[1]);
++        try std.testing.expectEqual(on, cuda.configs[1].pdl);
++    };
++    try std.testing.expectEqual(mm.Chain.all, mm.Chain.parse("1").?);
++    try std.testing.expectEqual(mm.Chain{}, mm.Chain.parse("0").?);
++    try std.testing.expectEqual(mm.Chain{ .reduce = true, .p2p = true }, mm.Chain.parse("reduce,p2p").?);
++    try std.testing.expectEqual(mm.Chain{ .hc = true }, mm.Chain.parse("hc").?);
++    try std.testing.expect(mm.Chain.parse("reduce,hc,x") == null);
++}
+diff --git a/zig/kernels/cuda/glm_mm.cu b/zig/kernels/cuda/glm_mm.cu
+index 2eaaa999..840875af 100644
+--- a/zig/kernels/cuda/glm_mm.cu
++++ b/zig/kernels/cuda/glm_mm.cu
+@@ -218,9 +218,11 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
+ 
+ }  // namespace
+ 
+-// The K slices' partials added in slice order, then rounded once.
++// The K slices' partials added in slice order, then rounded once. Dependent launch: it may start while the matmul
++// that writes `part` runs, so every thread waits for that grid before it reads `part` or writes `out` (or exits).
+ extern "C" __global__ void glm_mm_reduce(const float* __restrict__ part, void* __restrict__ out, long long total, int SK, int f32) {
+     qmm_frag::grid_launch();
++    qmm_frag::grid_wait();
+     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+     if (i >= total) return;
+     float acc = part[i];
+diff --git a/zig/src/families/glm/cuda_mm.zig b/zig/src/families/glm/cuda_mm.zig
+index 88e79162..0197d8d2 100644
+--- a/zig/src/families/glm/cuda_mm.zig
++++ b/zig/src/families/glm/cuda_mm.zig
+@@ -36,6 +36,39 @@ pub const Packed = struct {
+     }
+ };
+ 
++/// TF_GLM_PDL_CHAIN: dependent launches past glm_mm's own, each kernel waiting before it touches another grid's
++/// data, so the bits never depend on overlap. "1" (the default) all, "0" none, or a comma list of the names below;
++/// TF_GLM_PDL=0 turns these off with glm_mm's.
++pub const Chain = struct {
++    reduce: bool = false, // glm_mm_reduce launches as its matmul's dependent (not on the shared expert's side stream)
++    hc: bool = false, // a decode window's hc_post, hc_partial8 and hc_finish (cuda_glue)
++    p2p: bool = false, // the peer-store all-gather (cuda/p2p_gather.zig): waits, lets the next grid launch, exchanges
++
++    pub const all: Chain = .{ .reduce = true, .hc = true, .p2p = true };
++
++    /// The chain a TF_GLM_PDL_CHAIN value names; null when a name is none of the three.
++    pub fn parse(v: []const u8) ?Chain {
++        if (std.mem.eql(u8, v, "1")) return all;
++        if (std.mem.eql(u8, v, "0")) return .{};
++        var c: Chain = .{};
++        var it = std.mem.tokenizeScalar(u8, v, ',');
++        while (it.next()) |name| {
++            if (std.mem.eql(u8, name, "reduce")) c.reduce = true else if (std.mem.eql(u8, name, "hc")) c.hc = true else if (std.mem.eql(u8, name, "p2p")) c.p2p = true else return null;
++        }
++        return c;
++    }
++
++    /// The process's chain: TF_GLM_PDL=0 none; else TF_GLM_PDL_CHAIN (unset: all; a bad value: none, logged).
++    pub fn read() Chain {
++        if (std.c.getenv("TF_GLM_PDL")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return .{};
++        const v = std.mem.span(std.c.getenv("TF_GLM_PDL_CHAIN") orelse return all);
++        return parse(v) orelse {
++            std.log.err("TF_GLM_PDL_CHAIN: 1, 0 or a comma list of reduce, hc, p2p (not '{s}'): the chain stays off", .{v});
++            return .{};
++        };
++    }
++};
++
+ /// glm_mm's bf16 kernels by row bucket, the K-slice reduce and the tiling.
+ pub const Kernels = struct {
+     by_rows: [4]cuda.Function, // bf16: 16, 32, 64, 128 rows a block
+@@ -48,6 +81,7 @@ pub const Kernels = struct {
+     tile_packed: [3]cuda.Function, // glm_mm_tile4/6/8: packed rows and their scales into the tiles
+     prompt_fixed_k: bool = false, // opt-in prompt experiment; never selected from the number of batched rows
+     pdl: bool, // dependent launches: a matmul's weights stream in while the kernel before it finishes
++    chain: Chain = .{}, // TF_GLM_PDL_CHAIN: the dependent launches past glm_mm's (none unless load reads them)
+     q8: cuda.Function, // glm_q8_rows: a prompt's bf16 rows to int8 with a scale per row and 64- or 32-group (TF_GLM_W8A8)
+     mm8a8: [2][2]cuda.Function, // [64-, 32-groups][glm_mm8a8_64s3r (to 1024 rows), _128s3r]: int8 rows by the 8-bit codes
+     a8: ?A8 = null, // TF_GLM_W8A8=1: the int8 rows' scratch; null: packed prompts stay on bf16 rows (the default)
+@@ -77,6 +111,7 @@ pub const Kernels = struct {
+         }
+         try k.prompt.allowDynamicShared(smem(128));
+         if (std.c.getenv("TF_GLM_PDL")) |v| k.pdl = !std.mem.eql(u8, std.mem.span(v), "0");
++        k.chain = Chain.read();
+         return k;
+     }
+ };
+@@ -222,7 +257,8 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
+             r.add(@as(c_longlong, @intCast(total)));
+             r.add(@as(c_int, @intCast(sk)));
+             r.add(@as(c_int, @intFromBool(wide)));
+-            try cuda.launch.launch(k.reduce, .{ .grid = .{ .x = @intCast((total + 255) / 256) }, .block = .{ .x = 256 } }, s, &r);
++            // with chain.reduce it may start while the matmul runs: it waits for it before reading `part`
++            try cuda.launch.launch(k.reduce, .{ .grid = .{ .x = @intCast((total + 255) / 256) }, .block = .{ .x = 256 }, .pdl = k.chain.reduce }, s, &r);
+         }
+         done += rows;
+     }
+diff --git a/zig/src/families/glm/cuda_moe.zig b/zig/src/families/glm/cuda_moe.zig
+index 90e4415e..3649cf02 100644
+--- a/zig/src/families/glm/cuda_moe.zig
++++ b/zig/src/families/glm/cuda_moe.zig
+@@ -7,6 +7,7 @@ const experts = @import("cuda_experts.zig");
+ const exl3 = @import("cuda_exl3.zig");
+ const prof_mod = @import("cuda_prof.zig");
+ const projection = @import("cuda_proj.zig");
++const mm_mod = @import("cuda_mm.zig");
+ 
+ /// One MoE layer on a rank: router (bf16 [count][dims]) and fp32 bias, routed experts, shared [gate | up] and down.
+ pub const Layer = struct {
+@@ -79,7 +80,15 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
+         const sd = k.side.?;
+         try sd.fork.record(stream);
+         try sd.s.wait(sd.fork);
+-        try sharedRows(k, sd.s, l, s, x, x_stride, 0, rows, prompt, !grouped(k, l, rows, prompt));
++        // the side stream keeps glm_mm's own dependent launches only: none of TF_GLM_PDL_CHAIN's there
++        var ks = k;
++        var side_mm: mm_mod.Kernels = undefined;
++        if (k.set.mm) |m| {
++            side_mm = m.*;
++            side_mm.chain = .{};
++            ks.set.mm = &side_mm;
++        }
++        try sharedRows(ks, sd.s, l, s, x, x_stride, 0, rows, prompt, !grouped(k, l, rows, prompt));
+         try sd.join.record(sd.s);
+     }
+     var stamp = prof_mod.span(k.prof, stream, .router);

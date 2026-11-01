@@ -1,0 +1,6 @@
+# The image build reads only patches/engine/ (docker/Dockerfile is passed with -f); everything else stays out of
+# the context: logs/, .state/, .git, models, caches.
+**
+!patches/
+!patches/engine/
+!patches/engine/**

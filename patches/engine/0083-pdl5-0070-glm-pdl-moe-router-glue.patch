@@ -1,0 +1,169 @@
+integ5 0083 = pdl5/slot4/0070-glm-pdl-moe-router-glue.patch (overnight 2026-10-31), renumbered for the integrated stack on 3f94715d.
+
+pdl5 0070 (c3, rebased for integ5's order: after graph5 0068, before attn5 0069): a decode window's MoE router glue as
+dependents (TF_GLM_PDL_CHAIN's moe, in the default; TF_GLM_PDL_CHAIN=reduce,hc,p2p is the same binary without it).
+- glm_glue_bmm.cuh: tf_glm_router_tile (an ordinary launch) triggers its dependents first.
+- glm_glue_moe.cuh: glue5's fused tf_glm_topk_group_sum stages the bias (immutable) into shared memory, then waits
+  (the router's slices are an earlier grid's), then triggers; every store after the wait. The fallback
+  tf_glm_topk_group waits first, then triggers.
+- glm_glue_rows.cuh: tf_glm_slice_sum (the DSA index gate's and the fallback's) waits first, then triggers.
+- cuda_glue.zig: Set.pdl_moe; topk_group_sum, topk_group and slice_sum launch with it. cuda_forward.zig: decode
+  windows only. cuda_mm.zig: Chain.moe (in Chain.all). glm_mm_policy_host.zig: its parse cases.
+The EXL3 kernels after the select stay ordinary launches (the common EXL3 module is untouched). Exact by
+construction: the same kernels and arithmetic, every read of another grid's data after its wait.
+
+diff --git a/zig/glm_mm_policy_host.zig b/zig/glm_mm_policy_host.zig
+index f053cbbe..91c64f20 100644
+--- a/zig/glm_mm_policy_host.zig
++++ b/zig/glm_mm_policy_host.zig
+@@ -100,6 +100,8 @@ test "TF_GLM_PDL_CHAIN: a K-sliced call's reduce launches as the matmul's depend
+     try std.testing.expectEqual(mm.Chain{ .reduce = true, .p2p = true }, mm.Chain.parse("reduce,p2p").?);
+     try std.testing.expectEqual(mm.Chain{ .hc = true }, mm.Chain.parse("hc").?);
+     try std.testing.expect(mm.Chain.parse("reduce,hc,x") == null);
++    try std.testing.expectEqual(mm.Chain{ .moe = true, .hc = true }, mm.Chain.parse("moe,hc").?);
++    try std.testing.expect(mm.Chain.all.moe and mm.Chain.all.reduce and mm.Chain.all.hc and mm.Chain.all.p2p);
+ }
+ 
+ test "decode two-problem launches keep each problem's split K, one reduce for both, and refuse what matmul would not run" {
+diff --git a/zig/kernels/cuda/glm_glue_bmm.cuh b/zig/kernels/cuda/glm_glue_bmm.cuh
+index 5c5c4cc4..3b09d6e5 100644
+--- a/zig/kernels/cuda/glm_glue_bmm.cuh
++++ b/zig/kernels/cuda/glm_glue_bmm.cuh
+@@ -308,6 +308,8 @@ extern "C" __global__ void __launch_bounds__(256, 2)
+ extern "C" __global__ void __launch_bounds__(128)
+     tf_glm_router_tile(const __nv_bfloat16* x, const __nv_bfloat16* w, float* part, int64_t rows, int64_t x_stride,
+                        int64_t d, int64_t ne, int ks) {
++  // an ordinary launch that lets the select after it (a dependent launch on decode windows, waiting first) launch now
++  glm_triton::pdl_trigger();
+   constexpr int BM = 64, BE = 32, KS = 64, LD = KS + 8, A = BM * LD, B = BE * LD, STAGE = (A + B) * 2, RPI = 16;
+   __shared__ __align__(16) __nv_bfloat16 sm[2][A + B];
+   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, q = lane & 3;
+diff --git a/zig/kernels/cuda/glm_glue_moe.cuh b/zig/kernels/cuda/glm_glue_moe.cuh
+index 52a5e3e8..4cf89a58 100644
+--- a/zig/kernels/cuda/glm_glue_moe.cuh
++++ b/zig/kernels/cuda/glm_glue_moe.cuh
+@@ -263,6 +263,10 @@ extern "C" __global__ void __launch_bounds__(tf_exl3::GROUP_THREADS)
+   __shared__ int cnt[512], place[512];
+   const int total = rows * ne;
+   for (int i = threadIdx.x; i < ne; i += blockDim.x) sb[i] = bias[i];
++  // Dependent launch (decode windows): the bias (immutable) is staged before the wait; the router's slices, an
++  // earlier grid's, and every store come after it.
++  pdl_wait();
++  pdl_trigger();
+   for (int i = threadIdx.x; i < total; i += blockDim.x) {
+     float v[glm_moe::ROUTER_KS];
+ #pragma unroll
+@@ -289,6 +293,9 @@ extern "C" __global__ void __launch_bounds__(tf_exl3::GROUP_THREADS)
+     tf_glm_topk_group(const float* logits, const float* bias, int* pick, float* wts, float scale, int ne, int top_k, int norm,
+                       int rows, int* pick8, int* uids, int* ucount, int* members) {
+   __shared__ int sh_pick[tf_exl3::GROUP_THREADS];
++  // Dependent launch (decode windows): the logits are an earlier grid's, so the wait comes first.
++  pdl_wait();
++  pdl_trigger();
+   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+   if (warp < rows) glm_moe::topk_row(warp, lane, logits, bias, pick, wts, scale, ne, top_k, norm, sh_pick);
+   __syncthreads();
+diff --git a/zig/kernels/cuda/glm_glue_rows.cuh b/zig/kernels/cuda/glm_glue_rows.cuh
+index 7eb5142a..ff5d180c 100644
+--- a/zig/kernels/cuda/glm_glue_rows.cuh
++++ b/zig/kernels/cuda/glm_glue_rows.cuh
+@@ -141,6 +141,9 @@ extern "C" __global__ void tf_glm_combine(
+ 
+ // glue._router_sum and qmm._reduce: ks slices of `total` fp32 added in order (fp32 or bf16 out), 8 values a thread.
+ extern "C" __global__ void tf_glm_slice_sum(const float* part, void* out, int64_t total, int ks, int f32) {
++  // Dependent launch (decode windows): the slices are an earlier grid's, so the wait comes first.
++  pdl_wait();
++  pdl_trigger();
+   const int64_t i0 = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
+   if (i0 >= total) return;
+   const bool aligned = ((reinterpret_cast<uintptr_t>(out) | reinterpret_cast<uintptr_t>(part)) & 15) == 0;
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 4ee0cd25..3fb4a759 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -220,7 +220,7 @@ pub const Forward = struct {
+     absorb_mma: bool = false, // TF_GLM_ABSORB_MMA=1: a prompt pass's absorb_q and expand_v on tensor cores
+ 
+     pub fn set(f: *const Forward) glue.Set {
+-        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .absorb_mma = f.absorb_mma and f.ranks[0].b.prefill, .dsel = f.m.dsel, .pdl_hc = f.m.mm.chain.hc and !f.ranks[0].b.prefill };
++        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .absorb_mma = f.absorb_mma and f.ranks[0].b.prefill, .dsel = f.m.dsel, .pdl_hc = f.m.mm.chain.hc and !f.ranks[0].b.prefill, .pdl_moe = f.m.mm.chain.moe and !f.ranks[0].b.prefill };
+     }
+ 
+     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index 5dcdafe9..e234e982 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -9,7 +9,8 @@ const index_mod = @import("cuda_index.zig");
+ /// `absorb_mma`: TF_GLM_ABSORB_MMA=1 on a prompt pass (absorb_q and expand_v on tensor cores, cuda_latent).
+ /// `dsel`: a decode window's DSA select on many CTAs (tf_glm_dsel_*, cuda_sparse; TF_GLM_DSEL, default on).
+ /// `pdl_hc`: a decode window's hc_post, hc_partial8 and hc_finish launch as dependents (TF_GLM_PDL_CHAIN's hc).
+-pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false, pdl_hc: bool = false };
++/// `pdl_moe`: a decode window's slice_sum, topk_group and topk_group_sum launch as dependents (TF_GLM_PDL_CHAIN's moe).
++pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false, pdl_hc: bool = false, pdl_moe: bool = false };
+ 
+ /// A hidden-size norm's weight: bf16, or float32 (FP4-Local's) read as float32 by the _f32w kernels.
+ pub const Norm = union(enum) { bf16: u64, f32: u64 };
+@@ -230,7 +231,8 @@ pub fn selectGroup(set: Set, stream: cuda.Stream, logits: u64, bias: u64, pick:
+     if (rows == 0 or rows > select_group_rows or rows * top_k > 1024 or experts > 4096) return error.TooManyRows;
+     var a: cuda.Args = .{};
+     inline for (.{ logits, bias, pick, wts, scale, cint(experts), cint(top_k), @as(c_int, @intFromBool(norm)), cint(rows), pick8, ids, count, members }) |v| a.add(v);
+-    try cuda.launch.launch(set.glue.topk_group, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, stream, &a);
++    // `pdl_moe`: a dependent launch; the kernel waits before it reads the logits or writes anything
++    try cuda.launch.launch(set.glue.topk_group, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 }, .pdl = set.pdl_moe }, stream, &a);
+ }
+ 
+ /// Shared memory a summed select-and-group takes beyond its static arrays: the rows' sigmoid scores.
+@@ -252,7 +254,8 @@ pub fn selectGroupSum(set: Set, stream: cuda.Stream, part: u64, logits: u64, bia
+     if (shared > select_group_sum_shared) return false;
+     var a: cuda.Args = .{};
+     inline for (.{ part, logits, bias, pick, wts, scale, cint(experts), cint(top_k), @as(c_int, @intFromBool(norm)), cint(rows), pick8, ids, count, members }) |v| a.add(v);
+-    try cuda.launch.launch(set.glue.topk_group_sum, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 }, .shared = @intCast(shared) }, stream, &a);
++    // `pdl_moe`: a dependent launch (router_tile before it triggers at its start); the kernel stages the bias, then waits
++    try cuda.launch.launch(set.glue.topk_group_sum, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 }, .shared = @intCast(shared), .pdl = set.pdl_moe }, stream, &a);
+     return true;
+ }
+ 
+@@ -348,7 +351,8 @@ pub fn convShift(set: Set, stream: cuda.Stream, conv: u64, proj: u64, keep: usiz
+ pub fn sliceSum(set: Set, stream: cuda.Stream, part: u64, out: u64, total: usize, ks: usize, wide: bool) !void {
+     var a: cuda.Args = .{};
+     inline for (.{ part, out, i64of(total), cint(ks), @as(c_int, @intFromBool(wide)) }) |v| a.add(v);
+-    try cuda.launch.launch(set.glue.slice_sum, .{ .grid = .{ .x = cdiv(total, 1024) }, .block = .{ .x = 128 } }, stream, &a);
++    // `pdl_moe`: a dependent launch (router_tile before it triggers at its start); the kernel waits before it reads
++    try cuda.launch.launch(set.glue.slice_sum, .{ .grid = .{ .x = cdiv(total, 1024) }, .block = .{ .x = 128 }, .pdl = set.pdl_moe }, stream, &a);
+ }
+ 
+ test "the norm's block is the next power of two of the width" {
+diff --git a/zig/src/families/glm/cuda_mm.zig b/zig/src/families/glm/cuda_mm.zig
+index 14d83c83..c65b8515 100644
+--- a/zig/src/families/glm/cuda_mm.zig
++++ b/zig/src/families/glm/cuda_mm.zig
+@@ -43,8 +43,9 @@ pub const Chain = struct {
+     reduce: bool = false, // glm_mm_reduce launches as its matmul's dependent (not on the shared expert's side stream)
+     hc: bool = false, // a decode window's hc_post, hc_partial8 and hc_finish (cuda_glue)
+     p2p: bool = false, // the peer-store all-gather (cuda/p2p_gather.zig): waits, lets the next grid launch, exchanges
++    moe: bool = false, // a decode window's MoE router glue: slice_sum, topk_group(_sum) launch as dependents (cuda_glue)
+ 
+-    pub const all: Chain = .{ .reduce = true, .hc = true, .p2p = true };
++    pub const all: Chain = .{ .reduce = true, .hc = true, .p2p = true, .moe = true };
+ 
+     /// The chain a TF_GLM_PDL_CHAIN value names; null when a name is none of the three.
+     pub fn parse(v: []const u8) ?Chain {
+@@ -53,7 +54,7 @@ pub const Chain = struct {
+         var c: Chain = .{};
+         var it = std.mem.tokenizeScalar(u8, v, ',');
+         while (it.next()) |name| {
+-            if (std.mem.eql(u8, name, "reduce")) c.reduce = true else if (std.mem.eql(u8, name, "hc")) c.hc = true else if (std.mem.eql(u8, name, "p2p")) c.p2p = true else return null;
++            if (std.mem.eql(u8, name, "reduce")) c.reduce = true else if (std.mem.eql(u8, name, "hc")) c.hc = true else if (std.mem.eql(u8, name, "p2p")) c.p2p = true else if (std.mem.eql(u8, name, "moe")) c.moe = true else return null;
+         }
+         return c;
+     }
+@@ -63,7 +64,7 @@ pub const Chain = struct {
+         if (std.c.getenv("TF_GLM_PDL")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return .{};
+         const v = std.mem.span(std.c.getenv("TF_GLM_PDL_CHAIN") orelse return all);
+         return parse(v) orelse {
+-            std.log.err("TF_GLM_PDL_CHAIN: 1, 0 or a comma list of reduce, hc, p2p (not '{s}'): the chain stays off", .{v});
++            std.log.err("TF_GLM_PDL_CHAIN: 1, 0 or a comma list of reduce, hc, p2p, moe (not '{s}'): the chain stays off", .{v});
+             return .{};
+         };
+     }

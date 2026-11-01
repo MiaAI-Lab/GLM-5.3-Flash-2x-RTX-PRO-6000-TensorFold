@@ -1,0 +1,124 @@
+From 6be7b69d2315495087849592eaf705231aa7b3ab Mon Sep 17 00:00:00 2001
+From: Bizuayeu <30091157+Bizuayeu@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 15:24:32 +0900
+Subject: [PATCH 49/63] glm cuda: the lanes' host checks move to their own
+ file, so the lanes have room under the line limit
+
+---
+ zig/src/families/glm/cuda.zig            |  1 +
+ zig/src/families/glm/cuda_lanes.zig      | 37 ---------------------
+ zig/src/families/glm/cuda_lanes_test.zig | 42 ++++++++++++++++++++++++
+ 3 files changed, 43 insertions(+), 37 deletions(-)
+ create mode 100644 zig/src/families/glm/cuda_lanes_test.zig
+
+diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
+index cf20110d..0d3177d9 100644
+--- a/zig/src/families/glm/cuda.zig
++++ b/zig/src/families/glm/cuda.zig
+@@ -50,6 +50,7 @@ test {
+     _ = @import("cuda_ranks_test.zig");
+     _ = @import("cuda_p2p.zig");
+     _ = @import("cuda_ce.zig");
++    _ = @import("cuda_lanes_test.zig");
+     _ = experts;
+     _ = exl3;
+     _ = vision;
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index d1ce9340..a4746770 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -700,43 +700,6 @@ comptime {
+     std.debug.assert(max_rows <= fw.window_rows);
+ }
+ 
+-test "a lane's slot is chosen before its map entry exists" {
+-    var storage: [8192]u8 = @splat(0);
+-    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+-    var e: engine.Engine = undefined;
+-    e.gpa = fixed.allocator();
+-    var self: Lanes = .{ .x = .{ .e = &e, .link = undefined } };
+-    defer self.lanes.deinit(e.gpa);
+-    var streams: [3]lanes.Stream = undefined;
+-    const Probe = struct {
+-        var bad = false;
+-        fn choose(l: *const Lanes) u32 {
+-            bad = l.lanes.count() != 0;
+-            return 0;
+-        }
+-    };
+-    _ = try self.claimUsing(&streams[0], Probe.choose);
+-    try std.testing.expect(!Probe.bad);
+-    try std.testing.expectEqual(@as(u32, 0), (try self.claim(&streams[0])).slot);
+-    try std.testing.expectEqual(@as(u32, 1), (try self.claim(&streams[1])).slot);
+-    _ = self.lanes.remove(&streams[0]);
+-    try std.testing.expectEqual(@as(u32, 0), (try self.claim(&streams[2])).slot);
+-    try std.testing.expectEqual(@as(u32, 1), (try self.claim(&streams[1])).slot);
+-}
+-
+-test "a failed lane insertion leaves no entry, and a retry takes slot zero" {
+-    var fail = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+-    var e: engine.Engine = undefined;
+-    e.gpa = fail.allocator();
+-    var self: Lanes = .{ .x = .{ .e = &e, .link = undefined } };
+-    defer self.lanes.deinit(e.gpa);
+-    var stream: lanes.Stream = undefined;
+-    try std.testing.expectError(error.OutOfMemory, self.claim(&stream));
+-    try std.testing.expectEqual(@as(usize, 0), self.lanes.count());
+-    fail.fail_index = std.math.maxInt(usize);
+-    try std.testing.expectEqual(@as(u32, 0), (try self.claim(&stream)).slot);
+-}
+-
+ /// Eligibility for the maintained fresh-prompt batching path.
+ pub fn canBatch(s: anytype) bool {
+     return s.prompt_logprobs == null and s.images.len == 0 and s.reuse.saved == null and s.prompt_len <= engine.prompt_rows;
+diff --git a/zig/src/families/glm/cuda_lanes_test.zig b/zig/src/families/glm/cuda_lanes_test.zig
+new file mode 100644
+index 00000000..0a248eb1
+--- /dev/null
++++ b/zig/src/families/glm/cuda_lanes_test.zig
+@@ -0,0 +1,42 @@
++//! cuda_lanes' checks on the host: a lane's slot chosen before its entry exists, and given back.
++const std = @import("std");
++const lanes = @import("lanes");
++const engine = @import("cuda_engine.zig");
++const Lanes = @import("cuda_lanes.zig").Lanes;
++
++test "a lane's slot is chosen before its map entry exists" {
++    var storage: [8192]u8 = @splat(0);
++    var fixed = std.heap.FixedBufferAllocator.init(&storage);
++    var e: engine.Engine = undefined;
++    e.gpa = fixed.allocator();
++    var self: Lanes = .{ .x = .{ .e = &e, .link = undefined } };
++    defer self.lanes.deinit(e.gpa);
++    var streams: [3]lanes.Stream = undefined;
++    const Probe = struct {
++        var bad = false;
++        fn choose(l: *const Lanes) u32 {
++            bad = l.lanes.count() != 0;
++            return 0;
++        }
++    };
++    _ = try self.claimUsing(&streams[0], Probe.choose);
++    try std.testing.expect(!Probe.bad);
++    try std.testing.expectEqual(@as(u32, 0), (try self.claim(&streams[0])).slot);
++    try std.testing.expectEqual(@as(u32, 1), (try self.claim(&streams[1])).slot);
++    _ = self.lanes.remove(&streams[0]);
++    try std.testing.expectEqual(@as(u32, 0), (try self.claim(&streams[2])).slot);
++    try std.testing.expectEqual(@as(u32, 1), (try self.claim(&streams[1])).slot);
++}
++
++test "a failed lane insertion leaves no entry, and a retry takes slot zero" {
++    var fail = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
++    var e: engine.Engine = undefined;
++    e.gpa = fail.allocator();
++    var self: Lanes = .{ .x = .{ .e = &e, .link = undefined } };
++    defer self.lanes.deinit(e.gpa);
++    var stream: lanes.Stream = undefined;
++    try std.testing.expectError(error.OutOfMemory, self.claim(&stream));
++    try std.testing.expectEqual(@as(usize, 0), self.lanes.count());
++    fail.fail_index = std.math.maxInt(usize);
++    try std.testing.expectEqual(@as(u32, 0), (try self.claim(&stream)).slot);
++}
+-- 
+2.53.0
+

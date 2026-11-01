@@ -1,0 +1,63 @@
+From c6a84802a6d11cc5e49e015a2aed0281fc9c61ad Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 19:37:43 +0200
+Subject: [PATCH 47/63] tests: the GLM mm-policy and prompt-workflow host fakes
+ compile again
+
+test-glm-mm-policy-host's Kernels lacked packed_prompt (since the two-stage prompt GEMM) and now decode4's pair
+kernels; test-glm-prompts-host's fake Drafter.Slot lacked mem2's prompt run (first, end), and its Forward and settings
+num3's absorb_mma. Neither suite compiled on 0f67821f; both pass now (3/3, 7/7). Fixtures only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj6TMcvsfVhxuBcBLg
+---
+ zig/glm_mm_policy_host.zig | 2 ++
+ zig/glm_prompt_host.zig    | 5 +++--
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/zig/glm_mm_policy_host.zig b/zig/glm_mm_policy_host.zig
+index c71dc69b..5311dba3 100644
+--- a/zig/glm_mm_policy_host.zig
++++ b/zig/glm_mm_policy_host.zig
+@@ -8,6 +8,8 @@ const kernels: mm.Kernels = .{
+     .reduce = .{ .id = 1024 },
+     .tile = .{},
+     .tile_packed = @splat(.{}),
++    .pair = @splat(.{}), // decode windows' two-problem launches (not this test's)
++    .packed_prompt = @splat(.{}), // the two-stage packed prompt kernels (not this test's)
+     .pdl = false,
+ };
+ test "verify and draft windows keep shape-selected split K at every width" {
+diff --git a/zig/glm_prompt_host.zig b/zig/glm_prompt_host.zig
+index 1c094d17..722c9a24 100644
+--- a/zig/glm_prompt_host.zig
++++ b/zig/glm_prompt_host.zig
+@@ -29,6 +29,7 @@ const fw = struct {
+         split: bool,
+         kda_wide: bool,
+         ring: bool = false,
++        absorb_mma: bool = false, // TF_GLM_ABSORB_MMA (num3): the engine's opt-in prompt numerics, off here
+         taps: ?Taps = null,
+         pub fn run(f: *Forward, ids: []const i32) !void {
+             observed_ring = f.ring;
+@@ -69,7 +70,7 @@ const engine = struct {
+         seqs: [32]Seq = @splat(.{}),
+         bp: fw.Buffers,
+         share: struct { vocab: Vocab = .{} } = .{},
+-        settings: struct { split: bool = true, ring: bool = true, kda_wide: bool = true } = .{},
++        settings: struct { split: bool = true, ring: bool = true, kda_wide: bool = true, numerics: struct { absorb_mma: bool = false } = .{} } = .{},
+         d: u8 = 0,
+         m: u8 = 0,
+         stream: u8 = 0,
+@@ -102,7 +103,7 @@ const engine = struct {
+     pub const Drafter = struct {
+         taps_prefill: u64 = 0,
+         states: [32]Slot = @splat(.{}),
+-        const Slot = struct { ring: ?struct { ptr: u64 } = null };
++        const Slot = struct { ring: ?struct { ptr: u64 } = null, first: i64 = glm.dflash.no_rows, end: i64 = 0 }; // mem2's prompt run
+         pub fn taps(dr: *Drafter, _: bool) fw.Taps {
+             return .{ .out = dr.taps_prefill };
+         }
+-- 
+2.53.0
+

@@ -1,0 +1,119 @@
+integ5 0084 = pdl5/slot4/0071-glm-kda-step-warps.patch (overnight 2026-10-31), renumbered for the integrated stack on 3f94715d.
+
+pdl5 0071 (R4, rebased for integ5's order: after this series' 0070): the KDA decode step with 4 or 2 warps a block for
+small lone windows (exact). TF_GLM_KDA_STEP_WARPS=8 is the same binary without it.
+- glm_kda.cu: tf_glm_kda_step4 and tf_glm_kda_step2, the existing step_kernel_body<WARPS, 16> at WARPS 4 and 2 (256 and
+  512 blocks a layer for 32 heads, against 128). Every warp keeps its 4 value rows, loads and arithmetic, so y and the
+  state are the same bits (bench_kda: byte-identical at rows 1-2048).
+- cuda_kda.zig: kda.chain launches the step with stepWarps(rows) warps: 2 for one row, 4 for 2-8 rows, 8 past 8 rows
+  and for every prompt chunk (measured on GPU0, prep + step + out: −0.80 / −0.46 / −0.38 / −0.07 µs a layer at
+  1/2/4/8 rows; W4/W2 lose from 16 rows and on 2048-row chunks). TF_GLM_KDA_STEP_WARPS: auto (default), 8, 4 or 2.
+  glue5's shared-window chainSegs keeps its WARPS 8 step_segs.
+- Host tests of the dispatch and the setting.
+
+diff --git a/zig/kernels/cuda/glm_kda.cu b/zig/kernels/cuda/glm_kda.cu
+index c25fb5b4..90310dc4 100644
+--- a/zig/kernels/cuda/glm_kda.cu
++++ b/zig/kernels/cuda/glm_kda.cu
+@@ -426,6 +426,22 @@ extern "C" __global__ void __launch_bounds__(256) tf_glm_kda_step(
+     step_kernel_body<8, 16>(H, state_in, q_in, k_save, v_save, g_save, b_save, rows, y_out, state_out);
+ }
+ 
++// The same step with 4 and 2 warps a block (256 and 512 blocks a layer for 32 heads instead of 128): every warp keeps its
++// 4 value rows and its arithmetic, so y and the state are the same bits; small windows spread over more SMs (cuda_kda).
++extern "C" __global__ void __launch_bounds__(128) tf_glm_kda_step4(
++        int H, const float* __restrict__ state_in, const float* __restrict__ q_in, const float* __restrict__ k_save,
++        const __nv_bfloat16* __restrict__ v_save, const float* __restrict__ g_save, const float* __restrict__ b_save,
++        int rows, __nv_bfloat16* __restrict__ y_out, float* __restrict__ state_out) {
++    step_kernel_body<4, 16>(H, state_in, q_in, k_save, v_save, g_save, b_save, rows, y_out, state_out);
++}
++
++extern "C" __global__ void __launch_bounds__(64) tf_glm_kda_step2(
++        int H, const float* __restrict__ state_in, const float* __restrict__ q_in, const float* __restrict__ k_save,
++        const __nv_bfloat16* __restrict__ v_save, const float* __restrict__ g_save, const float* __restrict__ b_save,
++        int rows, __nv_bfloat16* __restrict__ y_out, float* __restrict__ state_out) {
++    step_kernel_body<2, 16>(H, state_in, q_in, k_save, v_save, g_save, b_save, rows, y_out, state_out);
++}
++
+ extern "C" __global__ void __launch_bounds__(128) tf_glm_kda_out(
+         int H, const __nv_bfloat16* __restrict__ y_in, const __nv_bfloat16* __restrict__ G, int g_stride,
+         const __nv_bfloat16* __restrict__ norm_w, float eps, __nv_bfloat16* __restrict__ out) {
+diff --git a/zig/src/families/glm/cuda_kda.zig b/zig/src/families/glm/cuda_kda.zig
+index 5e26f87e..68bb07e7 100644
+--- a/zig/src/families/glm/cuda_kda.zig
++++ b/zig/src/families/glm/cuda_kda.zig
+@@ -15,18 +15,38 @@ pub const Kernels = struct {
+     replay_layers: cuda.Function,
+     prep: cuda.Function,
+     step: cuda.Function,
++    step4: cuda.Function, // the step with 4 and 2 warps a block: the same bits, more blocks for small windows
++    step2: cuda.Function,
+     out: cuda.Function,
+     prep_segs: cuda.Function, // a shared window's segments in one launch each (chainSegs)
+     step_segs: cuda.Function,
+     out_segs: cuda.Function,
++    step_warps: u32 = 0, // TF_GLM_KDA_STEP_WARPS: 0 (unset or auto) by rows (stepWarps); 8, 4 or 2 at every row count
+ 
+     pub fn load(m: cuda.Module) !Kernels {
+         var k: Kernels = undefined;
+-        inline for (.{ "chain", "replay", "replay_layers", "prep", "step", "out", "prep_segs", "step_segs", "out_segs" }) |name| @field(k, name) = try m.function("tf_glm_kda_" ++ name);
++        inline for (.{ "chain", "replay", "replay_layers", "prep", "step", "step4", "step2", "out", "prep_segs", "step_segs", "out_segs" }) |name| @field(k, name) = try m.function("tf_glm_kda_" ++ name);
++        k.step_warps = stepWarpsSetting(if (std.c.getenv("TF_GLM_KDA_STEP_WARPS")) |v| std.mem.span(v) else null);
+         return k;
+     }
+ };
+ 
++/// Warps a lone chain's step block by its rows (measured on GPU0, prep + step + out): 2 for one row, 4 to 8 rows,
++/// 8 past that and for prompt chunks. Each warp keeps its 4 value rows, so every choice gives the same bits.
++pub fn stepWarps(rows: usize) u32 {
++    return if (rows == 1) 2 else if (rows <= 8) 4 else 8;
++}
++
++/// TF_GLM_KDA_STEP_WARPS: unset or "auto" 0 (stepWarps), "8" today's kernel at every row count (the control), "4" or
++/// "2" fixed (diagnostic); anything else is logged and taken as auto. No bit depends on it, so not in the fingerprint.
++pub fn stepWarpsSetting(v: ?[]const u8) u32 {
++    const s = v orelse return 0;
++    if (std.mem.eql(u8, s, "auto")) return 0;
++    for ([_]u32{ 8, 4, 2 }) |w| if (std.mem.eql(u8, s, &[_]u8{'0' + @as(u8, @intCast(w))})) return w;
++    std.log.err("TF_GLM_KDA_STEP_WARPS: auto, 8, 4 or 2 (not '{s}'): auto", .{s});
++    return 0;
++}
++
+ /// The most segments one chainSegs launch takes (glm_kda.cu's KDA_SEGS: Engine.max_shared).
+ pub const max_segs = 16;
+ 
+@@ -120,7 +140,13 @@ pub fn chain(ks: *const Kernels, stream: cuda.Stream, c: Chain, rows: usize, s:
+         b.add(@as(c_int, @intCast(rows)));
+         b.add(w.y);
+         b.add(s.state_out);
+-        try cuda.launch.launch(ks.step, .{ .grid = .{ .x = @intCast(c.heads), .y = dv / 4 / 8 }, .block = .{ .x = 8 * 32 } }, stream, &b);
++        const wp: u32 = if (ks.step_warps != 0) ks.step_warps else stepWarps(rows);
++        const f = switch (wp) {
++            2 => ks.step2,
++            4 => ks.step4,
++            else => ks.step,
++        };
++        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(c.heads), .y = dv / 4 / wp }, .block = .{ .x = wp * 32 } }, stream, &b);
+         var o: cuda.Args = .{};
+         o.add(h);
+         o.add(w.y);
+@@ -161,3 +187,19 @@ pub fn replay(ks: *const Kernels, stream: cuda.Stream, state_in: u64, k: u64, v:
+ test "the three-kernel chain's step grid is the Python family's" {
+     try std.testing.expectEqual(@as(u32, 4), dv / 4 / 8); // DV / 4 / WARPS value rows a block, 8 warps of 4 rows
+ }
++
++test "a lone chain's step warps by rows: 2 for one row, 4 to 8 rows, 8 past that; every grid covers the value rows" {
++    try std.testing.expectEqual(@as(u32, 2), stepWarps(1));
++    for ([_]usize{ 2, 3, 4, 8 }) |r| try std.testing.expectEqual(@as(u32, 4), stepWarps(r));
++    for ([_]usize{ 9, 16, 32, 2048 }) |r| try std.testing.expectEqual(@as(u32, 8), stepWarps(r));
++    for ([_]u32{ 2, 4, 8 }) |wp| try std.testing.expectEqual(@as(u32, dv), dv / 4 / wp * wp * 4);
++}
++
++test "TF_GLM_KDA_STEP_WARPS: auto by default, 8/4/2 fixed, anything else auto" {
++    try std.testing.expectEqual(@as(u32, 0), stepWarpsSetting(null));
++    try std.testing.expectEqual(@as(u32, 0), stepWarpsSetting("auto"));
++    try std.testing.expectEqual(@as(u32, 8), stepWarpsSetting("8"));
++    try std.testing.expectEqual(@as(u32, 4), stepWarpsSetting("4"));
++    try std.testing.expectEqual(@as(u32, 2), stepWarpsSetting("2"));
++    try std.testing.expectEqual(@as(u32, 0), stepWarpsSetting("16"));
++}

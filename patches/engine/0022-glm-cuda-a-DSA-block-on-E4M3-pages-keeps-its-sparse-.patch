@@ -1,0 +1,33 @@
+From a583a2ae41cbecbf74cc0febc8ce25179064a66e Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 16:48:37 +0200
+Subject: [PATCH 22/25] glm cuda: a DSA block on E4M3 pages keeps its sparse
+ token lists as positions (Table.logical)
+
+The one line beside 987c1a4a's launchers: attend's table is logical when the cache is E4M3 (ls set), so
+tf_glm_dsa_tokens writes positions and the _paged chunks take each key through the table. BF16 pages keep
+their page rows; windows are unaffected (no table).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj6TMcvsfVhxuBcBLg
+---
+ zig/src/families/glm/cuda_dsa_block.zig | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda_dsa_block.zig
+index 6ca41786..dc6a61e6 100644
+--- a/zig/src/families/glm/cuda_dsa_block.zig
++++ b/zig/src/families/glm/cuda_dsa_block.zig
+@@ -134,7 +134,8 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch,
+     v.ol += r0 * l.heads * l.lw * 2;
+     v.qi += r0 * ix.heads * ix.d * 2;
+     if (c.ps % (l.lw * 2) != 0) return error.LatentShape; // pages whole latent rows apart (the token lists' unit)
+-    const t: latent.Table = .{ .pt = c.pt, .ps = c.ps, .page_rows = c.ps / (l.lw * 2) };
++    // an E4M3 cache's sparse lists stay positions (its chunks take each key through the table); BF16's are page rows
++    const t: latent.Table = .{ .pt = c.pt, .ps = c.ps, .page_rows = c.ps / (l.lw * 2), .logical = c.ls != 0 };
+     var stamp = prof.span(k.prof, stream, .cache_write);
+     try latent.latentWriteFormat(set, stream, v.lat, l.lw, c.lc, c.ls, t, pos, rows, l.lw);
+     stamp.end();
+-- 
+2.53.0
+

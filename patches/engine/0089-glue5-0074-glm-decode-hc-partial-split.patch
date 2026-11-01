@@ -1,0 +1,247 @@
+integ5 0089 = patches/glue5/0074-glm-decode-hc-partial-split.patch (overnight 2026-10-31), renumbered for the integrated stack on 3f94715d.
+
+glm cuda: hc_pre's decode dots over more blocks (T3 candidate 9, glue5; exact, switchable)
+
+tf_glm_hc_partial8 (decode rows < 64) makes a row's 16 K blocks' 24 mixing dots and squares sum in 16 blocks of
+1,024 threads, each block loading all 24 fn rows of its K block (48 KB): latency-bound at one row (prof5: 2.7 us x 90
+a plain step, 16 of 188 SMs busy).
+- glm_glue_hc.cuh: tf_glm_hc_partial8_o1 / _o2 / _o4 / _o8 (glm_hcp::partial_split<M>): block (row, K block, z) of
+  128 M threads makes dots z M .. z M + M - 1, each (dot, step) on one 16-lane half-warp with tf_glm_hc_partial8's
+  lanes, loads, fma chain, butterfly and step sum from 0.0f; block z = 24 / M makes the squares sum with
+  tf_glm_hc_partial8's group-0 threads and order. tf_glm_hc_partial8 itself is untouched (the SASS of every existing
+  glm_glue kernel unchanged).
+- cuda_glue.hcPre: decode rows take the variant Set.hc_part's steps give for their rows (glue.partSplit; grid z
+  24 / M + 1, 128 M threads); past the last step, tf_glm_hc_partial8. TF_GLM_HC_PART (read once at load, local to
+  the rank): unset/1/on the default steps, 2:16 (M 2 up to 16 rows, tf_glm_hc_partial8 above: bench_hcpart's
+  measured best, o2 winning at 1-16 rows and partial8 from 32), 0/off none, or up to four "M:rows" steps
+  ("1:4,8:32"); a bad value fails the load. Same arguments, same scratch; prompt rows (>= 64) unchanged.
+- Measured (GPU0 400 W, graph-timed, cold weights, us a call): partial8 -> o2 2.40 -> 1.69 at 1 row, 2.40 -> 1.74
+  at 4, 2.58 -> 2.52 at 8, 4.45 -> 4.10 at 16; at 32 rows partial8 7.07 against o2 8.70 (and o8 12.24).
+- Exact: every partial byte against tf_glm_hc_partial8 (glue5/bench_hcpart.cu: rows 1-63, random, signed-zero and
+  wide-range inputs).
+
+diff --git a/zig/kernels/cuda/glm_glue_hc.cuh b/zig/kernels/cuda/glm_glue_hc.cuh
+index bd814c0d..1534171e 100644
+--- a/zig/kernels/cuda/glm_glue_hc.cuh
++++ b/zig/kernels/cuda/glm_glue_hc.cuh
+@@ -107,6 +107,83 @@ extern "C" __global__ void __launch_bounds__(1024)
+   }
+ }
+ 
++// tf_glm_hc_partial8 spread over more blocks (decode rows): block (row, K block b, z) of 128 M threads makes M of the
++// 24 dots, z M .. z M + M - 1, each (dot, step) on one 16-lane half-warp with tf_glm_hc_partial8's lanes (c = lane %
++// 16 over the step's 128 inputs), loads, fma chain, butterfly (xor 8 .. 1) and step sum in order from 0.0f; the last
++// z makes the squares sum (out[24]) with its group 0's threads and order. So the same bits, from 24 / M + 1 blocks a
++// K block instead of one, each loading M rows of fn instead of all 24.
++namespace glm_hcp {
++template <int M>
++__device__ __forceinline__ void partial_split(const __nv_bfloat16* x, const __nv_bfloat16* fn, float* part,
++                                              int64_t wide, int nb) {
++  static_assert(24 % M == 0, "whole dots a block");
++  __shared__ float dots[M][8];
++  __shared__ float smem[4];
++  const int64_t r = blockIdx.x, b = blockIdx.y, kb = wide / nb;
++  const int steps = static_cast<int>(kb / 128);  // 8 (hcPre's shapes), as tf_glm_hc_partial8 holds at most
++  float* out = part + (r * nb + b) * 32;
++  const int t = threadIdx.x;
++  if (blockIdx.z == 24 / M) {  // tf_glm_hc_partial8's group 0: the squares
++    if (t < 128) {
++      float ss = 0.0f;
++      for (int s = 0; s < steps; ++s) {
++        const float xt = bf(x[r * wide + b * kb + s * 128 + t]);
++        ss = __fmaf_rn(xt, xt, ss);
++      }
++      for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
++      if ((t & 31) == 0) smem[t >> 5] = ss;
++    }
++    __syncthreads();
++    if (t == 0) out[24] = (smem[0] + smem[2]) + (smem[1] + smem[3]);
++    return;
++  }
++  const int k = t >> 7, s = (t >> 4) & 7, c = t & 15;
++  const int64_t m = (int64_t)blockIdx.z * M + k;
++  const bool live = s < steps;  // a half-warp's own step: its warp-mate holds another, so every lane shuffles
++  float d = 0.0f;
++  if (live) {
++    const int64_t base = b * kb + s * 128;
++    float xv[8];
++    {
++      const uint4 u = *reinterpret_cast<const uint4*>(x + r * wide + base + c * 8);
++      const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&u);
++      for (int j = 0; j < 8; ++j) xv[j] = bf(h[j]);
++    }
++    const uint4 u = __ldg(reinterpret_cast<const uint4*>(fn + m * wide + base + c * 8));
++    const __nv_bfloat16* w = reinterpret_cast<const __nv_bfloat16*>(&u);
++    d = __fmul_rn(xv[1], bf(w[1]));
++    d = __fmaf_rn(xv[0], bf(w[0]), d);
++    for (int j = 2; j < 8; ++j) d = __fmaf_rn(xv[j], bf(w[j]), d);
++  }
++  for (int o = 8; o > 0; o >>= 1) d = d + __shfl_xor_sync(0xffffffffu, d, o);
++  if (live && c == 0) dots[k][s] = d;
++  __syncthreads();
++  if (t < M) {
++    float acc = 0.0f;
++    for (int st = 0; st < steps; ++st) acc = acc + dots[t][st];
++    out[(int64_t)blockIdx.z * M + t] = acc;
++  }
++}
++}  // namespace glm_hcp
++
++// grid (rows, 16, 24 / M + 1) of 128 M threads; cuda_glue.hcPre picks M by rows (Set.hc_part)
++extern "C" __global__ void __launch_bounds__(128)
++    tf_glm_hc_partial8_o1(const __nv_bfloat16* x, const __nv_bfloat16* fn, float* part, int64_t wide, int nb) {
++  glm_hcp::partial_split<1>(x, fn, part, wide, nb);
++}
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_hc_partial8_o2(const __nv_bfloat16* x, const __nv_bfloat16* fn, float* part, int64_t wide, int nb) {
++  glm_hcp::partial_split<2>(x, fn, part, wide, nb);
++}
++extern "C" __global__ void __launch_bounds__(512)
++    tf_glm_hc_partial8_o4(const __nv_bfloat16* x, const __nv_bfloat16* fn, float* part, int64_t wide, int nb) {
++  glm_hcp::partial_split<4>(x, fn, part, wide, nb);
++}
++extern "C" __global__ void __launch_bounds__(1024)
++    tf_glm_hc_partial8_o8(const __nv_bfloat16* x, const __nv_bfloat16* fn, float* part, int64_t wide, int nb) {
++  glm_hcp::partial_split<8>(x, fn, part, wide, nb);
++}
++
+ namespace glm_hc {
+ 
+ // The Sinkhorn sums of 4: lanes (i, j) = (lane / 4 % 4, lane % 4), rows over j (xor 2, 1), columns over i (xor 8, 4).
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 519a4fc7..0f7d0e70 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -54,6 +54,7 @@ pub const Modules = struct {
+     shared_segs: bool = true, // TF_GLM_SHARED_SEGS=0: a shared window's segments take their own launches (the same bits)
+     hc_split: bool = true, // TF_GLM_HC_SPLIT=0: hc_pre's finish on the one-warp schedule (the same bits)
+     shared_writes: bool = true, // TF_GLM_SHARED_WRITES=0: a batched shared window's cache writes and KDA row copies per segment (the same bits)
++    hc_part: glue.PartTable = .{}, // TF_GLM_HC_PART: hc_pre's decode-dot blocks by rows (default 2:16); 0: tf_glm_hc_partial8's 16 a row (the same bits)
+ 
+     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
+         const k = cuda.kernels;
+@@ -95,6 +96,7 @@ pub const Modules = struct {
+         m.shared_segs = if (std.c.getenv("TF_GLM_SHARED_SEGS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+         m.hc_split = if (std.c.getenv("TF_GLM_HC_SPLIT")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+         m.shared_writes = if (std.c.getenv("TF_GLM_SHARED_WRITES")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
++        m.hc_part = try glue.PartTable.parse(if (std.c.getenv("TF_GLM_HC_PART")) |v| std.mem.span(v) else null);
+         return m;
+     }
+ 
+@@ -224,7 +226,7 @@ pub const Forward = struct {
+     absorb_mma: bool = false, // TF_GLM_ABSORB_MMA=1: a prompt pass's absorb_q and expand_v on tensor cores
+ 
+     pub fn set(f: *const Forward) glue.Set {
+-        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .absorb_mma = f.absorb_mma and f.ranks[0].b.prefill, .dsel = f.m.dsel, .pdl_hc = f.m.mm.chain.hc and !f.ranks[0].b.prefill, .pdl_moe = f.m.mm.chain.moe and !f.ranks[0].b.prefill, .hc_split = f.m.hc_split };
++        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .absorb_mma = f.absorb_mma and f.ranks[0].b.prefill, .dsel = f.m.dsel, .pdl_hc = f.m.mm.chain.hc and !f.ranks[0].b.prefill, .pdl_moe = f.m.mm.chain.moe and !f.ranks[0].b.prefill, .hc_split = f.m.hc_split, .hc_part = f.m.hc_part };
+     }
+ 
+     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index 5eaccf20..51715406 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -11,7 +11,8 @@ const index_mod = @import("cuda_index.zig");
+ /// `pdl_hc`: a decode window's hc_post, hc_partial8 and hc_finish launch as dependents (TF_GLM_PDL_CHAIN's hc).
+ /// `pdl_moe`: a decode window's slice_sum, topk_group and topk_group_sum launch as dependents (TF_GLM_PDL_CHAIN's moe).
+ /// `hc_split`: hc_pre's finish on the split schedule (TF_GLM_HC_SPLIT=0: off), the same bits.
+-pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false, pdl_hc: bool = false, pdl_moe: bool = false, hc_split: bool = false };
++/// `hc_part`: hc_pre's decode dots over more blocks by rows (partSplit; TF_GLM_HC_PART), the same bits.
++pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false, dsel: bool = false, pdl_hc: bool = false, pdl_moe: bool = false, hc_split: bool = false, hc_part: PartTable = .{ .n = 0 } };
+ 
+ /// A hidden-size norm's weight: bf16, or float32 (FP4-Local's) read as float32 by the _f32w kernels.
+ pub const Norm = union(enum) { bf16: u64, f32: u64 };
+@@ -45,6 +46,10 @@ pub const Kernels = struct {
+     router_tile: cuda.Function,
+     hc_partial: cuda.Function,
+     hc_partial8: cuda.Function,
++    hc_partial8_o1: cuda.Function, // its dots over more blocks, M = 1, 2, 4, 8 a block (Set.hc_part, partSplit)
++    hc_partial8_o2: cuda.Function,
++    hc_partial8_o4: cuda.Function,
++    hc_partial8_o8: cuda.Function,
+     hc_finish: cuda.Function,
+     hc_finish_f32w: cuda.Function,
+     hc_finish_split: cuda.Function, // the same outputs with warp 0's Sinkhorn beside the collapse (Set.hc_split)
+@@ -281,6 +286,70 @@ pub fn hcPartBytes(rows: usize) usize {
+     return rows * hc_blocks * 32 * 4;
+ }
+ 
++/// hc_pre's decode-dot variants by rows: steps (m, most rows) in rising rows; a window of `rows` takes the first step
++/// that holds it, past the last (or with n 0) tf_glm_hc_partial8 itself. The default, 2:16 (m 2 up to 16 rows), is
++/// glue5/bench_hcpart.cu's measured best: o2 wins at 1 to 16 rows, tf_glm_hc_partial8 from 32.
++pub const PartTable = struct {
++    m: [4]u8 = .{ 2, 0, 0, 0 },
++    most: [4]u8 = .{ 16, 0, 0, 0 },
++    n: u8 = 1,
++
++    /// TF_GLM_HC_PART: unset, "1" or "on": the default steps (2:16); "0" or "off": none; else up to four "m:rows"
++    /// steps, comma-separated, m in 1, 2, 4, 8 and rows rising, each under 64 (decode windows), e.g. "1:4,8:32".
++    pub fn parse(spec: ?[]const u8) !PartTable {
++        const v = spec orelse return .{};
++        if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "on")) return .{};
++        if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off")) return .{ .n = 0 };
++        var t: PartTable = .{ .n = 0 };
++        var it = std.mem.splitScalar(u8, v, ',');
++        while (it.next()) |step| {
++            if (t.n == 4) return error.BadHcPart;
++            const colon = std.mem.indexOfScalar(u8, step, ':') orelse return error.BadHcPart;
++            const m = std.fmt.parseInt(u8, step[0..colon], 10) catch return error.BadHcPart;
++            const most = std.fmt.parseInt(u8, step[colon + 1 ..], 10) catch return error.BadHcPart;
++            if (m != 1 and m != 2 and m != 4 and m != 8) return error.BadHcPart;
++            if (most == 0 or most >= 64 or (t.n > 0 and most <= t.most[t.n - 1])) return error.BadHcPart;
++            t.m[t.n] = m;
++            t.most[t.n] = most;
++            t.n += 1;
++        }
++        return t;
++    }
++};
++
++/// tf_glm_hc_partial8's dots over more blocks (tf_glm_hc_partial8_o<m>, the same bits): m of the 24 dots a block of
++/// 128 m threads, 24 / m + 1 blocks a K block (the last one the squares); by `t` (null: tf_glm_hc_partial8 itself).
++pub const PartSplit = struct { f: cuda.Function, m: u32 };
++pub fn partSplit(k: *const Kernels, t: PartTable, rows: usize) ?PartSplit {
++    for (t.m[0..t.n], t.most[0..t.n]) |m, most| {
++        if (rows > most) continue;
++        return .{ .m = m, .f = switch (m) {
++            1 => k.hc_partial8_o1,
++            2 => k.hc_partial8_o2,
++            4 => k.hc_partial8_o4,
++            else => k.hc_partial8_o8,
++        } };
++    }
++    return null;
++}
++
++test "TF_GLM_HC_PART's steps" {
++    for ([_]?[]const u8{ null, "1", "on" }) |v| { // the default: 2:16
++        const d = try PartTable.parse(v);
++        try std.testing.expectEqual(@as(u8, 1), d.n);
++        try std.testing.expectEqual(@as(u8, 2), d.m[0]);
++        try std.testing.expectEqual(@as(u8, 16), d.most[0]);
++    }
++    try std.testing.expectEqual(@as(u8, 0), (try PartTable.parse("0")).n);
++    try std.testing.expectEqual(@as(u8, 0), (try PartTable.parse("off")).n);
++    const t = try PartTable.parse("1:4,8:32");
++    try std.testing.expectEqual(@as(u8, 2), t.n);
++    try std.testing.expectEqual(@as(u8, 8), t.m[1]);
++    try std.testing.expectEqual(@as(u8, 32), t.most[1]);
++    for ([_][]const u8{ "3:4", "1:64", "1:8,2:8", "1:4,2:8,4:16,8:32,8:40", "2", "x:4", "1:", "" }) |bad|
++        try std.testing.expectError(error.BadHcPart, PartTable.parse(bad));
++}
++
+ /// glue.hc_pre: streams [rows][s d] -> the collapsed RMS-normed row and its 64-sums `xs`; `post`, `comb` (Sinkhorn).
+ pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale: u64, norm: Norm, out: u64, xs: u64, post: u64, comb: u64, part: u64, eps: f32, hc_eps: f32, iters: usize, rows: usize, d: usize, s: usize) !void {
+     if (d != 4096 or s != 4) return error.HcShape;
+@@ -290,7 +359,10 @@ pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale:
+     // `pdl_hc`: partial8 and finish launch as dependents (each waits before it reads x or the partials; the prompt
+     // kernel tf_glm_hc_partial has no wait and never does).
+     if (rows < 64) {
+-        try cuda.launch.launch(set.glue.hc_partial8, .{ .grid = .{ .x = @intCast(rows), .y = hc_blocks }, .block = .{ .x = 1024 }, .pdl = set.pdl_hc }, stream, &a);
++        // `pdl_hc` on both: tf_glm_hc_partial8 and its split forms (tf_glm_hc_partial8_o<m>) wait before they read x
++        if (partSplit(set.glue, set.hc_part, rows)) |p| {
++            try cuda.launch.launch(p.f, .{ .grid = .{ .x = @intCast(rows), .y = hc_blocks, .z = 24 / p.m + 1 }, .block = .{ .x = 128 * p.m }, .pdl = set.pdl_hc }, stream, &a);
++        } else try cuda.launch.launch(set.glue.hc_partial8, .{ .grid = .{ .x = @intCast(rows), .y = hc_blocks }, .block = .{ .x = 1024 }, .pdl = set.pdl_hc }, stream, &a);
+     } else {
+         a.add(i64of(rows));
+         try cuda.launch.launch(set.glue.hc_partial, .{ .grid = .{ .x = cdiv(rows, 4), .y = hc_blocks }, .block = .{ .x = 128 } }, stream, &a);

@@ -1,0 +1,313 @@
+From ea58ea6b2662fae763ed4bb28fe25e4d7ff4c71a Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 16:01:55 +0200
+Subject: [PATCH 31/63] glm cuda: the follower's step in one broadcast, rank
+ 0's keep on its next step, a window's greedy picks in one gather
+
+No arithmetic changes; the steps' GPU work runs in the same order on every rank.
+
+- Every step's first broadcast is 384 bytes, the header and up to 80 ids (a decode step's all): one host
+  round trip on the other ranks instead of two. Longer steps follow with the whole message.
+- Rank 0 commits a keep at once and sends it on its next verify, block or draft step of the same slot
+  (Link.keep_flag); any other step, or a second keep, sends it alone as before.
+- A follower's verify and shared steps join their draws' gathers and skip the sync and read
+  (Engine.discard_draws): rank 0 alone reads those tokens.
+- greedyRows: a window's rows each take their top-1 launch, then one all-gather, one sync and one read for
+  all of them (each row picked by chance.pick as before). Also carries TF_GLM_MOE_FUSE's engine switch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNmHb8tWDWv2KnBDVCM
+---
+ zig/src/families/glm/cuda_engine.zig      | 26 +++++++--
+ zig/src/families/glm/cuda_engine_pick.zig | 35 ++++++++++++
+ zig/src/families/glm/cuda_follow.zig      | 67 +++++++++++++++++------
+ 3 files changed, 105 insertions(+), 23 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index da68a7ab..af7092de 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -27,6 +27,8 @@ pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) boo
+ pub const max_drafts = 3;
+ /// A greedy pick as it crosses ranks: (value, id) and padding, so the RoCE gather (16-byte packs) can carry it.
+ const pair_bytes = 16;
++/// The rows one gather of greedy picks holds (cuda_engine_pick.greedyRows): a shared window's.
++pub const pick_rows = 32;
+ 
+ /// A prompt pass's chunk rows (decode.prefill's).
+ pub const prompt_rows = fw.prefill_rows;
+@@ -67,6 +69,8 @@ pub const Engine = struct {
+     m: fw.Modules,
+     stream: cuda.Stream,
+     pieces: fw.Pieces,
++    discard_draws: bool = false, // a follower's verify step: its draws join the gathers, rank 0 alone reads the tokens
++    moe_fuse: bool = true, // TF_GLM_MOE_FUSE=0: a decode window's EXL3 MoE glue unfused (the same bits either way)
+     side: ?@import("cuda_moe.zig").Side = null, // decode windows' shared expert stream and events (TF_GLM_SHARED_SIDE=0: none)
+     w: weights.Weights,
+     bp: fw.Buffers, // prompt chunks
+@@ -147,7 +151,7 @@ pub const Engine = struct {
+         if (o.settings.layers > c.layers) return error.BadLayers;
+         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
+         for (layers, 0..) |*l, i| l.* = @intCast(i);
+-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .side = side, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .drafts = o.drafts, .mtp = false };
++        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .side = side, .moe_fuse = envOn("TF_GLM_MOE_FUSE"), .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .drafts = o.drafts, .mtp = false };
+         const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
+         if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
+         const Tile = struct {
+@@ -189,9 +193,9 @@ pub const Engine = struct {
+         errdefer if (e.bm) |*b| b.deinit();
+         if (o.drafts) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
+         errdefer if (e.bs) |*b| b.deinit();
+-        e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world);
++        e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world * pick_rows);
+         errdefer e.pairs.free();
+-        try d.check(d.api.cuMemsetD8_v2(e.pairs.ptr, 0, pair_bytes * world), "cuMemsetD8"); // each pair's padding stays zero
++        try d.check(d.api.cuMemsetD8_v2(e.pairs.ptr, 0, pair_bytes * world * pick_rows), "cuMemsetD8"); // each pair's padding stays zero
+         e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
+         errdefer e.smp.deinit();
+         errdefer e.freeProfs();
+@@ -255,7 +259,13 @@ pub const Engine = struct {
+     fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
+         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
+         const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
+-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .side = if (b == &e.bp) null else e.side };
++        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .side = if (b == &e.bp) null else e.side, .moe_fuse = e.moe_fuse };
++    }
++
++    /// An on-by-default switch: off only when `name` is "0".
++    fn envOn(name: [*:0]const u8) bool {
++        const v = std.c.getenv(name) orelse return true;
++        return !std.mem.eql(u8, std.mem.span(v), "0");
+     }
+ 
+     /// The decode windows' side stream for the MoE shared expert, unless TF_GLM_SHARED_SIDE=0.
+@@ -531,7 +541,7 @@ pub const Engine = struct {
+             rows += p.ids.len;
+         }
+         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
+-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(false) else null, .side = e.side };
++        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(false) else null, .side = e.side, .moe_fuse = e.moe_fuse };
+         try f.run(@ptrCast(ids[0..rows]));
+         if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
+         for (parts, segs[0..parts.len]) |p, g| {
+@@ -597,10 +607,14 @@ pub const Engine = struct {
+     pub fn draw(e: *Engine, logits: u64, rows: usize, first: u64, bits: u64, out: []u32) !void {
+         if (e.structured) return e.drawWhole(logits, rows, first, bits, out);
+         if (e.cur.sampling) |s| {
++            if (e.discard_draws) { // a follower's verify rows: their columns to every rank, the draw itself rank 0's
++                @memset(out[0..rows], 0);
++                return e.smp.gather(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows, e.smp.full.ptr);
++            }
+             try e.smp.draw(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows, first, sampler.rule(s), out);
+             return e.checkGathers(); // the draw read rows the forward's gathers made
+         }
+-        for (0..rows) |r| out[r] = try e.greedy(logits + r * e.share.vocab.len() * 2);
++        try @import("cuda_engine_pick.zig").greedyRows(e, logits, rows, out);
+     }
+ 
+     pub const promptHead = @import("cuda_structured.zig").promptHead;
+diff --git a/zig/src/families/glm/cuda_engine_pick.zig b/zig/src/families/glm/cuda_engine_pick.zig
+index e489d134..17a96515 100644
+--- a/zig/src/families/glm/cuda_engine_pick.zig
++++ b/zig/src/families/glm/cuda_engine_pick.zig
+@@ -13,6 +13,41 @@ pub fn greedyChance(e: *Engine, logits: u64) !chance.Pick {
+     return pick(e, logits, true);
+ }
+ 
++/// Greedy picks of a window's `rows` rows: a top-1 launch a row, then one gather of every rank's words, one sync and
++/// one read (rank order [world][rows]), each row picked as `greedy` picks it. A follower's verify rows
++/// (Engine.discard_draws) join the gather and stop there: rank 0 alone reads the tokens.
++pub fn greedyRows(e: *Engine, logits: u64, rows: usize, out: []u32) !void {
++    if (rows == 0) return;
++    if (rows > @import("cuda_engine.zig").pick_rows) return error.WindowTooWide;
++    const world = e.share.world;
++    const V = e.share.vocab.len();
++    const mine = e.pairs.ptr + e.share.rank * rows * pair_bytes;
++    for (0..rows) |r| {
++        var a: cuda.Args = .{};
++        a.add(logits + r * V * 2);
++        a.add(@as(i64, @intCast(V)));
++        a.add(@as(u32, @intCast(e.share.vocab.lo)));
++        a.add(mine + r * pair_bytes);
++        try cuda.launch.launch(e.m.glue.top1, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, e.stream, &a);
++    }
++    const stamp = @import("cuda_prof.zig").span(e.profiling_prompt, e.stream, .token_gather);
++    if (e.group) |g| try g.allGather(e.stream, mine, e.pairs.ptr, rows * pair_bytes) else try e.lib.check(e.lib.api.ncclAllGather(mine, e.pairs.ptr, rows * pair_bytes, .u8, e.comm, e.stream.handle), "ncclAllGather");
++    stamp.end();
++    if (e.discard_draws) {
++        @memset(out[0..rows], 0);
++        return;
++    }
++    try e.stream.synchronize();
++    try e.checkGathers();
++    var all: [ranks.max_world * 32][4]u32 = undefined;
++    try e.d.check(e.d.api.cuMemcpyDtoH_v2(&all, e.pairs.ptr, world * rows * pair_bytes), "cuMemcpyDtoH");
++    for (0..rows) |r| {
++        var words: [ranks.max_world][4]u32 = undefined;
++        for (0..world) |q| words[q] = all[q * rows + r];
++        out[r] = chance.pick(words[0..world], false).token;
++    }
++}
++
+ fn pick(e: *Engine, logits: u64, sums: bool) !chance.Pick {
+     const world = e.share.world;
+     var a: cuda.Args = .{};
+diff --git a/zig/src/families/glm/cuda_follow.zig b/zig/src/families/glm/cuda_follow.zig
+index 031587e0..50d37562 100644
+--- a/zig/src/families/glm/cuda_follow.zig
++++ b/zig/src/families/glm/cuda_follow.zig
+@@ -36,6 +36,13 @@ pub const Header = extern struct {
+ /// tf_glm_put_words' argument: a step's header (16 words) and up to `put_ids` ids.
+ pub const Words = extern struct { w: [96]u32 };
+ pub const put_ids = 96 - 16;
++/// The first broadcast of every step: the header and its first `put_ids` ids (a decode step's all), one host round trip
++/// on the other ranks; a longer step's ids follow in a second broadcast of the whole message.
++pub const head_bytes = @sizeOf(Words);
++
++/// Header `flags` bit set when the step carries rank 0's last `keep` on the same slot (rows in bits 16-23): the other
++/// ranks commit it before the step, as a separate keep step would have, without its round trip.
++pub const keep_flag: u32 = 1 << 24;
+ 
+ /// The most ids one step carries (a prompt at the engine's capacity).
+ pub const Link = struct {
+@@ -48,6 +55,7 @@ pub const Link = struct {
+     gpa: std.mem.Allocator,
+     wait: bool, // TF_GLM_LINK_WAIT=1: every step uploaded and waited for, as before the put
+     asleep: bool = false, // rank 0: the other ranks sleep on their lines (cuda.tp_watch) until its next step
++    keep_pending: ?struct { slot: u32, rows: u32 } = null, // rank 0: a keep not yet sent (it rides on the next step)
+ 
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, stream: cuda.Stream, asked_ids: usize) !Link {
+         const max_ids = @max(asked_ids, prompt_wire.words);
+@@ -74,7 +82,8 @@ pub const Link = struct {
+         try l.lib.check(l.lib.api.ncclBroadcast(l.buf.ptr, l.buf.ptr, bytes, .u8, 0, l.comm, l.stream.handle), "ncclBroadcast");
+     }
+ 
+-    /// Rank 0: the step and ids to every rank; up to `put_ids` ids go by `put` unwaited, longer ones upload and wait.
++    /// Rank 0: the step and ids to every rank: header and up to `put_ids` ids in one broadcast (by `put`, unwaited),
++    /// a longer step's whole message in a second one after it.
+     pub fn send(l: *Link, put: cuda.Function, h: Header, ids: []const u32) !void {
+         if (ids.len > l.ids.len) return error.TooManyIds;
+         var hh = h;
+@@ -88,16 +97,13 @@ pub const Link = struct {
+             a.add(@as(u32, @intCast(16 + ids.len)));
+             a.add(w);
+             try cuda.launch.launch(put, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, l.stream, &a);
+-            try l.post(64);
+-            if (ids.len > 0) try l.post(64 + ids.len * 4);
+-            return;
++            return l.post(head_bytes);
+         }
+         try l.buf.uploadAsync(0, std.mem.asBytes(&hh), l.stream.handle);
+-        try l.bcast(64);
+-        if (ids.len > 0) {
+-            try l.buf.uploadAsync(64, std.mem.sliceAsBytes(ids), l.stream.handle);
+-            try l.bcast(64 + ids.len * 4);
+-        }
++        if (ids.len > 0) try l.buf.uploadAsync(64, std.mem.sliceAsBytes(ids), l.stream.handle);
++        try l.post(head_bytes);
++        if (ids.len > put_ids) try l.post(64 + ids.len * 4);
++        try l.stream.synchronize();
+     }
+ 
+     /// `bytes` at `ptr` from rank 0 into every rank's `ptr` (image rows: the follower's buffer is the same size).
+@@ -106,13 +112,18 @@ pub const Link = struct {
+         try l.lib.check(l.lib.api.ncclBroadcast(ptr, ptr, bytes, .u8, 0, l.comm, l.stream.handle), "ncclBroadcast");
+     }
+ 
+-    /// Other ranks: the next step and its ids (valid until the next receive).
++    /// Other ranks: the next step and its ids (valid until the next receive): one host round trip for a step of up to
++    /// `put_ids` ids, two for a longer one.
+     pub fn receive(l: *Link) !struct { h: Header, ids: []const u32 } {
+-        try l.bcast(64);
++        try l.bcast(head_bytes);
++        var first: Words = undefined;
++        try l.buf.download(0, std.mem.asBytes(&first));
+         var h: Header = undefined;
+-        try l.buf.download(0, std.mem.asBytes(&h));
++        @memcpy(std.mem.asBytes(&h), std.mem.sliceAsBytes(first.w[0..16]));
+         if (h.n > l.ids.len) return error.TooManyIds;
+-        if (h.n > 0) {
++        if (h.n <= put_ids) {
++            @memcpy(l.ids[0..h.n], first.w[16..][0..h.n]);
++        } else {
+             try l.bcast(64 + h.n * 4);
+             try l.buf.download(64, std.mem.sliceAsBytes(l.ids[0..h.n]));
+         }
+@@ -125,7 +136,7 @@ pub const Leader = struct {
+     e: *Engine,
+     link: *Link,
+ 
+-    /// The step on the bound stream's sequence (its slot) to every rank.
++    /// The step on the bound stream's sequence (its slot) to every rank, with a pending keep on it when it can carry one.
+     fn send(x: Leader, h: Header, ids: []const u32) !void {
+         var hh = h;
+         hh.slot = x.e.slot;
+@@ -133,6 +144,12 @@ pub const Leader = struct {
+             cuda.tp_watch.wake();
+             x.link.asleep = false;
+         }
++        if (x.link.keep_pending) |kp| {
++            x.link.keep_pending = null;
++            const kind: Kind = @fromBackingInt(@intCast(hh.kind));
++            const rides = kp.slot == hh.slot and kp.rows < 256 and hh.flags & 0xffff_0000 == 0 and (kind == .verify or kind == .block or kind == .draft);
++            if (rides) hh.flags |= keep_flag | (kp.rows << 16) else try x.link.send(x.e.m.glue.put_words, .{ .kind = @backingInt(Kind.keep), .a = kp.rows, .slot = kp.slot }, &.{});
++        }
+         try x.link.send(x.e.m.glue.put_words, hh, ids);
+     }
+ 
+@@ -263,9 +280,14 @@ pub const Leader = struct {
+         try x.e.prefillMany(parts, firsts);
+     }
+ 
++    /// The other ranks hear the keep with rank 0's next step (Link.keep_flag), or alone before any other step.
+     pub fn keep(x: Leader, n: usize) !void {
+         try x.flush();
+-        try x.send(.{ .kind = @backingInt(Kind.keep), .a = n }, &.{});
++        if (x.link.keep_pending) |kp| { // two keeps in a row: the first goes alone
++            x.link.keep_pending = null;
++            try x.link.send(x.e.m.glue.put_words, .{ .kind = @backingInt(Kind.keep), .a = kp.rows, .slot = kp.slot }, &.{});
++        }
++        if (n >= 256) try x.send(.{ .kind = @backingInt(Kind.keep), .a = n }, &.{}) else x.link.keep_pending = .{ .slot = x.e.slot, .rows = @intCast(n) };
+         try x.e.keep(n);
+     }
+ 
+@@ -325,8 +347,13 @@ pub fn follow(e: *Engine, link: *Link) !void {
+     cuda.tp_watch.sleep(e.io); // rank 0 starts with no stream: its first step wakes this rank
+     while (true) {
+         const step = try link.receive();
+-        const h = step.h;
++        var h = step.h;
+         const kind: Kind = @fromBackingInt(@intCast(h.kind));
++        if (h.flags & keep_flag != 0) { // rank 0's last keep, on this step's slot, before the step (as its keep step was)
++            try e.bind(h.slot);
++            try e.keep((h.flags >> 16) & 0xff);
++            h.flags &= 0xffff;
++        }
+         if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many and kind != .idle and kind != .snapshots and kind != .pool) try e.bind(h.slot);
+         e.prompt_logprobs = if (promptRows(h)) .{} else null;
+         e.structured = structuredStep(h); // rank 0 alone masks them
+@@ -358,7 +385,11 @@ pub fn follow(e: *Engine, link: *Link) !void {
+                     else => return err,
+                 };
+             },
+-            .verify => try e.verify(step.ids, sampled[0..step.ids.len], 0),
++            .verify => { // rank 0 alone reads the draws: this rank joins their gathers and leaves the tokens on the device
++                e.discard_draws = true;
++                defer e.discard_draws = false;
++                try e.verify(step.ids, sampled[0..step.ids.len], 0);
++            },
+             .redraw => _ = try e.redrawFirst(@intCast(h.a), 0),
+             .shared => {
+                 const k = h.depth;
+@@ -374,6 +405,8 @@ pub fn follow(e: *Engine, link: *Link) !void {
+                     at += n;
+                     row += n;
+                 }
++                e.discard_draws = true;
++                defer e.discard_draws = false;
+                 try e.verifyShared(parts[0..k]);
+             },
+             .many => {
+-- 
+2.53.0
+

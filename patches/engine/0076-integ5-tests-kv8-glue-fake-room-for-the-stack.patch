@@ -1,0 +1,27 @@
+integ5: tests: the FP8 KV glue test's fake module records up to 128 kernels and 32 shared-memory opt-ins.
+
+cuda_kv8_test's "the glue resolves the paged symbols and opts their chunks into the window's shared memory" keeps every
+cuFuncSetAttribute call of glue.Kernels.load in a 16-entry array. 3f94715d makes 10 opt-ins; attn5 0068 adds 6
+(tf_glm_chunks_*_fused: 16, still fits) and glue5 0070 adds 1 (tf_glm_chunks_16_fp8_paged_segs: 11). Together they make
+17, so the test panicked (index out of bounds) in the integrated stack only (test-glm-fp8-kv-host and test-cuda-host).
+Test-only: no engine code changes.
+
+diff --git a/zig/src/families/glm/cuda_kv8_test.zig b/zig/src/families/glm/cuda_kv8_test.zig
+index 2337d1e0..4b42ab18 100644
+--- a/zig/src/families/glm/cuda_kv8_test.zig
++++ b/zig/src/families/glm/cuda_kv8_test.zig
+@@ -305,10 +305,11 @@ test "GLM FP8 KV: a logical table keeps the assembled token lists positions, whi
+ test "GLM FP8 KV: the glue resolves the paged symbols and opts their chunks into the window's shared memory" {
+     const glue = @import("cuda_glue.zig");
+     const Res = struct {
+-        var names: [96][]const u8 = undefined;
++        // room for every glue kernel and opt-in (the integrated stack: 66 kernels, 17 opt-ins)
++        var names: [128][]const u8 = undefined;
+         var n: usize = 0;
+-        var set_on: [16]usize = undefined;
+-        var set_bytes: [16]c_int = undefined;
++        var set_on: [32]usize = undefined;
++        var set_bytes: [32]c_int = undefined;
+         var sets: usize = 0;
+         fn function(out: *cuda.abi.Function, _: cuda.abi.Module, name: [*:0]const u8) callconv(.c) c_int {
+             names[n] = std.mem.span(name);

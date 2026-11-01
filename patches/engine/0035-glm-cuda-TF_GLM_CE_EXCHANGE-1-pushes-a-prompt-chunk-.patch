@@ -1,0 +1,442 @@
+From a9a79059fc4a3bf7d93920d478f9b9ca93941bfb Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 15:54:51 +0200
+Subject: [PATCH 35/63] glm cuda: TF_GLM_CE_EXCHANGE=1 pushes a prompt chunk's
+ split exchanges by copy engines
+
+With two ranks on one host and the direct split (the default), TF_GLM_CE_EXCHANGE=1 replaces each piece's
+splitPartials and splitGlued send/recv pairs: each rank copies its rows (cuMemcpyDtoDAsync in TF_GLM_CE_CHUNK_KB
+pieces, 1024) straight into the peer's room or glued rows, mapped through CUDA IPC at startup by role (rooms, normed,
+hidden), then writes the next sequence number into the peer's flag line with cuStreamWriteValue32 (fenced after the
+copies); the side stream waits for its own flag with cuStreamWaitValue32 before the glue. The bytes land where NCCL
+put them, so the bits are unchanged, and no SMs run the exchange. A batched pass of several fresh prompts (prefillMany) takes
+the same path on the same prompt buffers and pieces.
+
+Pieces carries ce_slot0 so a paired chunk's twin Pieces (#1423) can take its own flag slots; a twin buffer set
+registers its roles in the same order. Off by default until measured; both ranks always meet in the setup exchange.
+
+Measured: copy engines move 26.4 GB/s a direction both ways at once (1 MiB copies) against NCCL send/recv's 20.6-22.8
+at the 3 and 6 MiB piece sizes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj6TMcvsfVhxuBcBLg
+---
+ zig/src/cuda/ce_push.zig                     | 162 +++++++++++++++++++
+ zig/src/cuda/root.zig                        |   2 +
+ zig/src/families/glm/cuda.zig                |   1 +
+ zig/src/families/glm/cuda_ce.zig             |  90 +++++++++++
+ zig/src/families/glm/cuda_engine.zig         |   3 +-
+ zig/src/families/glm/cuda_forward.zig        |   2 +
+ zig/src/families/glm/cuda_forward_pieces.zig |   5 +-
+ zig/src/families/glm/cuda_native.zig         |   6 +
+ zig/src/families/glm/cuda_prompts.zig        |   2 +
+ 9 files changed, 270 insertions(+), 3 deletions(-)
+ create mode 100644 zig/src/cuda/ce_push.zig
+ create mode 100644 zig/src/families/glm/cuda_ce.zig
+
+diff --git a/zig/src/cuda/ce_push.zig b/zig/src/cuda/ce_push.zig
+new file mode 100644
+index 00000000..f554d94b
+--- /dev/null
++++ b/zig/src/cuda/ce_push.zig
+@@ -0,0 +1,162 @@
++//! Two ranks on one host: rows pushed by copy engines straight into the peer's registered buffers (CUDA IPC),
++//! each push followed by a stream write of a sequence number into the peer's flag and met by a stream wait there.
++const std = @import("std");
++const abi = @import("abi.zig");
++const Driver = @import("driver.zig").Driver;
++const Stream = @import("stream.zig").Stream;
++const tp_group = @import("tp_group.zig");
++const ipc_mod = @import("ipc.zig");
++
++/// Buffers a rank registers at most (a prompt buffer set's rooms and rows, and a paired chunk's twins).
++pub const max_buffers = 8;
++/// Flag slots: each a 128-byte line in the flag region, each with its own send and receive sequence.
++pub const slots = 128;
++const flag_bytes = 128;
++
++/// What a rank tells the other while the two set up: ready, then each buffer's allocation handle, offset and length.
++const Offer = extern struct {
++    ok: u32,
++    count: u32,
++    flags: ipc_mod.Handle,
++    handles: [max_buffers]ipc_mod.Handle,
++    offsets: [max_buffers]u64,
++    lens: [max_buffers]u64,
++};
++
++const Mapped = struct { local: abi.DevicePtr, len: usize, peer_base: abi.DevicePtr, peer: abi.DevicePtr };
++
++pub const Push = struct {
++    d: *const Driver,
++    gpa: std.mem.Allocator,
++    ipc: ipc_mod.Ipc,
++    rank: u32,
++    count: usize = 0,
++    bufs: [max_buffers]Mapped = undefined,
++    flags: abi.DevicePtr = 0, // this rank's flag lines (the peer writes them)
++    peer_flags_base: abi.DevicePtr = 0,
++    peer_flags: abi.DevicePtr = 0,
++    sent: [slots]u32 = @splat(0),
++    seen: [slots]u32 = @splat(0),
++    chunk: usize,
++    pushes: u64 = 0,
++
++    /// Both ranks call it with their buffers in the same order and sizes; null unless both mapped all of the other's.
++    pub fn open(gpa: std.mem.Allocator, d: *const Driver, g: *const tp_group.Group, s: Stream, wanted: bool, buffers: []const [2]u64, chunk: usize) !?*Push {
++        if (g.world != 2 or buffers.len > max_buffers) return null;
++        const x = try gpa.create(Push);
++        var keep = false;
++        defer if (!keep) gpa.destroy(x);
++        x.* = .{ .d = d, .gpa = gpa, .ipc = undefined, .rank = @intCast(g.rank), .chunk = @max(chunk, 64 << 10) };
++        var mine = std.mem.zeroes(Offer);
++        var have_ipc = false;
++        if (wanted) prepare: {
++            x.ipc = ipc_mod.Ipc.load() catch break :prepare;
++            have_ipc = true;
++            if (d.api.cuMemAlloc_v2(&x.flags, slots * flag_bytes) != abi.success) {
++                x.flags = 0;
++                break :prepare;
++            }
++            if (d.api.cuMemsetD8_v2(x.flags, 0, slots * flag_bytes) != abi.success) break :prepare;
++            if (x.ipc.get(&mine.flags, x.flags) != abi.success) break :prepare;
++            for (buffers, 0..) |b, i| {
++                var base: abi.DevicePtr = 0;
++                var size: usize = 0;
++                if (x.ipc.range(&base, &size, b[0]) != abi.success or b[0] + b[1] > base + size) break :prepare;
++                if (x.ipc.get(&mine.handles[i], base) != abi.success) break :prepare;
++                mine.offsets[i] = b[0] - base;
++                mine.lens[i] = b[1];
++            }
++            mine.count = @intCast(buffers.len);
++            mine.ok = 1;
++        }
++        var both: [2]Offer = undefined;
++        try g.gather(Offer, d, s, mine, &both);
++        const peer = both[1 - x.rank];
++        var opened: u32 = 0;
++        if (mine.ok == 1 and peer.ok == 1 and peer.count == mine.count) map: {
++            if (x.ipc.open(&x.peer_flags_base, peer.flags, ipc_mod.lazy_enable_peer_access) != abi.success) break :map;
++            x.peer_flags = x.peer_flags_base;
++            for (buffers, 0..) |b, i| {
++                if (peer.lens[i] != b[1]) break :map; // the same role must be the same size on both ranks
++                // roles carved from one allocation share its handle: a context opens a handle once
++                var base: abi.DevicePtr = 0;
++                for (0..i) |k| if (std.mem.eql(u8, &peer.handles[k].reserved, &peer.handles[i].reserved)) {
++                    base = x.bufs[k].peer_base;
++                    break;
++                };
++                if (base == 0 and x.ipc.open(&base, peer.handles[i], ipc_mod.lazy_enable_peer_access) != abi.success) break :map;
++                x.bufs[i] = .{ .local = b[0], .len = b[1], .peer_base = base, .peer = base + peer.offsets[i] };
++                x.count = i + 1;
++            }
++            opened = 1;
++        }
++        var agreed: [2]u32 = undefined;
++        try g.gather(u32, d, s, opened, &agreed);
++        if (agreed[0] == 1 and agreed[1] == 1) {
++            keep = true;
++            return x;
++        }
++        x.unmap();
++        if (have_ipc) x.ipc.lib.close();
++        return null;
++    }
++
++    fn unmap(x: *Push) void {
++        // one allocation can back several registered buffers: close each opened base once
++        for (x.bufs[0..x.count], 0..) |b, i| {
++            const dup = for (x.bufs[0..i]) |o| (if (o.peer_base == b.peer_base) break true) else false;
++            if (!dup) _ = x.ipc.close(b.peer_base);
++        }
++        x.count = 0;
++        if (x.peer_flags_base != 0) _ = x.ipc.close(x.peer_flags_base);
++        if (x.flags != 0) _ = x.d.api.cuMemFree_v2(x.flags);
++        x.peer_flags_base = 0;
++        x.flags = 0;
++    }
++
++    /// The peer's address for `local`: the same offset in the peer's buffer of the same role.
++    pub fn peerOf(x: *const Push, local: abi.DevicePtr, bytes: usize) !abi.DevicePtr {
++        for (x.bufs[0..x.count]) |b| if (local >= b.local and local + bytes <= b.local + b.len) return b.peer + (local - b.local);
++        return error.UnregisteredBuffer;
++    }
++
++    /// `bytes` at this rank's `src` into the peer's copy of `dst` (a registered buffer's address), in chunks, on `s`.
++    pub fn put(x: *Push, s: Stream, dst: abi.DevicePtr, src: abi.DevicePtr, bytes: usize) !void {
++        const to = try x.peerOf(dst, bytes);
++        var at: usize = 0;
++        while (at < bytes) : (at += x.chunk) {
++            const n = @min(x.chunk, bytes - at);
++            try x.d.check(x.d.api.cuMemcpyDtoDAsync_v2(to + at, src + at, n, s.handle), "cuMemcpyDtoDAsync (peer push)");
++        }
++        x.pushes += 1;
++    }
++
++    /// After this rank's puts for `slot` on `s`: the peer's flag gets the next sequence (fenced after the copies).
++    pub fn signal(x: *Push, s: Stream, slot: usize) !void {
++        x.sent[slot] +%= 1;
++        try x.d.check(x.ipc.write32(s.handle, x.peer_flags + slot * flag_bytes, x.sent[slot], ipc_mod.write_default), "cuStreamWriteValue32 (peer flag)");
++    }
++
++    /// `s` waits until the peer signalled `slot` once more than this rank has waited for.
++    pub fn wait(x: *Push, s: Stream, slot: usize) !void {
++        x.seen[slot] +%= 1;
++        try x.d.check(x.ipc.wait32(s.handle, x.flags + slot * flag_bytes, x.seen[slot], ipc_mod.wait_geq), "cuStreamWaitValue32 (own flag)");
++    }
++
++    pub fn deinit(x: *Push) void {
++        x.unmap();
++        x.ipc.lib.close();
++        x.gpa.destroy(x);
++    }
++};
++
++test "a registered role maps to the same offset on the peer; anything else is refused" {
++    var x: Push = undefined;
++    x.count = 2;
++    x.bufs[0] = .{ .local = 0x1000, .len = 0x100, .peer_base = 0x9000, .peer = 0x9040 };
++    x.bufs[1] = .{ .local = 0x2000, .len = 0x10, .peer_base = 0x9000, .peer = 0x9800 };
++    try std.testing.expectEqual(@as(abi.DevicePtr, 0x9050), try x.peerOf(0x1010, 0x20));
++    try std.testing.expectEqual(@as(abi.DevicePtr, 0x9800), try x.peerOf(0x2000, 0x10));
++    try std.testing.expectError(error.UnregisteredBuffer, x.peerOf(0x10f0, 0x20));
++    try std.testing.expectError(error.UnregisteredBuffer, x.peerOf(0x3000, 1));
++}
+diff --git a/zig/src/cuda/root.zig b/zig/src/cuda/root.zig
+index ce332958..147b7015 100644
+--- a/zig/src/cuda/root.zig
++++ b/zig/src/cuda/root.zig
+@@ -55,6 +55,7 @@ pub const sample = @import("sample.zig");
+ pub const rank_scatter = @import("rank_scatter.zig");
+ pub const relay_plan = @import("relay_plan.zig");
+ pub const tp_group = @import("tp_group.zig");
++pub const ce_push = @import("ce_push.zig");
+ pub const p2p_gather = @import("p2p_gather.zig");
+ pub const tp_watch = @import("tp_watch.zig");
+ pub const p2p_report = @import("p2p_report.zig");
+@@ -104,6 +105,7 @@ test {
+     _ = @import("sample.zig");
+     _ = @import("roce.zig");
+     _ = @import("p2p_gather.zig");
++    _ = @import("ce_push.zig");
+     _ = @import("roce_nap.zig");
+     _ = @import("rank_scatter.zig");
+     _ = @import("relay_plan.zig");
+diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
+index ccb7d3f0..cf20110d 100644
+--- a/zig/src/families/glm/cuda.zig
++++ b/zig/src/families/glm/cuda.zig
+@@ -49,6 +49,7 @@ test {
+     _ = @import("cuda_pages_test.zig");
+     _ = @import("cuda_ranks_test.zig");
+     _ = @import("cuda_p2p.zig");
++    _ = @import("cuda_ce.zig");
+     _ = experts;
+     _ = exl3;
+     _ = vision;
+diff --git a/zig/src/families/glm/cuda_ce.zig b/zig/src/families/glm/cuda_ce.zig
+new file mode 100644
+index 00000000..6fd40d64
+--- /dev/null
++++ b/zig/src/families/glm/cuda_ce.zig
+@@ -0,0 +1,90 @@
++//! TF_GLM_CE_EXCHANGE=1: a prompt chunk's split exchanges (cuda_relay's splitPartials and splitGlued) by copy engines.
++//! Each rank pushes its rows into the peer's registered rows (cuda/ce_push.zig), then signals; the peer's side stream
++//! waits for the signal before its glue. Same bytes in the same places as NCCL's send/recv, so the same bits.
++const std = @import("std");
++const cuda = @import("cuda");
++const fw = @import("cuda_forward.zig");
++const Forward = fw.Forward;
++const Pieces = fw.Pieces;
++const share = fw.Forward.share;
++
++pub const Kind = enum(usize) { partials = 0, glued = 1 };
++
++/// A piece's flag slot: Pieces.ce_slot0 + kind * max_pieces + q (a pair's twin Pieces starts after the first's).
++pub fn slot(p: *const Pieces, kind: Kind, q: usize) usize {
++    return p.ce_slot0 + @backingInt(kind) * fw.max_pieces + q;
++}
++
++/// Split's partials of piece [lo, lo + n): this rank's fp32 rows of the peer's share into the peer's room slot.
++pub fn partials(f: *const Forward, ce: *cuda.ce_push.Push, p: *const Pieces, q: usize, lo: usize, n: usize) !void {
++    const r = f.ranks[0];
++    const D = r.w.config.hidden;
++    const me = r.w.share.rank;
++    const theirs = share(n, 2, 1 - me);
++    const rows = theirs[1] - theirs[0];
++    // the peer's room has the same offset as this rank's; its slot `me` is `rows` (the peer's share) long
++    try ce.put(p.side, fw.Forward.room(r, lo) + me * rows * D * 4, r.b.part + (lo + theirs[0]) * D * 4, rows * D * 4);
++    try ce.signal(p.side, slot(p, .partials, q));
++    try ce.wait(p.side, slot(p, .partials, q));
++}
++
++/// Split's glued rows of piece [lo, lo + n) in `rows_of` (bf16): this rank's own rows into the peer's same rows.
++pub fn glued(f: *const Forward, ce: *cuda.ce_push.Push, p: *const Pieces, q: usize, rows_of: u64, lo: usize, n: usize) !void {
++    const r = f.ranks[0];
++    const D = r.w.config.hidden;
++    const mine = share(n, 2, r.w.share.rank);
++    const at = rows_of + (lo + mine[0]) * D * 2;
++    try ce.put(p.side, at, at, (mine[1] - mine[0]) * D * 2);
++    try ce.signal(p.side, slot(p, .glued, q));
++    try ce.wait(p.side, slot(p, .glued, q));
++}
++
++/// TF_GLM_CE_EXCHANGE (0 off, the default until measured; 1 on) and TF_GLM_CE_CHUNK_KB (a copy's size, 1024).
++pub const Settings = struct {
++    on: bool = false,
++    chunk: usize = 1 << 20,
++
++    pub fn read(get: *const fn ([:0]const u8) ?[]const u8) !Settings {
++        var s: Settings = .{};
++        if (get("TF_GLM_CE_EXCHANGE")) |v| s.on = if (std.mem.eql(u8, v, "1")) true else if (std.mem.eql(u8, v, "0")) false else return error.BadCeExchange;
++        if (get("TF_GLM_CE_CHUNK_KB")) |v| {
++            const kib = std.fmt.parseInt(usize, v, 10) catch return error.BadCeExchange;
++            if (kib < 64 or kib > 64 << 10) return error.BadCeExchange;
++            s.chunk = kib << 10;
++        }
++        return s;
++    }
++};
++
++fn environment(name: [:0]const u8) ?[]const u8 {
++    return std.mem.span(std.c.getenv(name) orelse return null);
++}
++
++/// A prompt buffer set's roles in a fixed order (both ranks register alike): rooms, glued rows, the last site's rows.
++pub fn roles(b: *const fw.Buffers, world: usize, dims: usize) [3][2]u64 {
++    return .{ .{ b.gathered, world * b.rows * dims * 4 }, .{ b.normed, b.rows * dims * 2 }, .{ b.hidden, b.rows * dims * 2 } };
++}
++
++/// Both ranks call it (two ranks, split exchanges direct): the prompt buffers' roles mapped on the peer, or null.
++pub fn open(gpa: std.mem.Allocator, d: *const cuda.Driver, g: *const cuda.tp_group.Group, s: cuda.Stream, bp: *const fw.Buffers, dims: usize, split_direct: bool) !?*cuda.ce_push.Push {
++    if (g.world != 2) return null;
++    const set = Settings.read(&environment) catch blk: {
++        std.log.err("TF_GLM_CE_EXCHANGE: 0 or 1; TF_GLM_CE_CHUNK_KB: 64 to 65536 (off)", .{});
++        break :blk Settings{};
++    };
++    const want = set.on and split_direct;
++    const r = roles(bp, 2, dims);
++    const x = try cuda.ce_push.Push.open(gpa, d, g, s, want, &r, set.chunk);
++    if (x) |c| std.log.info("ce exchange: a prompt chunk's split partials and glued rows by copy engines ({d} KiB copies)", .{c.chunk >> 10}) else if (set.on) std.log.info("ce exchange: off (a rank could not map the other's prompt rows, or the split is not direct); NCCL carries them", .{});
++    return x;
++}
++
++test "flag slots: a pair's twin Pieces never shares a slot with the first's" {
++    var a: Pieces = undefined;
++    a.ce_slot0 = 0;
++    var b: Pieces = undefined;
++    b.ce_slot0 = 2 * fw.max_pieces;
++    try std.testing.expectEqual(@as(usize, fw.max_pieces + 3), slot(&a, .glued, 3));
++    try std.testing.expect(slot(&a, .glued, fw.max_pieces - 1) < slot(&b, .partials, 0));
++    try std.testing.expect(slot(&b, .glued, fw.max_pieces - 1) < cuda.ce_push.slots);
++}
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index af7092de..39626a30 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -58,6 +58,7 @@ pub const Engine = struct {
+     lib: *const cuda.nccl.Library,
+     comm: cuda.nccl.Comm,
+     group: ?*const cuda.tp_group.Group = null, // the main stream's all-gathers (RoCE on two ranks); null: lib and comm
++    ce: ?*cuda.ce_push.Push = null, // TF_GLM_CE_EXCHANGE=1: a prompt chunk's split exchanges by copy engines (cuda_ce.zig)
+     images: ?*images_mod.Images = null, // --vision: a prompt pass's image rows (rank 0 encodes, the others receive)
+     packs: mm_mod.Packed = .{}, // the linears packed at load and their bits (TF_GLM_DENSE_BITS, _HEAD_BITS)
+     drafter: ?*dflash.Drafter = null, // --drafter: DFlash2 (every rank runs its passes; rank 0 selects the drafts)
+@@ -259,7 +260,7 @@ pub const Engine = struct {
+     fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
+         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
+         const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
+-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .side = if (b == &e.bp) null else e.side, .moe_fuse = e.moe_fuse };
++        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .side = if (b == &e.bp) null else e.side, .moe_fuse = e.moe_fuse, .ce = if (b == &e.bp) e.ce else null };
+     }
+ 
+     /// An on-by-default switch: off only when `name` is "0".
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 21a45ce1..d89b0ae6 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -127,6 +127,7 @@ pub fn ranges(rows: usize, pieces: usize, out: *[max_pieces][2]usize) usize {
+ /// A prompt chunk's pieced exchanges (overlap.Overlap): second stream and events; `count`: TF_GLM_OVERLAP_PIECES (3).
+ pub const Pieces = struct {
+     count: usize = 4,
++    ce_slot0: usize = 0, // the first of its 2 x max_pieces copy-engine flag slots (a paired chunk's twin takes the next)
+     side: cuda.Stream,
+     filled: [max_pieces]cuda.Event,
+     gathered: [max_pieces]cuda.Event,
+@@ -192,6 +193,7 @@ pub const Forward = struct {
+     images: ?ImageRows = null, // a prompt pass's image rows over their placeholders' embeddings (its sequence only)
+     prof: ?*prof_mod.Prof = null, // TF_GLM_PROF=1: events between the sections
+     taps: ?taps_mod.Taps = null, // DFlash2 (--drafter): the tapped layers' rows, after each such layer
++    ce: ?*cuda.ce_push.Push = null, // split exchanges by copy-engine pushes into the peer's registered rows (cuda_ce.zig)
+     index_split: bool = false, // TF_GLM_INDEX_SPLIT: this prompt chunk's indexer rows split across the ranks (rank 0's choice)
+     side: ?moe.Side = null, // a decode window's MoE shared expert on a second stream (TF_GLM_SHARED_SIDE, default on)
+     moe_fuse: bool = false, // a decode window's EXL3 MoE glue fused (TF_GLM_MOE_FUSE, default on in the engine)
+diff --git a/zig/src/families/glm/cuda_forward_pieces.zig b/zig/src/families/glm/cuda_forward_pieces.zig
+index bb41202f..d744fb26 100644
+--- a/zig/src/families/glm/cuda_forward_pieces.zig
++++ b/zig/src/families/glm/cuda_forward_pieces.zig
+@@ -1,5 +1,6 @@
+ //! The existing pieced prompt exchanges, isolated so their diagnostic spans stay beside each stream operation.
+ const relay = @import("cuda_relay.zig");
++const ce_x = @import("cuda_ce.zig");
+ const taps = @import("cuda_taps.zig");
+ const fw = @import("cuda_forward.zig");
+ const prof = @import("cuda_prof.zig");
+@@ -48,7 +49,7 @@ pub fn exchangePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site,
+                 const mine = share(n, world, me);
+                 const own = mine[1] - mine[0];
+                 const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
+-                if (f.ring) try relay.partials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D) else try relay.splitPartials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D);
++                if (f.ce) |ce| try ce_x.partials(f, ce, p, q, lo, n) else if (f.ring) try relay.partials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D) else try relay.splitPartials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D);
+                 try f.copy(p.side, room(r, lo) + me * own * D * 4, r.b.part + (lo + mine[0]) * D * 4, own * D * 4);
+             },
+         }
+@@ -99,7 +100,7 @@ pub fn gluePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut
+                 const me = r.w.share.rank;
+                 const rows_of = if (last) r.b.hidden else r.b.normed;
+                 const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
+-                if (f.ring) try relay.glued(x.lib, x.comm, p.side, plan, rows_of, lo, D) else try relay.splitGlued(x.lib, x.comm, p.side, plan, rows_of, lo, D);
++                if (f.ce) |ce| try ce_x.glued(f, ce, p, q, rows_of, lo, n) else if (f.ring) try relay.glued(x.lib, x.comm, p.side, plan, rows_of, lo, D) else try relay.splitGlued(x.lib, x.comm, p.side, plan, rows_of, lo, D);
+             },
+         }
+         stamp.end();
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index 0b71c420..ded91e2c 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -272,6 +272,11 @@ fn finishRank(a: OpenArgs) !Loaded {
+         x.deinit();
+         own.group.p2p = null;
+     };
++    own.e.ce = try @import("cuda_ce.zig").open(gpa, ctx.d, &own.group, own.e.stream, &own.e.bp, own.e.c.hidden, set.split and !set.ring);
++    errdefer if (own.e.ce) |x| {
++        x.deinit();
++        own.e.ce = null;
++    };
+     own.e.group = &own.group;
+     own.link = try follow.Link.init(gpa, ctx.d, &own.group.lib, own.group.comm, own.e.stream, try linkCapacity(cap, o.vision));
+     errdefer own.link.deinit();
+@@ -417,6 +422,7 @@ fn close(ptr: *anyopaque) void {
+ /// What a rank owns, freed by rank 0's close and by a follower before it leaves.
+ fn release(own: *Owned) void {
+     own.link.deinit();
++    if (own.e.ce) |x| x.deinit(); // before the buffers it maps go with the engine
+     if (own.e.images) |v| v.deinit();
+     own.e.deinit();
+     own.group.close();
+diff --git a/zig/src/families/glm/cuda_prompts.zig b/zig/src/families/glm/cuda_prompts.zig
+index 6e6f3032..f5945f96 100644
+--- a/zig/src/families/glm/cuda_prompts.zig
++++ b/zig/src/families/glm/cuda_prompts.zig
+@@ -39,6 +39,8 @@ pub fn pass(e: anytype, parts: []const engine.Prompt, firsts: []u32, comptime Fo
+     try e.gate(null);
+     var one: [1]Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = &e.bp, .segs = segs[0..parts.len] }};
+     var f: Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = &e.pieces, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(true) else null };
++    // TF_GLM_CE_EXCHANGE=1: the batched pass's split exchanges by copy engines too (the same prompt buffers and pieces)
++    if (comptime @hasField(Forward, "ce") and @hasField(@TypeOf(e.*), "ce")) f.ce = e.ce;
+     try f.run(@ptrCast(ids[0..rows]));
+     if (e.drafter) |dr| for (parts, segs[0..parts.len]) |p, g|
+         try dr.promptSegment(e, p.slot, 0, g.rows, p.ids.len, g.row0);
+-- 
+2.53.0
+

@@ -1,0 +1,599 @@
+From 102cf5d038e24850ade57d3832729f014f724965 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 17:02:03 +0200
+Subject: [PATCH 64/66] glm cuda: TF_GLM_W8A8=1 (or 32), packed 8-bit prompt
+ linears on int8 activations (opt-in)
+
+glm_mm's packed 8-bit prompt kernel unpacks int8 codes to bf16 and multiplies bf16 activations (W8A16). With
+TF_GLM_W8A8=1 a prompt call (one = true, 8-bit codes, rows and K inside the scratch) instead:
+
+- glm_q8_rows rounds the bf16 rows to int8 with an fp32 scale per row and 64 inputs (TF_GLM_W8A8=32: per 32),
+  q = rint(x * 127 / max|x|), writing each 64-group permuted into the m16n8k32 B-fragment lane order of the codes as
+  glm_mm already tiles them (a group's dot product does not depend on its terms' order), so the weights stay as they
+  are: no copy, no re-tiling;
+- glm_mm8a8 runs int8 x int8 IMMA (m16n8k32) on those rows and the tiled codes (sign-flipped from their +128 storage),
+  exact int32 sums per group (or per 32-input step), each scaled by its row's and column's scales into fp32;
+  row blocks fastest, 128 columns a block for a whole pass and 64 for pieces.
+
+The scratch holds one 2048-row pass at K <= 8192 (int8 rows and [K / group][rows] scales, ~16.5 MiB a rank); other
+calls keep the bf16-row kernels. TF_GLM_W8A8_SKIP_K=1024,6144,8192 (diagnostic) keeps those K widths on bf16 rows.
+
+Measured on one RTX PRO 6000 (GLM-5.3-Flash TP2 shapes): 2048 x 12576 x 4096 1.114 -> 0.677 ms including the
+quantization (1.65x), 2048 x 4096 x 8192 0.737 -> 0.442 ms, 768-row pieces 1.47x. The kernel matches its own float64
+reference at bf16 output and its bytes and scales match a CPU re-implementation exactly; the activations' rounding
+changes the numbers, so the flag is off by default.
+
+The mm policy host test gains the packed_prompt field (0009's) and a W8A8 dispatch case.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj6TMcvsfVhxuBcBLg
+---
+ zig/glm_mm_policy_host.zig               |  38 +++-
+ zig/kernels/cuda/glm_mm.cu               |   3 +
+ zig/kernels/cuda/glm_mm_a8.cuh           | 247 +++++++++++++++++++++++
+ zig/src/families/glm/cuda_engine.zig     |  33 ++-
+ zig/src/families/glm/cuda_mm.zig         |  73 ++++++-
+ zig/src/families/glm/cuda_ranks.zig      |  15 +-
+ zig/src/families/glm/cuda_ranks_test.zig |  11 +-
+ 7 files changed, 411 insertions(+), 9 deletions(-)
+ create mode 100644 zig/kernels/cuda/glm_mm_a8.cuh
+
+diff --git a/zig/glm_mm_policy_host.zig b/zig/glm_mm_policy_host.zig
+index 5311dba3..57b20641 100644
+--- a/zig/glm_mm_policy_host.zig
++++ b/zig/glm_mm_policy_host.zig
+@@ -9,8 +9,10 @@ const kernels: mm.Kernels = .{
+     .tile = .{},
+     .tile_packed = @splat(.{}),
+     .pair = @splat(.{}), // decode windows' two-problem launches (not this test's)
+-    .packed_prompt = @splat(.{}), // the two-stage packed prompt kernels (not this test's)
++    .packed_prompt = @splat(.{ .id = 256 }),
+     .pdl = false,
++    .q8 = .{ .id = 2048 },
++    .mm8a8 = .{ .{ .{ .id = 4096 }, .{ .id = 8192 } }, .{ .{ .id = 4097 }, .{ .id = 8193 } } },
+ };
+ test "verify and draft windows keep shape-selected split K at every width" {
+     for ([_]u8{ 16, 4, 6, 8 }) |bits| for ([_]usize{ 1, 2, 3, 4, 8, 16, 17, 31, 32 }) |rows| {
+@@ -46,3 +48,37 @@ test "fixed K prompt experiment uses the same shape split across bucket, offset
+     };
+     try std.testing.expect(!kernels.prompt_fixed_k);
+ }
++
++test "TF_GLM_W8A8: only packed 8-bit prompt calls inside the scratch quantize their rows, then one IMMA launch" {
++    var k = kernels;
++    k.a8 = .{ .q = 1 << 20, .xs = 1 << 24, .rows = 2048, .k = 4096 };
++    for ([_]u8{ 16, 4, 6, 8 }) |bits| for ([_]usize{ 1, 127, 128, 768, 1024, 1025, 2048 }) |rows| for ([_]bool{ false, true }) |prompt| {
++        cuda.count = 0;
++        try mm.matmul(&k, .{}, 4096, 2048, .{ .w = 8192, .s = 12288, .n = 4096, .k = 2048, .bits = bits }, 16384, 32768, rows, false, prompt);
++        if (bits == 8 and prompt) {
++            try std.testing.expectEqual(@as(usize, 2), cuda.count);
++            try std.testing.expectEqual(@as(u32, 2048), cuda.symbols[0]);
++            try std.testing.expectEqual(@as(u32, if (rows > 1024) 8192 else 4096), cuda.symbols[1]);
++            try std.testing.expectEqual(@as(u32, @intCast((rows + 127) / 128)), cuda.configs[1].grid.x); // row blocks fastest
++        } else for (cuda.symbols[0..cuda.count]) |sym| try std.testing.expect(sym != 2048 and sym != 4096 and sym != 8192);
++    };
++    // TF_GLM_W8A8=32: the 32-group kernels
++    k.a8.?.gs = 32;
++    cuda.count = 0;
++    try mm.matmul(&k, .{}, 4096, 2048, .{ .w = 8192, .s = 12288, .n = 4096, .k = 2048, .bits = 8 }, 16384, 32768, 2048, false, true);
++    try std.testing.expectEqual(@as(u32, 8193), cuda.symbols[1]);
++    k.a8.?.gs = 64;
++    // a K width the diagnostic skips: the bf16-row kernels
++    k.a8.?.skip_k[0] = 2048;
++    cuda.count = 0;
++    try mm.matmul(&k, .{}, 4096, 2048, .{ .w = 8192, .s = 12288, .n = 4096, .k = 2048, .bits = 8 }, 16384, 32768, 2048, false, true);
++    try std.testing.expectEqual(@as(usize, 1), cuda.count);
++    k.a8.?.skip_k[0] = 0;
++    // past the scratch (rows or K): the bf16-row kernels
++    for ([_][2]usize{ .{ 4096, 2048 }, .{ 2048, 8192 } }) |rk| {
++        cuda.count = 0;
++        try mm.matmul(&k, .{}, 4096, rk[1], .{ .w = 8192, .s = 12288, .n = 4096, .k = rk[1], .bits = 8 }, 16384, 32768, rk[0], false, true);
++        try std.testing.expectEqual(@as(usize, 1), cuda.count);
++        try std.testing.expectEqual(@as(u32, 256), cuda.symbols[0]);
++    }
++}
+diff --git a/zig/kernels/cuda/glm_mm.cu b/zig/kernels/cuda/glm_mm.cu
+index 51b0c73d..2eaaa999 100644
+--- a/zig/kernels/cuda/glm_mm.cu
++++ b/zig/kernels/cuda/glm_mm.cu
+@@ -322,3 +322,6 @@ extern "C" __global__ void glm_mm_tile16(const __nv_bfloat16* __restrict__ src,
+ #pragma unroll
+     for (int v = 0; v < 16; ++v) dst[c * 16 + v] = src[(long long)n * K + g * 64 + frag_k(lane, v)];
+ }
++
++// Opt-in W8A8 prompt linears (TF_GLM_W8A8=1): see glm_mm_a8.cuh.
++#include "glm_mm_a8.cuh"
+diff --git a/zig/kernels/cuda/glm_mm_a8.cuh b/zig/kernels/cuda/glm_mm_a8.cuh
+new file mode 100644
+index 00000000..c6c2d004
+--- /dev/null
++++ b/zig/kernels/cuda/glm_mm_a8.cuh
+@@ -0,0 +1,247 @@
++// Opt-in W8A8 for packed 8-bit prompt linears (TF_GLM_W8A8=1): activations rounded to int8 with one fp32 scale per row
++// and 64-group, then int8 x int8 IMMA (m16n8k32, exact int32 sums per group) on glm_mm's tiled 8-bit codes as stored.
++//
++// The tiled codes give lane (t = lane & 3) of a column tile, in a group of 64, the inputs frag_k(t, v) for v = 0..15
++// (bf16 m16n8k16 B-fragment order). A group's dot product does not depend on the order of its 64 terms, so the
++// activations are written permuted instead: position k' = 32 s + 16 r + 4 t + b (IMMA k-step s, register r, byte b,
++// the m16n8k32 B-fragment order) holds input frag_k(t, 8 s + 4 r + b). Then word (2 s + r) of a lane's tiled chunk is
++// exactly its IMMA register r of k-step s, and the activations' rows load with ldmatrix as for bf16.
++#pragma once
++
++namespace glm_a8 {
++
++using namespace qmm_frag;
++
++// Input 8 c + i of a group (i in 0..7: thread c's chunk) -> its permuted position k'.
++__device__ __forceinline__ int perm_of(int c, int i) {
++  return 32 * (c >> 2) + 16 * ((c >> 1) & 1) + 4 * (i >> 1) + 2 * (c & 1) + (i & 1);
++}
++
++__device__ __forceinline__ void imma(int (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++  asm volatile(
++      "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
++      "{%0, %1, %2, %3};\n"
++      : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
++      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++}
++__device__ __forceinline__ void imma0(int (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++  const int z = 0;
++  asm volatile(
++      "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
++      "{%10, %10, %10, %10};\n"
++      : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
++      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(z));
++}
++// a group's int32 sum (|i| < 2^21) to fp32, exactly (I2F measured ~3% faster here than the two-add trick)
++__device__ __forceinline__ float i2f(int i) { return __int2float_rn(i); }
++
++// 64-byte rows of 4 chunks: conflict-free ldmatrix over 8 consecutive rows
++__device__ __forceinline__ int swz4(int r, int c) { return c ^ ((r >> 1) & 3); }
++
++template <int BN, int STAGES, int GS = 64>
++struct Tile8 {
++  static constexpr int BM = 128, WM = 2, WN = 4, THREADS = 256, MT = BM / WM / 16, NT = BN / WN / 8, TILES = BN / 8;
++  static constexpr int X = BM * 64, XS = BM * 4 * (64 / GS), W = TILES * 32 * 4 * 4, WS = TILES * 16;
++  static constexpr int STAGE = X + XS + W + WS, SMEM = STAGES * STAGE;
++};
++
++// out [M][N] (fp32 with f32, else bf16) = sum over groups g of (q [M][64 g ..] . codes) * xs[g][m] * ws[n][g].
++// xs is [K/GS][mp] (rows of a group contiguous, mp = M rounded up to 4, padded so 16-byte loads stay inside).
++// GS 32: an activation scale per IMMA k-step (inputs 32 s .. 32 s + 31 of a 64-group, see perm_of), each step's int32
++// sum scaled on its own; GS 64: one scale per 64-group, both steps summed in int32 first.
++template <int BN, int STAGES, bool ROWS_FIRST, int GS = 64>
++__device__ __forceinline__ void mm8a8(const int8_t* __restrict__ q, const float* __restrict__ xs, int mp,
++                                      const uint32_t* __restrict__ w, const __half* __restrict__ s,
++                                      void* __restrict__ out, int f32, int M, int N, int K) {
++  using T = Tile8<BN, STAGES, GS>;
++  constexpr int SPG = 64 / GS;  // activation scales a 64-group
++  extern __shared__ __align__(128) unsigned char buf[];
++  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++  const int wm = warp / T::WN, wn = warp % T::WN;
++  const int KG = K >> 6, N8 = N >> 3;
++  // ROWS_FIRST: the row blocks of one column tile run together and share its weight tile in L2 (each read once)
++  const int n0 = (ROWS_FIRST ? blockIdx.y : blockIdx.x) * BN, m0 = (ROWS_FIRST ? blockIdx.x : blockIdx.y) * T::BM;
++  const int t0 = n0 >> 3;
++  auto stage = [&](int st) { return buf + st * T::STAGE; };
++  auto loadX = [&](int st, int g) {
++    unsigned char* p = stage(st);
++#pragma unroll
++    for (int c = tid; c < T::BM * 4; c += T::THREADS) {
++      const int r = c >> 2, ch = c & 3;
++      const int row = min(m0 + r, M - 1);
++      cp16z(p + r * 64 + swz4(r, ch) * 16, q + (long long)row * K + g * 64 + ch * 16, m0 + r < M);
++    }
++    if (tid < T::BM / 4 * SPG) {
++      const int h = tid / (T::BM / 4), c = tid % (T::BM / 4);
++      cp16(p + T::X + h * T::BM * 4 + c * 16, xs + (long long)(g * SPG + h) * mp + m0 + c * 4);
++    }
++  };
++  auto loadW = [&](int st, int g) {
++    unsigned char* pw = stage(st) + T::X + T::XS;
++    constexpr int PER_TILE = 32 * 4 * 4 / 16;
++    for (int c = tid; c < T::TILES * PER_TILE; c += T::THREADS) {
++      const int tt = c / PER_TILE, off = c % PER_TILE;
++      if (t0 + tt >= N8) continue;
++      cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(w) + ((long long)(t0 + tt) * KG + g) * 512 + off * 16);
++    }
++    unsigned char* ps = pw + T::W;
++    for (int tt = tid; tt < T::TILES; tt += T::THREADS) {
++      if (t0 + tt >= N8) continue;
++      cp16(ps + tt * 16, s + ((long long)(t0 + tt) * KG + g) * 8);
++    }
++  };
++  float acc[T::MT][T::NT][4];
++#pragma unroll
++  for (int i = 0; i < T::MT; ++i)
++#pragma unroll
++    for (int j = 0; j < T::NT; ++j)
++#pragma unroll
++      for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
++  grid_launch();
++#pragma unroll
++  for (int st = 0; st < STAGES - 1; ++st)
++    if (st < KG) loadW(st, st);
++  grid_wait();
++#pragma unroll
++  for (int st = 0; st < STAGES - 1; ++st) {
++    if (st < KG) loadX(st, st);
++    commit();
++  }
++  const int g4 = lane >> 2, t4 = lane & 3;
++  for (int it = 0; it < KG; ++it) {
++    wait<STAGES - 2>();
++    __syncthreads();
++    const int next = it + STAGES - 1;
++    if (next < KG) {
++      loadX(next % STAGES, next);
++      loadW(next % STAGES, next);
++    }
++    commit();
++    const unsigned char* p = stage(it % STAGES);
++    const float* px = reinterpret_cast<const float*>(p + T::X);
++    const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X + T::XS);
++    const __half* ps = reinterpret_cast<const __half*>(p + T::X + T::XS + T::W);
++    uint32_t b[T::NT][4];
++#pragma unroll
++    for (int j = 0; j < T::NT; ++j) {
++      const uint4 u = *reinterpret_cast<const uint4*>(pw + ((wn * T::NT + j) * 32 + lane) * 4);
++      b[j][0] = u.x ^ 0x80808080u, b[j][1] = u.y ^ 0x80808080u, b[j][2] = u.z ^ 0x80808080u, b[j][3] = u.w ^ 0x80808080u;
++    }
++    float sw[T::NT][2];
++#pragma unroll
++    for (int j = 0; j < T::NT; ++j) {
++      const __half2 h = *reinterpret_cast<const __half2*>(ps + (wn * T::NT + j) * 8 + t4 * 2);
++      sw[j][0] = __low2float(h), sw[j][1] = __high2float(h);
++    }
++    // a step's (or, GS 64, a group's) int32 sums into the fp32 accumulators with their scales
++    auto scale = [&](const int (&d)[T::MT][T::NT][4], const float* pxs) {
++      float sx[T::MT][2];
++#pragma unroll
++      for (int i = 0; i < T::MT; ++i) {
++        const int r = wm * (T::BM / T::WM) + i * 16 + g4;
++        sx[i][0] = pxs[r], sx[i][1] = pxs[r + 8];
++      }
++#pragma unroll
++      for (int i = 0; i < T::MT; ++i)
++#pragma unroll
++        for (int j = 0; j < T::NT; ++j)
++#pragma unroll
++          for (int e = 0; e < 4; ++e)
++            acc[i][j][e] = __fmaf_rn(i2f(d[i][j][e]), sx[i][e >> 1] * sw[j][e & 1], acc[i][j][e]);
++    };
++    int d[T::MT][T::NT][4];
++#pragma unroll
++    for (int ks = 0; ks < 2; ++ks) {
++      uint32_t a[T::MT][4];
++#pragma unroll
++      for (int i = 0; i < T::MT; ++i) {
++        const int r = wm * (T::BM / T::WM) + i * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
++        ldmatrix4(a[i], p + r * 64 + swz4(r, ks * 2 + (lane >> 4)) * 16);
++      }
++#pragma unroll
++      for (int i = 0; i < T::MT; ++i)
++#pragma unroll
++        for (int j = 0; j < T::NT; ++j) {
++          if (ks == 0 || GS == 32) imma0(d[i][j], a[i], b[j][2 * ks], b[j][2 * ks + 1]);
++          else imma(d[i][j], a[i], b[j][2], b[j][3]);
++        }
++      if constexpr (GS == 32) scale(d, px + ks * T::BM);
++    }
++    if constexpr (GS == 64) scale(d, px);
++  }
++  wait<0>();
++#pragma unroll
++  for (int i = 0; i < T::MT; ++i)
++#pragma unroll
++    for (int j = 0; j < T::NT; ++j) {
++      const int col = n0 + (wn * T::NT + j) * 8 + t4 * 2;
++      if (col >= N) continue;
++#pragma unroll
++      for (int h = 0; h < 2; ++h) {
++        const int row = m0 + wm * (T::BM / T::WM) + i * 16 + g4 + h * 8;
++        if (row >= M) continue;
++        const float v0 = acc[i][j][2 * h], v1 = acc[i][j][2 * h + 1];
++        if (f32) {
++          *reinterpret_cast<float2*>(reinterpret_cast<float*>(out) + (long long)row * N + col) = make_float2(v0, v1);
++        } else {
++          *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(out) + (long long)row * N + col) =
++              __floats2bfloat162_rn(v0, v1);
++        }
++      }
++    }
++}
++
++
++}  // namespace glm_a8
++
++// Activations for glm_mm8a8: x bf16 [M][K] (rows ldx apart) -> q int8 [M][K] (each 64-group permuted, see above) and
++// xs fp32 [K/gs][mp]: per row and gs-group (gs 64 or 32), scale = max|x| / 127 and q = rint(x / scale) (0 for an
++// all-zero group). 8 threads a 64-group (4 a 32-group), 32 64-groups a block of 256.
++extern "C" __global__ void __launch_bounds__(256) glm_q8_rows(const __nv_bfloat16* __restrict__ x, long long ldx,
++    int8_t* __restrict__ q, float* __restrict__ xs, int mp, int M, int K, int gs) {
++  const int KG = K >> 6;
++  const long long gid = (long long)blockIdx.x * 32 + (threadIdx.x >> 3);
++  const int c = threadIdx.x & 7;
++  const bool ok = gid < (long long)M * KG;
++  const long long row = ok ? gid / KG : 0;
++  const int g = ok ? (int)(gid % KG) : 0;
++  float v[8];
++  uint4 u = make_uint4(0, 0, 0, 0);
++  if (ok) u = *reinterpret_cast<const uint4*>(x + row * ldx + g * 64 + c * 8);
++  const __nv_bfloat16* hv = reinterpret_cast<const __nv_bfloat16*>(&u);
++  float amax = 0.0f;
++#pragma unroll
++  for (int i = 0; i < 8; ++i) {
++    v[i] = __bfloat162float(hv[i]);
++    amax = fmaxf(amax, fabsf(v[i]));
++  }
++  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
++  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
++  const float a4 = __shfl_xor_sync(0xffffffffu, amax, 4);
++  if (gs == 64) amax = fmaxf(amax, a4);
++  if (!ok) return;
++  const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
++  int8_t* dst = q + row * K + g * 64;
++#pragma unroll
++  for (int i = 0; i < 8; i += 2) {
++    const int a = max(-127, min(127, __float2int_rn(v[i] * inv)));
++    const int b = max(-127, min(127, __float2int_rn(v[i + 1] * inv)));
++    *reinterpret_cast<uint16_t*>(dst + glm_a8::perm_of(c, i)) = (uint16_t)((a & 255) | ((b & 255) << 8));
++  }
++  if (gs == 64 && c == 0) xs[(long long)g * mp + row] = amax * (1.0f / 127.0f);
++  if (gs == 32 && (c & 3) == 0) xs[(long long)(2 * g + (c >> 2)) * mp + row] = amax * (1.0f / 127.0f);
++}
++
++// The instances cuda_mm.zig launches (row blocks fastest): 64 columns a block for pieces (two blocks an SM), 128 for a
++// whole pass. Measured at 2048 x 12576 x 4096: 0.67 ms against glm_mm8_128s2's 1.12 ms (column-first order, four
++// stages, or the scale epilogue one group behind measured no faster).
++#define GLM_MM8A8(name, BN, MINB, GS)                                                                                  \
++  extern "C" __global__ void __launch_bounds__(256, MINB) name(const int8_t* __restrict__ q, const float* __restrict__ xs, \
++      int mp, const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, int f32, int M,    \
++      int N, int K) { glm_a8::mm8a8<BN, 3, true, GS>(q, xs, mp, w, s, out, f32, M, N, K); }
++GLM_MM8A8(glm_mm8a8_64s3r, 64, 2, 64)
++GLM_MM8A8(glm_mm8a8_128s3r, 128, 1, 64)
++// TF_GLM_W8A8=32: an activation scale per 32 inputs (each IMMA k-step's own), the same codes
++GLM_MM8A8(glm_mm8a8_64s3r_g32, 64, 2, 32)
++GLM_MM8A8(glm_mm8a8_128s3r_g32, 128, 1, 32)
++#undef GLM_MM8A8
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 52df416f..1248a1f0 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -128,6 +128,7 @@ pub const Engine = struct {
+     pages: ?*pages_mod.Pages = null, // the other streams' KV pages and sequences (cuda_pages), once the server attached them
+     index_split: bool = false, // the next prompt step's indexer rows split across the ranks: rank 0's choice, the chunk's flag 2
+     index_splits: u64 = 0, // prompt steps whose indexer rows split (glm-split-check counts them)
++    a8_buf: ?cuda.DeviceBuffer = null, // TF_GLM_W8A8=1: a prompt pass's int8 rows and scales (cuda_mm.A8)
+ 
+     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
+@@ -219,7 +220,8 @@ pub const Engine = struct {
+         }
+         e.bp = try fw.Buffers.init(d, &e.w, fw.prefill_rows, true, o.capacity);
+         errdefer e.bp.deinit();
+-        e.initNumerics();
++        try e.initNumerics();
++        errdefer if (e.a8_buf) |*b| b.free();
+         if (pair) e.pair = try prompt_pair.Pair.init(d, &e.w, &e.bp, &e.pieces, o.capacity, !o.settings.split); // split: one room
+         errdefer if (e.pair) |*p| p.deinit();
+         e.bd = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
+@@ -273,6 +275,7 @@ pub const Engine = struct {
+         e.bd.deinit();
+         if (e.pair) |*p| p.deinit();
+         e.bp.deinit();
++        if (e.a8_buf) |*b| b.free();
+         if (e.pages) |p| p.deinit();
+         for (0..e.seqs.items.len) |i| e.free(i);
+         e.seqs.deinit(e.gpa);
+@@ -288,11 +291,33 @@ pub const Engine = struct {
+ 
+     const freeProfs = @import("cuda_engine_prof.zig").freeProfs;
+ 
+-    /// The opt-in numerics flags (cuda_ranks.Numerics), named once at startup.
+-    fn initNumerics(e: *Engine) void {
++    /// The widest K a W8A8 prompt call takes from the scratch (TP2's DSA o_proj: 32 heads of 256); wider ones stay bf16.
++    const a8_max_k = 8192;
++
++    /// The opt-in numerics flags (cuda_ranks.Numerics), named once at startup; TF_GLM_W8A8's scratch for one pass.
++    fn initNumerics(e: *Engine) !void {
+         const n = e.settings.numerics;
+         if (n.bits() == 0) return;
+-        std.log.warn("opt-in prompt numerics: absorb/expand {s}", .{if (n.absorb_mma) "tensor cores (TF_GLM_ABSORB_MMA)" else "SIMT"});
++        if (n.w8a8 and e.settings.tiled and (e.settings.dense_bits == 8 or e.settings.head_bits == 8)) {
++            const gs: usize = if (n.w8a8_g32) 32 else 64;
++            const sz = mm_mod.A8.bytes(fw.prefill_rows, a8_max_k, gs);
++            const buf = try cuda.DeviceBuffer.alloc(e.d, sz[0] + sz[1]);
++            e.a8_buf = buf;
++            e.m.mm.a8 = .{ .q = buf.ptr, .xs = buf.ptr + sz[0], .rows = fw.prefill_rows, .k = a8_max_k, .gs = gs };
++            if (std.c.getenv("TF_GLM_W8A8_SKIP_K")) |v| { // diagnostic: these K widths keep bf16 rows (e.g. 1024,6144,8192)
++                var it = std.mem.tokenizeScalar(u8, std.mem.span(v), ',');
++                var i: usize = 0;
++                while (it.next()) |tok| : (i += 1) {
++                    if (i == 4) break;
++                    e.m.mm.a8.?.skip_k[i] = std.fmt.parseInt(usize, tok, 10) catch 0;
++                }
++                std.log.warn("TF_GLM_W8A8_SKIP_K={s}: those K widths keep bf16 rows", .{std.mem.span(v)});
++            }
++        } else if (n.w8a8) std.log.warn("TF_GLM_W8A8=1 needs 8-bit packed linears (TF_GLM_DENSE_BITS=8, TF_GLM_MM=1); prompts stay on bf16 rows", .{});
++        std.log.warn("opt-in prompt numerics: absorb/expand {s}, packed 8-bit linears on {s} rows", .{
++            if (n.absorb_mma) "tensor cores (TF_GLM_ABSORB_MMA)" else "SIMT",
++            if (e.m.mm.a8) |a| (if (a.gs == 32) "int8, a scale per 32 (TF_GLM_W8A8=32)" else "int8, a scale per 64 (TF_GLM_W8A8=1)") else "bf16",
++        });
+     }
+ 
+     pub fn exchange(e: *const Engine) fw.Exchange {
+diff --git a/zig/src/families/glm/cuda_mm.zig b/zig/src/families/glm/cuda_mm.zig
+index 406141ad..88e79162 100644
+--- a/zig/src/families/glm/cuda_mm.zig
++++ b/zig/src/families/glm/cuda_mm.zig
+@@ -48,9 +48,16 @@ pub const Kernels = struct {
+     tile_packed: [3]cuda.Function, // glm_mm_tile4/6/8: packed rows and their scales into the tiles
+     prompt_fixed_k: bool = false, // opt-in prompt experiment; never selected from the number of batched rows
+     pdl: bool, // dependent launches: a matmul's weights stream in while the kernel before it finishes
++    q8: cuda.Function, // glm_q8_rows: a prompt's bf16 rows to int8 with a scale per row and 64- or 32-group (TF_GLM_W8A8)
++    mm8a8: [2][2]cuda.Function, // [64-, 32-groups][glm_mm8a8_64s3r (to 1024 rows), _128s3r]: int8 rows by the 8-bit codes
++    a8: ?A8 = null, // TF_GLM_W8A8=1: the int8 rows' scratch; null: packed prompts stay on bf16 rows (the default)
+ 
+     pub fn load(m: cuda.Module) !Kernels {
+-        var k: Kernels = .{ .by_rows = undefined, .packed_rows = undefined, .packed_prompt = undefined, .pair = undefined, .tile_packed = undefined, .prompt = try m.function("glm_mm16_rows"), .reduce = try m.function("glm_mm_reduce"), .tile = try m.function("glm_mm_tile16"), .pdl = true };
++        var k: Kernels = .{ .by_rows = undefined, .packed_rows = undefined, .packed_prompt = undefined, .pair = undefined, .tile_packed = undefined, .prompt = try m.function("glm_mm16_rows"), .reduce = try m.function("glm_mm_reduce"), .tile = try m.function("glm_mm_tile16"), .pdl = true, .q8 = try m.function("glm_q8_rows"), .mm8a8 = .{
++            .{ try m.function("glm_mm8a8_64s3r"), try m.function("glm_mm8a8_128s3r") },
++            .{ try m.function("glm_mm8a8_64s3r_g32"), try m.function("glm_mm8a8_128s3r_g32") },
++        } };
++        for (k.mm8a8, [2]usize{ 64, 32 }) |fs, gs| for (fs, a8_bn) |f, bn| try f.allowDynamicShared(a8Shared(bn, gs));
+         inline for (.{ "glm_mm16_16", "glm_mm16_32", "glm_mm16_64", "glm_mm16_128" }, 0..) |name, i| {
+             k.by_rows[i] = try m.function(name);
+             try k.by_rows[i].allowDynamicShared(smem(bucket(i)));
+@@ -74,6 +81,65 @@ pub const Kernels = struct {
+     }
+ };
+ 
++/// TF_GLM_W8A8's scratch for one prompt pass: int8 rows [rows][k] and their fp32 scales [k / gs][rows to 4] (+ 128);
++/// `gs` the activations' group: 64 (TF_GLM_W8A8=1) or 32 (=32).
++pub const A8 = struct {
++    q: u64,
++    xs: u64,
++    rows: usize,
++    k: usize,
++    gs: usize = 64,
++    skip_k: [4]usize = @splat(0), // TF_GLM_W8A8_SKIP_K (diagnostic): calls of these K widths keep bf16 rows
++
++    fn takes(a: A8, rows: usize, k: usize) bool {
++        if (rows > a.rows or k > a.k) return false;
++        for (a.skip_k) |x| if (x == k) return false;
++        return true;
++    }
++
++    pub fn bytes(rows: usize, k: usize, gs: usize) [2]usize {
++        return .{ std.mem.alignForward(usize, rows * k, 256), ((k / gs) * std.mem.alignForward(usize, rows, 4) + 128) * 4 };
++    }
++};
++
++const a8_bn = [2]usize{ 64, 128 };
++
++/// glm_mm8a8's three stages: 128 int8 rows of 64 and their scales (64 / gs a row), `bn` columns of codes and theirs.
++fn a8Shared(bn: usize, gs: usize) u32 {
++    return @intCast(3 * (128 * 64 + 128 * 4 * (64 / gs) + bn / 8 * 512 + bn / 8 * 16));
++}
++
++/// A packed 8-bit prompt call on int8 rows (TF_GLM_W8A8): the rows quantized into the scratch, then the IMMA kernel.
++fn matmulA8(k: *const Kernels, a: A8, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, out: u64, m: usize, wide: bool) !void {
++    const mp = std.mem.alignForward(usize, m, 4);
++    const groups = m * (w.k / 64);
++    var q: cuda.Args = .{};
++    q.add(x);
++    q.add(@as(c_longlong, @intCast(ldx)));
++    q.add(a.q);
++    q.add(a.xs);
++    q.add(@as(c_int, @intCast(mp)));
++    q.add(@as(c_int, @intCast(m)));
++    q.add(@as(c_int, @intCast(w.k)));
++    q.add(@as(c_int, @intCast(a.gs)));
++    try cuda.launch.launch(k.q8, .{ .grid = .{ .x = @intCast((groups + 31) / 32) }, .block = .{ .x = 256 } }, s, &q);
++    const wide_tile = m > 1024; // 128 columns a block for a whole pass, 64 for pieces (the faster of each, measured)
++    const bn = a8_bn[@intFromBool(wide_tile)];
++    var g: cuda.Args = .{};
++    g.add(a.q);
++    g.add(a.xs);
++    g.add(@as(c_int, @intCast(mp)));
++    g.add(w.w);
++    g.add(w.s);
++    g.add(out);
++    g.add(@as(c_int, @intFromBool(wide)));
++    g.add(@as(c_int, @intCast(m)));
++    g.add(@as(c_int, @intCast(w.n)));
++    g.add(@as(c_int, @intCast(w.k)));
++    // row blocks fastest
++    try cuda.launch.launch(k.mm8a8[@intFromBool(a.gs == 32)][@intFromBool(wide_tile)], .{ .grid = .{ .x = @intCast((m + 127) / 128), .y = @intCast((w.n + bn - 1) / bn) }, .block = .{ .x = 256 }, .shared = a8Shared(bn, a.gs), .pdl = k.pdl }, s, &g);
++}
++
+ const split_target = 192; // column tiles times K slices a launch aims at (the GB10's SMs, a few blocks each)
+ 
+ fn bucket(i: usize) usize {
+@@ -117,6 +183,11 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
+     while (done < m) { // windows to 64 rows a launch with K slices; prompts in one launch of 128-row blocks, one slice
+         const big = if (one) !k.prompt_fixed_k else m - done >= 128;
+         const rows = if (big) m - done else @min(m - done, 64);
++        if (big and one and w.bits == 8) if (k.a8) |a| if (a.takes(rows, w.k)) {
++            try matmulA8(k, a, s, x + done * ldx * 2, ldx, w, out + done * w.n * @as(usize, if (wide) 4 else 2), rows, wide);
++            done += rows;
++            continue;
++        };
+         const i: usize = if (big) 3 else if (rows <= 16) 0 else if (rows <= 32) 1 else 2;
+         const bm = bucket(i);
+         const sk = if (big) 1 else splitK(w.n, w.k); // a prompt's blocks share each weight tile in L2: no slices
+diff --git a/zig/src/families/glm/cuda_ranks.zig b/zig/src/families/glm/cuda_ranks.zig
+index 66346617..9da15db0 100644
+--- a/zig/src/families/glm/cuda_ranks.zig
++++ b/zig/src/families/glm/cuda_ranks.zig
+@@ -99,6 +99,15 @@ pub const Settings = struct {
+                 return error.BadSetting;
+             }
+         }
++        if (get("TF_GLM_W8A8")) |v| {
++            if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "64")) s.numerics.w8a8 = true else if (std.mem.eql(u8, v, "32")) {
++                s.numerics.w8a8 = true;
++                s.numerics.w8a8_g32 = true;
++            } else if (!std.mem.eql(u8, v, "0")) {
++                problem.* = "TF_GLM_W8A8: 0, 1 (a scale per 64 inputs) or 32 (per 32)";
++                return error.BadSetting;
++            }
++        }
+         s.heat = heat.bandsFrom(get("TF_HEAT_HIGH"), get("TF_HEAT_LOW")) catch {
+             problem.* = "TF_HEAT_HIGH and TF_HEAT_LOW: both or neither, in degrees, with low at or under high";
+             return error.BadSetting;
+@@ -114,7 +123,9 @@ pub const Settings = struct {
+ /// Opt-in prompt kernels whose sums round differently from the default path (a KL check each, off by default).
+ pub const Numerics = packed struct(u32) {
+     absorb_mma: bool = false, // TF_GLM_ABSORB_MMA=1: a prompt's absorb_q and expand_v as head-batched tensor-core GEMMs
+-    unused: u31 = 0,
++    w8a8: bool = false, // TF_GLM_W8A8=1: packed 8-bit prompt linears on int8 activations (per row and 64-group scales)
++    w8a8_g32: bool = false, // TF_GLM_W8A8=32: the same with an activation scale per 32 inputs
++    unused: u29 = 0,
+ 
+     pub fn bits(n: Numerics) u32 {
+         return @bitCast(n);
+@@ -358,7 +369,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
+         .max_videos => "the video count limit",
+         .max_frames => "the frame limit",
+         .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
+-        .numerics => "TF_GLM_ABSORB_MMA",
++        .numerics => "TF_GLM_ABSORB_MMA or TF_GLM_W8A8",
+         .capacity => "the sequence capacity (the context)",
+         .heat_high => "TF_HEAT_HIGH",
+         .heat_low => "TF_HEAT_LOW",
+diff --git a/zig/src/families/glm/cuda_ranks_test.zig b/zig/src/families/glm/cuda_ranks_test.zig
+index 2f83c197..cb611385 100644
+--- a/zig/src/families/glm/cuda_ranks_test.zig
++++ b/zig/src/families/glm/cuda_ranks_test.zig
+@@ -316,6 +316,13 @@ test "TF_GLM_INDEX_SPLIT: 2048 by default, 0 for never, a position, and a refusa
+ }
+ 
+ fn numeric(name: [:0]const u8) ?[]const u8 {
++    if (std.mem.eql(u8, name, "TF_GLM_W8A8")) return "1";
++    if (std.mem.eql(u8, name, "TF_GLM_ABSORB_MMA")) return "0";
++    return null;
++}
++
++fn numeric32(name: [:0]const u8) ?[]const u8 {
++    if (std.mem.eql(u8, name, "TF_GLM_W8A8")) return "32";
+     if (std.mem.eql(u8, name, "TF_GLM_ABSORB_MMA")) return "1";
+     return null;
+ }
+@@ -330,9 +337,11 @@ test "the opt-in prompt numerics: off by default, read by name, in the fingerpri
+     const none = try Settings.read(&typo_free, &problem);
+     try std.testing.expectEqual(@as(u32, 0), none.numerics.bits());
+     const s = try Settings.read(&numeric, &problem);
+-    try std.testing.expect(s.numerics.absorb_mma);
++    try std.testing.expect(s.numerics.w8a8 and !s.numerics.absorb_mma);
+     const f = Fingerprint.of(2, 0, s, 8192, true, @splat(0), @splat(0), hashBytes("/c"));
+     try std.testing.expectEqual(s.numerics.bits(), f.numerics);
++    const g = try Settings.read(&numeric32, &problem);
++    try std.testing.expect(g.numerics.w8a8 and g.numerics.w8a8_g32 and g.numerics.absorb_mma);
+     try std.testing.expectError(error.BadSetting, Settings.read(&numericTypo, &problem));
+     try std.testing.expectEqualStrings("TF_GLM_ABSORB_MMA: 0 or 1", problem);
+ }
+-- 
+2.53.0
+

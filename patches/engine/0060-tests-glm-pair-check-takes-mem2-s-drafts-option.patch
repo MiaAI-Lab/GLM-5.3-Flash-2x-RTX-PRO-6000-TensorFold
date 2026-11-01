@@ -1,0 +1,31 @@
+From a2bab5c5139d55f2b6478bb16aba17281c16c61e Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 17:58:47 +0200
+Subject: [PATCH 60/63] tests: glm-pair-check takes mem2's drafts option
+
+The engine's Options.mtp is now drafts. glm-pair-check, added with the paired prompt steps,
+still passed .mtp = true, so tf-cuda-test did not build on opt-mem2-paged. It now passes
+.drafts = true, the value the old field meant (the other GLM GPU checks took it in 96a491c5).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj6TMcvsfVhxuBcBLg
+---
+ zig/tests/cuda/glm_pair_tests.zig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/tests/cuda/glm_pair_tests.zig b/zig/tests/cuda/glm_pair_tests.zig
+index e86b55a9..a8d137e4 100644
+--- a/zig/tests/cuda/glm_pair_tests.zig
++++ b/zig/tests/cuda/glm_pair_tests.zig
+@@ -25,7 +25,7 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
+     try check.expect(world > 1, "glm-pair-check needs other ranks: at TP=1 an engine makes no twin", .{});
+     const C = glm.engine.prompt_rows;
+     const capacity = @max(dc.capacity, 5 * C);
+-    const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = capacity, .mtp = true, .settings = set });
++    const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = capacity, .drafts = true, .settings = set });
+     defer e.deinit();
+     var link = try glm.follow.Link.init(gpu.gpa, gpu.d, &lib, comm, e.stream, capacity);
+     defer link.deinit();
+-- 
+2.53.0
+

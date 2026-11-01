@@ -1,0 +1,148 @@
+From eeca8042ca13a671a5fbc06623e40e5adb7077bc Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 16:46:35 +0200
+Subject: [PATCH 19/25] glm cuda: the KV pool says what a held-back request
+ waits for, once a wait; unit tests for E4M3 pages
+
+Rank 0 logs one line when admission starts holding a request back (its prompt and reply tokens, the
+pages it needs, free and reclaimable of the pool's total, or that every paged sequence is busy) and
+one when it fits again. Unit tests: an E4M3 page beside DFlash2 holds a DSA layer's codes, scales and
+pooled keys (580 B a token, no MTP part) with ls and pk placed after the codes; a request needing
+more pages than the whole pool is admitted and refused with PoolTooSmall, taking nothing, also while
+the pool is busy. The pages unit fixture now names the target head (it read undefined before).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj6TMcvsfVhxuBcBLg
+---
+ zig/build/glm_family_host.zig            |  2 +-
+ zig/src/families/glm/cuda_lanes.zig      |  2 +-
+ zig/src/families/glm/cuda_pages.zig      | 25 ++++++++++++++--
+ zig/src/families/glm/cuda_pages_test.zig | 38 ++++++++++++++++++++++++
+ 4 files changed, 62 insertions(+), 5 deletions(-)
+
+diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
+index 98450245..6dd2305d 100644
+--- a/zig/build/glm_family_host.zig
++++ b/zig/build/glm_family_host.zig
+@@ -41,7 +41,7 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
+     const copies = b.createModule(.{ .root_source_file = b.path("zig/src/native/cuda_snaps.zig"), .target = host, .optimize = .debug, .imports = &.{.{ .name = "engine_api", .module = api }} });
+     const snapshots = b.createModule(.{ .root_source_file = b.path("zig/glm_snapshot_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm", .module = glm }, .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "engine_api", .module = api }, .{ .name = "copies", .module = copies } } });
+     b.step("test-glm-snapshots-host", "Prompt-sized GLM state copies, page budgets and rank ordering without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = snapshots })).step);
+-    b.step("test-glm-kv-pages-host", "TF_KV_PAGES for bf16 and E4M3, its refusals and the windows' capacity, on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{ "TF_KV_PAGES", "capacity keeps", "the plan's window" } })).step);
++    b.step("test-glm-kv-pages-host", "TF_KV_PAGES for bf16 and E4M3, the page layouts, admission and refusals, on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{ "TF_KV_PAGES", "capacity keeps", "the plan's window", "a paged stream", "the engine's own sequence holds", "a pool is refused", "a follower", "TF_KV_POISON", "every host allocation failure while making the pages", "E4M3 pages", "a request needing more pages" } })).step);
+     b.step("test-glm-host-cache", "The pinned host tier's size: TF_GLM_HOST_CACHE_GIB and the auto share, on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM host cache:"} })).step);
+     b.step("test-glm-prompt-settings-host", "Actual opt-in settings and rank agreement on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"prompt K experiment"} })).step);
+     const mm_record = b.createModule(.{ .root_source_file = b.path("zig/test_support/glm_mm_cuda.zig"), .target = host, .optimize = .debug });
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index 82773220..23303011 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -307,7 +307,7 @@ pub const Lanes = struct {
+ 
+     /// The lane host's admission: with a pool, a paged sequence and the request's pages are free.
+     pub fn fits(self: *const Lanes, prompt: usize, max_tokens: usize) bool {
+-        const p = self.x.e.pages orelse return true;
++        const p = self.x.e.pages orelse return true; // its wait note is rank 0's, on the engine thread
+         return p.fits(prompt, max_tokens);
+     }
+ 
+diff --git a/zig/src/families/glm/cuda_pages.zig b/zig/src/families/glm/cuda_pages.zig
+index 4da0a511..fc78f006 100644
+--- a/zig/src/families/glm/cuda_pages.zig
++++ b/zig/src/families/glm/cuda_pages.zig
+@@ -62,6 +62,7 @@ pub const Pages = struct {
+     used: []bool,
+     leader: bool,
+     poison: bool, // TF_KV_POISON=1: a stream's pages start as NaN, so a row read before its write shows in the reply
++    waiting: ?usize = null, // rank 0: the pages the request admission last held back needs (one log line a wait)
+ 
+     /// `streams` sequences from slot 0 on `pages` pages: the engine's own (`ownSequence`) placed, the others made now.
+     pub fn init(gpa: std.mem.Allocator, e: *Engine, l: kv.Layout, streams: usize, pages: usize, leader: bool) !*Pages {
+@@ -138,10 +139,28 @@ pub const Pages = struct {
+ 
+     /// Whether a request's pages fit now and a paged sequence is free for it. One that needs more pages than the whole
+     /// pool holds is admitted at once, so its opening refuses it (error.PoolTooSmall) instead of it waiting forever.
+-    pub fn fits(p: *const Pages, prompt: usize, max_tokens: usize) bool {
++    pub fn fits(p: *Pages, prompt: usize, max_tokens: usize) bool {
+         const n = need(p.layout, prompt, max_tokens);
+-        for (p.used) |u| if (!u) return n > p.pool.total() or p.pool.fits(n);
+-        return false;
++        const free_seq = for (p.used) |u| {
++            if (!u) break true;
++        } else false;
++        const ok = free_seq and (n > p.pool.total() or p.pool.fits(n));
++        p.noteWait(n, prompt, max_tokens, ok, free_seq);
++        return ok;
++    }
++
++    /// One line when admission starts holding a request back, saying for what, and one when it fits again.
++    fn noteWait(p: *Pages, n: usize, prompt: usize, max_tokens: usize, ok: bool, free_seq: bool) void {
++        if (@import("builtin").is_test) return;
++        if (ok) {
++            if (p.waiting) |w| std.log.info("kv pool: the request waiting for {d} pages fits now ({d} free of {d})", .{ w, p.pool.available(), p.pool.total() });
++            p.waiting = null;
++            return;
++        }
++        if (p.waiting == n) return;
++        p.waiting = n;
++        if (!free_seq) return std.log.info("kv pool: a request ({d} prompt + {d} reply tokens, {d} pages) waits for a stream: all {d} paged sequences are busy", .{ prompt, max_tokens, n, p.used.len });
++        std.log.info("kv pool: a request ({d} prompt + {d} reply tokens) waits for {d} pages: {d} free and {d} reclaimable of {d}, while the running streams hold the rest", .{ prompt, max_tokens, n, p.pool.available(), p.pool.reclaimable(), p.pool.total() });
+     }
+ 
+     /// Rank 0: paged slot `slot` takes the pages of a prompt, its reply and a last window; LaneMemory: not yet.
+diff --git a/zig/src/families/glm/cuda_pages_test.zig b/zig/src/families/glm/cuda_pages_test.zig
+index 7acda05f..010f6cd3 100644
+--- a/zig/src/families/glm/cuda_pages_test.zig
++++ b/zig/src/families/glm/cuda_pages_test.zig
+@@ -81,6 +81,7 @@ const Fake = struct {
+         f.e.pages = null;
+         f.e.images = null;
+         f.e.settings = .{};
++        f.e.mtp = true; // the target MTP head's part on every page (DFlash2 tests turn it off)
+         f.e.w = undefined;
+         f.e.w.config = .{};
+         f.e.w.share = try shard.Share.of(&f.e.w.config, 0, 2);
+@@ -277,3 +278,40 @@ test "every host allocation failure while making the pages leaves no device buff
+         }
+     }.run, .{});
+ }
++
++test "E4M3 pages beside DFlash2: a page holds each DSA layer's codes, scales and pooled keys, no MTP part" {
++    var f: Fake = undefined;
++    try f.init(std.testing.allocator);
++    f.e.settings.kv8 = true;
++    f.e.mtp = false;
++    const l = try pages_mod.layout(std.testing.allocator, &f.e, 0);
++    try expectEqual(@as(u64, 512 + 4 + 64), l.token_bytes); // one DSA layer: codes, its scale, pooled keys
++    const p = try f.pool(l, 3, 8, true);
++    defer f.deinit(p);
++    _ = try p.open(1, 600, 100);
++    const st = &f.e.seqs.items[1].?.st;
++    const x = st.caches[0];
++    try expect(st.kv8 and !st.head);
++    try expectEqual(x.lc + 512 * 512, x.ls); // the part's scales after its codes
++    try expectEqual(x.ls + 512 * 4, x.pk); // its pooled keys last
++    try expectEqual(l.pageBytes(), x.ps);
++    try expectEqual(@as(u64, 296_960), l.pageBytes());
++    p.close(1);
++}
++
++test "a request needing more pages than the whole pool is admitted at once and refused, never left waiting" {
++    var f: Fake = undefined;
++    try f.init(std.testing.allocator);
++    const l = try pages_mod.layout(std.testing.allocator, &f.e, 0);
++    const p = try f.pool(l, 3, 4, true); // 4 pages: 2,048 rows in all
++    defer f.deinit(p);
++    try expect(p.fits(3000, 100)); // 7 pages: past the pool, inside the window's table of 8
++    try std.testing.expectError(error.PoolTooSmall, p.open(1, 3000, 100));
++    try expectEqual(@as(usize, 0), f.e.seqs.items[1].?.st.capacity);
++    try expect(p.pool.idle() and p.pool.census().free == 4); // nothing promised or taken
++    _ = try p.open(1, 1500, 100); // 4 pages: the whole pool
++    try expect(!p.fits(600, 100)); // waits: the running stream holds every page
++    try expect(p.fits(3000, 100)); // still refused at once, not left waiting
++    p.close(1);
++    try expect(p.fits(600, 100));
++}
+-- 
+2.53.0
+

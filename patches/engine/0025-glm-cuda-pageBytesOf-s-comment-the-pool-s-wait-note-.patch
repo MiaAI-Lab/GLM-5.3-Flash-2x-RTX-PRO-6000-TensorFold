@@ -1,0 +1,52 @@
+From 0f67821f378a318f559bd4f75054dfa216ac6db7 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 17:12:19 +0200
+Subject: [PATCH 25/25] glm cuda: pageBytesOf's comment; the pool's wait note
+ ends with the held-back request's own admission
+
+- pageBytesOf's comment: a headless bf16 token is 11,968 bytes (11 DSA parts of 1,088).
+- The "fits now" line came when any other request fitted beside the held-back one (the slot's log showed it
+  with 585 of 1,171 pages free); the note now clears only when a request of the waiting need is admitted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj6TMcvsfVhxuBcBLg
+---
+ zig/src/families/glm/cuda_pages.zig | 8 +++++---
+ zig/src/families/glm/cuda_state.zig | 2 +-
+ 2 files changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_pages.zig b/zig/src/families/glm/cuda_pages.zig
+index d0338ac8..f3ffbf27 100644
+--- a/zig/src/families/glm/cuda_pages.zig
++++ b/zig/src/families/glm/cuda_pages.zig
+@@ -152,9 +152,11 @@ pub const Pages = struct {
+     /// One line when admission starts holding a request back, saying for what, and one when it fits again.
+     fn noteWait(p: *Pages, n: usize, prompt: usize, max_tokens: usize, ok: bool, free_seq: bool) void {
+         if (@import("builtin").is_test) return;
+-        if (ok) {
+-            if (p.waiting) |w| std.log.info("kv pool: the request waiting for {d} pages fits now ({d} free of {d})", .{ w, p.pool.available(), p.pool.total() });
+-            p.waiting = null;
++        if (ok) { // the held-back request's own admission ends its wait (another request fitting beside it does not)
++            if (p.waiting == n) {
++                std.log.info("kv pool: the request waiting for {d} pages fits now ({d} free of {d})", .{ n, p.pool.available(), p.pool.total() });
++                p.waiting = null;
++            }
+             return;
+         }
+         if (p.waiting == n) return;
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index 7c550dbc..933b8e6c 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -75,7 +75,7 @@ pub fn pageBytes(w: *const weights.Weights) u64 {
+ }
+ 
+ /// A page's bytes for this cache format: every DSA layer's part, then the target MTP head's if it is loaded
+-/// (bf16 13,056 a row, E4M3 6,960; 12,036 and 6,380 without the head, as beside DFlash2).
++/// (bf16 13,056 a row, E4M3 6,960; 11,968 and 6,380 without the head, as beside DFlash2).
+ pub fn pageBytesOf(w: *const weights.Weights, kv8: bool, head: bool) u64 {
+     return (mlaLayers(w) + @intFromBool(head)) * pageCacheBytes(&w.config, kv8);
+ }
+-- 
+2.53.0
+

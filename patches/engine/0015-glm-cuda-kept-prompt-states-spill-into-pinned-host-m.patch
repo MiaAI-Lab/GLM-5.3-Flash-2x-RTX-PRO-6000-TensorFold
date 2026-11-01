@@ -1,0 +1,1040 @@
+From e73c1e42c556b100180893eea9bbe510cf4bb7d2 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 16:00:18 +0200
+Subject: [PATCH 15/25] glm cuda: kept prompt states spill into pinned host
+ memory, and carry DFlash2's context to their mark
+
+The prompt cache's pages had one tier: the device memory left after the streams, a GiB or less at
+4 streams x 472K. Each rank now also pins a host tier (cuda_snapshot_host): TF_GLM_HOST_CACHE_GIB over
+all ranks (0: off), or unset a quarter of MemAvailable at startup, at most 16 GiB in all. A state takes
+free device pages first and host pages for the rest (one lease, two id lists); copies to and from the
+host run on the engine stream from page-locked memory, so a restore stays a byte copy.
+
+The ranks agree on the tier at the snapshots step: each reads its own MemAvailable, the least wins, and
+if any rank fails to pin it every rank frees its tier and takes device pages alone. The store's budget
+is the device cache plus the tier (native cuda_snaps cacheBudget's snap_host_tier).
+
+A state beside DFlash2 also keeps the drafter's context ring when the pass tapped the rows right up to
+its mark (dflash Slot.first/end), and a resume drafts from those rows as a fresh pass would, instead of
+from the mark. TF_GLM_SNAP_DRAFTER=0 keeps the old behaviour (A/B).
+
+Rank 0 logs each copy that touches host pages with its size and time.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNmHb8tWDWv2KnBDVCM
+---
+ zig/build/glm_family_host.zig                 |   1 +
+ zig/glm_snapshot_host.zig                     | 205 +++++++++++++++++-
+ zig/src/families/glm/cuda.zig                 |   1 +
+ zig/src/families/glm/cuda_engine.zig          |   5 +-
+ zig/src/families/glm/cuda_engine_types.zig    |  10 +-
+ zig/src/families/glm/cuda_follow.zig          |  13 +-
+ zig/src/families/glm/cuda_native.zig          |  13 +-
+ zig/src/families/glm/cuda_snapshot_host.zig   |  99 +++++++++
+ zig/src/families/glm/cuda_snapshot_layout.zig |  11 +-
+ zig/src/families/glm/cuda_snapshot_pages.zig  | 109 ++++++++--
+ zig/src/families/glm/cuda_snapshots.zig       |  91 +++++++-
+ zig/src/families/glm/dflash.zig               |  36 ++-
+ zig/src/native/cuda_snaps.zig                 |   6 +-
+ zig/test_support/glm_snap_driver.zig          |  40 ++++
+ 14 files changed, 599 insertions(+), 41 deletions(-)
+ create mode 100644 zig/src/families/glm/cuda_snapshot_host.zig
+
+diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
+index 1987ff62..22066ef2 100644
+--- a/zig/build/glm_family_host.zig
++++ b/zig/build/glm_family_host.zig
+@@ -41,6 +41,7 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
+     const copies = b.createModule(.{ .root_source_file = b.path("zig/src/native/cuda_snaps.zig"), .target = host, .optimize = .debug, .imports = &.{.{ .name = "engine_api", .module = api }} });
+     const snapshots = b.createModule(.{ .root_source_file = b.path("zig/glm_snapshot_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm", .module = glm }, .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "engine_api", .module = api }, .{ .name = "copies", .module = copies } } });
+     b.step("test-glm-snapshots-host", "Prompt-sized GLM state copies, page budgets and rank ordering without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = snapshots })).step);
++    b.step("test-glm-host-cache", "The pinned host tier's size: TF_GLM_HOST_CACHE_GIB and the auto share, on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM host cache:"} })).step);
+     b.step("test-glm-prompt-settings-host", "Actual opt-in settings and rank agreement on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"prompt K experiment"} })).step);
+     const mm_record = b.createModule(.{ .root_source_file = b.path("zig/test_support/glm_mm_cuda.zig"), .target = host, .optimize = .debug });
+     const mm_actual = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm/cuda_mm.zig"), .target = host, .optimize = .debug, .imports = &.{.{ .name = "cuda", .module = mm_record }} });
+diff --git a/zig/glm_snapshot_host.zig b/zig/glm_snapshot_host.zig
+index 2fb37e24..d5b2d52b 100644
+--- a/zig/glm_snapshot_host.zig
++++ b/zig/glm_snapshot_host.zig
+@@ -55,11 +55,13 @@ test "GLM snapshots: a short prefix fits 4 GiB even with a 524288-token configur
+     try t.expect(short < longer);
+     try t.expect(longer < seq.st.arena.buf.len);
+     try t.expectEqual(@as(u64, 0), short % (2 << 20));
+-    // beside a drafter (DFlash2) the prompts leave the head's caches empty (mtp_len 0): their rows leave the budget
++    // beside a drafter (DFlash2) the prompts leave the head's caches empty (mtp_len 0): their rows leave the budget,
++    // and DFlash2's context ring joins it (a state carries the drafter's rows up to its mark)
+     e.drafter = @ptrFromInt(4096); // only its presence is read
+     const drafted = glm.native.snap_bytes(&e, 34816);
+     e.drafter = null;
+-    try t.expect(drafted < longer);
++    try t.expect(drafted - glm.dflash.ring_bytes < longer);
++    try t.expect(drafted > longer - glm.dflash.ring_bytes);
+     try t.expectEqual(@as(u64, 0), drafted % (2 << 20));
+ }
+ 
+@@ -96,7 +98,7 @@ test "GLM snapshots: grid and committed off-grid read sets survive copies on bot
+             try t.expectEqual(@as(usize, 0), f.seq.in_head);
+             const tail = f.seq.st.caches[0].lc + at * f.e.c.kv_lora * 2;
+             try t.expectEqual(@as(u8, 0xE9), rec.bytes(tail, 1)[0]);
+-            const charge = f.e.snaps.get(id).?.lease.ids.items.len * glm.snapshots.pages.page;
++            const charge = f.e.snaps.get(id).?.lease.count() * glm.snapshots.pages.page;
+             try t.expect(charge <= f.e.stateBytes(at));
+             try t.expectEqual(f.e.snap_pages.?.arena.?.len, charge + f.e.snap_pages.?.spare());
+             f.e.dropState(id);
+@@ -192,7 +194,7 @@ test "GLM snapshots: fragmented pages join a larger state and cannot exceed the
+ }
+ 
+ const Control = struct {
+-    share: struct { rank: usize },
++    share: struct { rank: usize, world: usize = 2 },
+     dropped: std.ArrayList(u32) = .empty,
+     announce: u64 = 0,
+     words: [8]f64 = @splat(0),
+@@ -204,6 +206,9 @@ const Control = struct {
+     position: u32 = 0,
+     kept_at: u32 = 0,
+     fail_shared: bool = false,
++    tiers: u64 = 0,
++    fail_tiers: bool = false,
++    unprepared: usize = 0,
+     pub fn shared(c: *@This(), word: f64) !f64 {
+         if (c.fail_shared) return error.PeerFailed;
+         const i = c.calls;
+@@ -223,6 +228,15 @@ const Control = struct {
+         c.prepares += 1;
+         if (c.fail_prepare) return error.OutOfMemory;
+     }
++    pub fn prepareTiers(c: *@This(), _: u64, host: u64) !void {
++        c.prepares += 1;
++        if (c.fail_tiers) return error.OutOfMemory;
++        c.tiers = host;
++    }
++    pub fn unprepareSnapshots(c: *@This()) void {
++        c.tiers = 0;
++        c.unprepared += 1;
++    }
+     fn mark(ctx: *anyopaque, at: u32) void {
+         const c: *Control = @ptrCast(@alignCast(ctx));
+         c.held = 2;
+@@ -636,3 +650,186 @@ test "GLM snapshots: without the target MTP head a window's sequence drops exact
+         try t.expect(plan.len < without.arena.buf.len);
+     }
+ }
++
++const snap_page = glm.snapshots.pages.page;
++
++test "GLM snapshots: past the device pages a state spills into pinned host pages, restores byte-exact, and both tiers' pages come back" {
++    var d = rec.init();
++    const before = cuda.usage(false);
++    for ([_]bool{ false, true }) |kv8| for (0..2) |rank| {
++        var f: Fixture = undefined;
++        try f.initFormat(&d, rank, 2, false, kv8); // beside DFlash2: no target MTP head
++        defer f.deinit();
++        const one = f.e.stateBytes(8192);
++        try f.e.prepareTiers(one / 2, 2 * one); // the device holds half a state, the host the rest and more
++        const pool = &f.e.snap_pages.?;
++        const total = pool.spare();
++        try t.expectEqual(one / 2 / snap_page * snap_page + 2 * one, total);
++        try t.expectEqual(2 * one, pool.hostBytes());
++        try f.mark(8192, 0, 7);
++        const saved = try t.allocator.dupe(u8, rec.bytes(f.seq.st.arena.buf.ptr, f.seq.st.arena.buf.len));
++        defer t.allocator.free(saved);
++        const id = try f.e.keepState();
++        const s = f.e.snaps.get(id).?;
++        try t.expect(s.lease.dev.ids.items.len > 0 and s.lease.host.ids.items.len > 0); // device pages first, then host
++        try t.expectEqual(@as(usize, 0), pool.pages.available());
++        try t.expect(s.lease.hostBytes(s.len) > 0 and s.lease.hostBytes(s.len) < s.len);
++        @memset(rec.bytes(f.seq.st.arena.buf.ptr, f.seq.st.arena.buf.len), 0xE9);
++        try f.seq.st.restoreHost(f.e.stream, 17, 0, &.{0}, .{ 0, 0 });
++        const copies = rec.host_copies;
++        try f.e.restoreState(id);
++        try t.expect(rec.host_copies > copies);
++        try f.expectPrefix(saved, 8192, 0);
++        try t.expectEqual(@as(usize, 8192), f.seq.st.pos);
++        // a second state finds no device snap_page: it lands in host pages alone, and both restore their own bytes
++        try f.mark(4096, 0, 9);
++        const second = try t.allocator.dupe(u8, rec.bytes(f.seq.st.arena.buf.ptr, f.seq.st.arena.buf.len));
++        defer t.allocator.free(second);
++        const id2 = try f.e.keepState();
++        try t.expectEqual(@as(usize, 0), f.e.snaps.get(id2).?.lease.dev.ids.items.len);
++        try f.e.restoreState(id);
++        try f.expectPrefix(saved, 8192, 0);
++        try f.e.restoreState(id2);
++        try f.expectPrefix(second, 4096, 0);
++        try t.expectEqual((f.e.snaps.get(id).?.lease.host.ids.items.len + f.e.snaps.get(id2).?.lease.count()) * snap_page, pool.hostHeld());
++        f.e.dropState(id);
++        f.e.dropState(id2);
++        f.e.dropped.clearRetainingCapacity();
++        try t.expectEqual(total, pool.spare());
++        try t.expectEqual(@as(u64, 0), pool.hostHeld());
++    };
++    try t.expectEqual(before.device, cuda.usage(false).device);
++    try t.expectEqual(before.host, cuda.usage(false).host);
++}
++
++test "GLM snapshots: the actual store's budget spans the host tier, keeps past the card's pages and evicts within both" {
++    var d = rec.init();
++    var f: Fixture = undefined;
++    try f.init(&d, 0, 1, false);
++    defer f.deinit();
++    const one = f.e.stateBytes(2048);
++    const Ready = struct {
++        var host: u64 = 0;
++        fn run(p: *anyopaque, budget: u64) anyerror!void {
++            const e: *glm.engine.Engine = @ptrCast(@alignCast(p));
++            try e.prepareTiers(budget, host);
++        }
++    };
++    Ready.host = 3 * one;
++    f.e.snap_setup = .{ .ptr = &f.e, .run = Ready.run };
++    const budget = try adapter.cacheBudget(glm.native, &f.e, one + 31);
++    try t.expectEqual(one + 31 + 3 * one, budget); // the device's budget as asked and the host tier
++    const family: pc.Snapshots = .{ .ptr = &f.e, .vtable = &adapter.Snaps(glm.native, null).vtable };
++    var store = pc.Store.init(t.allocator, family, adapter.cacheRules(glm.native), budget);
++    defer store.deinit();
++    var prompt: [2049]u32 = @splat(1);
++    for (0..9) |i| {
++        prompt[0] = @intCast(i);
++        try f.mark(2048, 0, @intCast(i));
++        try t.expect(store.keep(&prompt, 2048, null, &.{}, &.{}));
++        try t.expectEqual(budget - 31, store.held + glm.native.snap_spare(&f.e)); // whole pages: every one held or spare
++        try t.expect(store.entries.items.len <= 4);
++    }
++    try t.expectEqual(@as(usize, 4), store.entries.items.len); // one on the card, three in host memory
++    try t.expectEqual(@as(u64, 3 * one), f.e.snap_pages.?.hostHeld());
++    try t.expectEqual(@as(u64, 5), store.counts.evicted);
++    // the oldest kept is the first to go: the newest four still resume their own rows
++    for (5..9) |i| {
++        prompt[0] = @intCast(i);
++        const found = try store.lookup(t.allocator, &prompt, 2048, &.{}, &.{}, &.{});
++        defer t.allocator.free(found.marks);
++        const e = found.entry orelse return error.ExpectedHit;
++        defer store.release(e);
++        const kept: *glm.engine.Kept = @ptrCast(@alignCast(e.saved));
++        try f.e.restoreState(kept.id);
++        try t.expectEqual(@as(usize, 2048), f.seq.st.pos);
++    }
++}
++
++test "GLM snapshots: ranks pin the least any of them may, fall back to device pages together, and pin nothing when off" {
++    const g: u64 = 1 << 30;
++    // rank 0 may pin its share of what it asked (8 GiB over two ranks of a host with 100 available): the all-reduce
++    // answers its own word here
++    var leader: Control = .{ .share = .{ .rank = 0 } };
++    try t.expectEqual(@as(u64, 4 * g), try glm.snapshots.agreeTiersWith(&leader, g, 8 * g, 100 * g));
++    try t.expectEqual(-@as(f64, @floatFromInt(4 * g)), leader.words[0]);
++    try t.expectEqual(@as(u64, 4 * g), leader.tiers);
++    try t.expectEqual(@as(usize, 2), leader.calls); // the least, then the pin's agreement
++    // a follower hears a smaller least (another rank's reading), pins it, then hears that a rank failed: it frees its
++    // tier and joins the device pages' agreement
++    var peer: Control = .{ .share = .{ .rank = 1 } };
++    peer.words[0] = -@as(f64, @floatFromInt(3 * g));
++    peer.words[1] = 1;
++    peer.words[2] = 0;
++    try t.expectEqual(@as(u64, 0), try glm.snapshots.agreeTiersWith(&peer, g, 8 * g, 100 * g));
++    try t.expectEqual(@as(usize, 1), peer.unprepared);
++    try t.expectEqual(@as(u64, 0), peer.tiers);
++    try t.expectEqual(@as(usize, 2), peer.prepares); // its tier of 3 GiB, then the device pages alone
++    try t.expectEqual(@as(usize, 3), peer.calls);
++    // the auto share under the headroom, or off: no tier, the device pages' one agreement
++    for ([_]u64{ 0, glm.snapshots.host_tier.auto }) |asked| {
++        var off: Control = .{ .share = .{ .rank = 0 } };
++        try t.expectEqual(@as(u64, 0), try glm.snapshots.agreeTiersWith(&off, g, asked, 10 * g));
++        try t.expectEqual(@as(u64, 0), off.tiers);
++        try t.expectEqual(@as(usize, 1), off.prepares);
++    }
++}
++
++test "GLM snapshots: beside DFlash2 a state carries the drafter's context rows to its mark, into another slot's ring" {
++    var d = rec.init();
++    const df = glm.dflash;
++    var f: Fixture = undefined;
++    try f.init(&d, 1, 2, false);
++    defer f.deinit();
++    var dr: df.Drafter = undefined;
++    dr.gpa = t.allocator;
++    dr.d = &d;
++    dr.slots = .empty;
++    defer {
++        for (dr.slots.items) |*s| if (s.ring) |*r| r.free();
++        dr.slots.deinit(t.allocator);
++    }
++    f.e.drafter = &dr;
++    f.e.slot = 0;
++    const plain = f.e.stateBytes(8192);
++    try f.e.prepareTiers(plain, 2 * plain + 2 * df.ring_bytes); // a state on the card, the others in host memory
++    // slot 0's pass tapped its prompt rows 6144 .. 8192 (dflash.promptRun keeps the last window of a prompt)
++    try dr.restart(0, 0);
++    dr.slots.items[0].first = 6144;
++    dr.slots.items[0].end = 8192;
++    const ring0 = rec.bytes(try dr.ringPtr(0), df.ring_bytes);
++    for (ring0, 0..) |*b, i| b.* = @truncate(i *% 131 +% 5);
++    try f.mark(8192, 0, 3);
++    const id = try f.e.keepState();
++    const s = f.e.snaps.get(id).?;
++    try t.expectEqual(@as(?i64, 6144), s.ring_from);
++    try t.expectEqual(@as(usize, df.ring_bytes), s.len - (try glm.snapshots.layout.Plan.init(&f.seq.st, &f.e.c, 8192, null)).len);
++    // restored into slot 1: its ring holds those rows, and it drafts from 6144 as the fresh pass would
++    try dr.restart(1, 0);
++    const ring1 = rec.bytes(try dr.ringPtr(1), df.ring_bytes);
++    @memset(ring1, 0);
++    f.e.slot = 1;
++    try f.e.restoreState(id);
++    try t.expectEqualSlices(u8, ring0, ring1);
++    try t.expectEqual(@as(i64, 6144), dr.slots.items[1].from);
++    try t.expectEqual(dr.keptFrom(1, 8192), 6144); // a later keep at the same mark carries them again
++    // a pass that tapped nothing right before its mark keeps no ring, and a resume from it starts at the mark
++    try dr.restart(0, 0);
++    dr.slots.items[0].first = 2048;
++    dr.slots.items[0].end = 4096;
++    f.e.slot = 0;
++    try f.mark(8192, 0, 4);
++    const bare = try f.e.keepState();
++    try t.expectEqual(@as(?i64, null), f.e.snaps.get(bare).?.ring_from);
++    try t.expect(f.e.snaps.get(bare).?.len < s.len);
++    f.e.slot = 1;
++    try f.e.restoreState(bare);
++    try t.expectEqual(@as(i64, 8192), dr.slots.items[1].from);
++    try t.expectEqual(df.no_rows, dr.slots.items[1].first);
++    try t.expectEqual(@as(?i64, null), dr.keptFrom(1, 8192));
++    // the ring's window: rows further back than a window before the mark are not the sequence's any more
++    dr.slots.items[0].first = 0;
++    dr.slots.items[0].end = 8192;
++    try t.expectEqual(@as(?i64, 8192 - df.WIN), dr.keptFrom(0, 8192));
++    f.e.drafter = null;
++}
+diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
+index 3ff6fcc1..ea821a44 100644
+--- a/zig/src/families/glm/cuda.zig
++++ b/zig/src/families/glm/cuda.zig
+@@ -78,6 +78,7 @@ test {
+     _ = native;
+     _ = @import("cuda_qpack.zig");
+     _ = @import("cuda_mtp_chance.zig");
++    _ = @import("cuda_snapshot_host.zig");
+     _ = @import("cuda_tile.zig");
+     _ = @import("heat"); // upstream's heat bands, run where the GLM ranks use them
+ }
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index d7806b4e..da68a7ab 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -353,8 +353,7 @@ pub const Engine = struct {
+         if (len == 0 or len + fw.window_rows >= e.cur.st.capacity) return error.PromptTooLong;
+         const r = from orelse return 0;
+         if (r.at == 0 or r.at >= len or r.at % fw.prefill_rows != 0) return error.BadResume;
+-        try e.restoreState(r.id);
+-        if (e.drafter) |dr| try dr.restart(e.slot, r.at); // the rows before it were never tapped
++        try e.restoreState(r.id); // DFlash2's context too: its kept rows, or from r.at when it kept none
+         return r.at;
+     }
+ 
+@@ -446,6 +445,8 @@ pub const Engine = struct {
+ 
+     pub const stateBytes = snapshots.bytes;
+     pub const prepareSnapshots = snapshots.prepare;
++    pub const prepareTiers = snapshots.prepareTiers;
++    pub const unprepareSnapshots = snapshots.unprepare;
+     pub const keepState = snapshots.keep;
+     pub const keepAs = snapshots.keepAs;
+     pub const restoreState = snapshots.restore;
+diff --git a/zig/src/families/glm/cuda_engine_types.zig b/zig/src/families/glm/cuda_engine_types.zig
+index e5b90e9c..6385ddfd 100644
+--- a/zig/src/families/glm/cuda_engine_types.zig
++++ b/zig/src/families/glm/cuda_engine_types.zig
+@@ -18,7 +18,15 @@ pub const Seq = struct {
+ };
+ 
+ /// One rank's copy of a kept prompt state: the state arena's bytes and the host fields beside them.
+-pub const Snap = struct { lease: @import("cuda_snapshot_pages.zig").Lease, len: usize, pos: usize, mtp_len: usize, cur: []u1, bases: [2]usize };
++pub const Snap = struct {
++    lease: @import("cuda_snapshot_pages.zig").Lease,
++    len: usize,
++    pos: usize,
++    mtp_len: usize,
++    cur: []u1,
++    bases: [2]usize,
++    ring_from: ?i64 = null, // DFlash2's context rows from here up to `pos`, in the plan's last part (null: none kept)
++};
+ 
+ /// Where a prompt pass resumes: a kept state (every rank holds `id`) at `at`, a multiple of the chunk rows.
+ pub const Resume = struct { id: u64, at: usize };
+diff --git a/zig/src/families/glm/cuda_follow.zig b/zig/src/families/glm/cuda_follow.zig
+index cdf90bbf..031587e0 100644
+--- a/zig/src/families/glm/cuda_follow.zig
++++ b/zig/src/families/glm/cuda_follow.zig
+@@ -21,7 +21,7 @@ pub const Header = extern struct {
+     depth: u32 = 0, // draft: drafts to chain; chunk: where it starts; shared: its parts
+     flags: u32 = 0, // begin: sampled; draft: from the prompt (1), chances (2); prefill, chunk: prompt_logprobs (1); chunk: indexer rows split (2); verify, shared: whole rows
+     a: u64 = 0, // keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length
+-    seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position
++    seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position; snapshots: the host tier asked
+     temperature: f64 = 0,
+     top_p: f64 = 0,
+     min_p: f64 = 0,
+@@ -192,10 +192,11 @@ pub const Leader = struct {
+         try x.e.begin(c);
+     }
+ 
+-    /// Every rank's prompt cache at rank 0's budget (snapshots.agree): the others make theirs on this step.
+-    pub fn snapshots(x: Leader, budget: u64) !void {
+-        try x.send(.{ .kind = @backingInt(Kind.snapshots), .a = budget }, &.{});
+-        try @import("cuda_snapshots.zig").agree(x.e, budget);
++    /// Every rank's prompt cache at rank 0's device budget, and the host tier `asked` (snapshots.agreeTiers): the
++    /// others make theirs on this step. The pinned bytes each rank holds come back (0: device pages alone).
++    pub fn snapshots(x: Leader, budget: u64, asked: u64) !u64 {
++        try x.send(.{ .kind = @backingInt(Kind.snapshots), .a = budget, .seed = asked }, &.{});
++        return @import("cuda_snapshots.zig").agreeTiers(x.e, budget, asked);
+     }
+ 
+     /// The other ranks make rank 0's pool: `streams` paged sequences and `pages` pages, each page's bytes checked.
+@@ -399,7 +400,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
+                 try v.take(h.slot, step.ids);
+                 try link.rows(v.rows.ptr, v.rowCount() * vcfg.out_hidden * 2);
+             },
+-            .snapshots => try @import("cuda_snapshots.zig").agree(e, h.a),
++            .snapshots => _ = try @import("cuda_snapshots.zig").agreeTiers(e, h.a, h.seed),
+             .drop => for (step.ids) |id| e.dropState(id),
+             .release => e.release(h.slot),
+             .idle => cuda.tp_watch.sleep(e.io),
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index 44122bfb..5c6e1371 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -345,14 +345,22 @@ pub fn snap_ready(ptr: *engine.Engine, budget: u64) !u64 {
+ fn readySnapshots(ptr: *anyopaque, budget: u64) !void {
+     const own: *Owned = @ptrCast(@alignCast(ptr));
+     const x: follow.Leader = .{ .e = own.e, .link = &own.link }; // its steps wake the ranks asleep on their lines
+-    try x.snapshots(budget);
++    // TF_GLM_HOST_CACHE_GIB, rank 0's: GiB of pinned host pages over all ranks (0: none; unset: a share of what's available)
++    const asked = try snapshots.host_tier.asked(if (std.c.getenv("TF_GLM_HOST_CACHE_GIB")) |v| std.mem.span(v) else null);
++    const host = try x.snapshots(budget, asked);
+     try x.idle(); // no stream yet: they sleep again until the first
++    std.log.info("prompt cache: {d:.1} GiB of device pages and {d:.1} GiB of pinned host memory a rank ({d:.1} GiB over the {d} ranks{s})", .{ @as(f64, @floatFromInt(budget)) / (1 << 30), @as(f64, @floatFromInt(host)) / (1 << 30), @as(f64, @floatFromInt(host * own.e.share.world)) / (1 << 30), own.e.share.world, if (asked == snapshots.host_tier.auto) "; TF_GLM_HOST_CACHE_GIB unset: a quarter of the host's available memory, at most 16 GiB" else "" });
++}
++
++/// The host tier's bytes past the device pages: the prompt cache's budget holds both (native/cuda_snaps cacheBudget).
++pub fn snap_host_tier(ptr: *engine.Engine) u64 {
++    return if (ptr.snap_pages) |*p| p.hostBytes() else 0;
+ }
+ 
+ pub fn snap_charged(ptr: *anyopaque, saved: *anyopaque) u64 {
+     const e: *engine.Engine = @ptrCast(@alignCast(ptr));
+     const k: *engine.Kept = @ptrCast(@alignCast(saved));
+-    return e.snaps.get(k.id).?.lease.ids.items.len * snapshots.pages.page;
++    return e.snaps.get(k.id).?.lease.count() * snapshots.pages.page;
+ }
+ 
+ pub fn snap_spare(ptr: *anyopaque) u64 {
+@@ -414,6 +422,7 @@ fn release(own: *Owned) void {
+ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+     return switch (err) {
+         error.BadRoceCap => "TF_ROCE_MAX_KB: give an integer from 1 through 4194303 KiB, or unset it for 4096 KiB",
++        error.BadHostCache => "TF_GLM_HOST_CACHE_GIB: give GiB of pinned host memory over all the ranks (0 turns the host tier off), or unset it or set auto for a quarter of what the host has available (at most 16 GiB)",
+         error.NoRank => "GLM-5.3-Flash runs at TP over hosts: set TF_GLM_RANK and TF_GLM_WORLD on every host (WORLD 1: one GPU, with TF_GLM_LAYERS for a thin model)",
+         error.NoCommId => "GLM-5.3-Flash's ranks meet over NCCL: with TF_GLM_WORLD 2 or more, set NCCL_COMM_ID to rank 0's address:port on every host",
+         error.RankMismatch => "the ranks' settings differ (each rank's log names the one): start them alike",
+diff --git a/zig/src/families/glm/cuda_snapshot_host.zig b/zig/src/families/glm/cuda_snapshot_host.zig
+new file mode 100644
+index 00000000..9cdbdada
+--- /dev/null
++++ b/zig/src/families/glm/cuda_snapshot_host.zig
+@@ -0,0 +1,99 @@
++//! The pinned host tier of GLM's kept prompt states: how much each rank pins (TF_GLM_HOST_CACHE_GIB, else a share of
++//! the host's available memory), read once at startup. Restores from it are byte copies over the link, as exact as
++//! the device tier's.
++const std = @import("std");
++const page = @import("cuda_snapshot_pages.zig").page;
++
++/// TF_GLM_HOST_CACHE_GIB unset (or "auto"): the ranks take a share of what the host has available.
++pub const auto: u64 = std.math.maxInt(u64);
++/// The auto share: a quarter of MemAvailable at startup, at most 16 GiB over all the ranks, none under 16 GiB available.
++pub const auto_total_most: u64 = 16 << 30;
++pub const auto_share: u64 = 4;
++pub const least_available: u64 = 16 << 30;
++/// An asked size still leaves the host this much of what it had available.
++pub const asked_headroom: u64 = 8 << 30;
++
++/// TF_GLM_HOST_CACHE_GIB, GiB of pinned host memory over all the ranks: auto when unset or "auto", 0 (off) for "0".
++pub fn asked(text: ?[]const u8) error{BadHostCache}!u64 {
++    const s = std.mem.trim(u8, text orelse return auto, " \t");
++    if (s.len == 0 or std.ascii.eqlIgnoreCase(s, "auto")) return auto;
++    const g = std.fmt.parseFloat(f64, s) catch return error.BadHostCache;
++    if (!std.math.isFinite(g) or g < 0 or g > 4096) return error.BadHostCache;
++    return pages(@intFromFloat(g * (1 << 30)));
++}
++
++/// Whole pages of `bytes`.
++pub fn pages(bytes: u64) u64 {
++    return bytes / page * page;
++}
++
++/// One rank's pinned bytes of a total `want` over `world` ranks (they may share this host): as asked, short of the
++/// last `asked_headroom` of what is available; or auto, a quarter of what is available, at most `auto_total_most`.
++pub fn allowance(want: u64, available_bytes: ?u64, world: usize) u64 {
++    const ranks: u64 = @max(world, 1);
++    const avail = available_bytes orelse return if (want == auto) 0 else pages(want / ranks); // unread: only an asked size
++    if (want != auto) return pages(@min(want, avail -| asked_headroom) / ranks);
++    if (avail < least_available) return 0;
++    return pages(@min(auto_total_most, avail / auto_share) / ranks);
++}
++
++/// MemAvailable from /proc/meminfo, in bytes (null: unreadable).
++pub fn available() ?u64 {
++    const fd = std.c.open("/proc/meminfo", .{ .ACCMODE = .RDONLY });
++    if (fd < 0) return null;
++    defer _ = std.c.close(fd);
++    var buf: [8192]u8 = undefined;
++    var n: usize = 0;
++    while (n < buf.len) {
++        const got = std.c.read(fd, buf[n..].ptr, buf.len - n);
++        if (got <= 0) break;
++        n += @intCast(got);
++    }
++    return parseAvailable(buf[0..n]);
++}
++
++pub fn parseAvailable(text: []const u8) ?u64 {
++    var rows = std.mem.tokenizeScalar(u8, text, '\n');
++    while (rows.next()) |row| {
++        var words = std.mem.tokenizeAny(u8, row, ": \t");
++        if (!std.mem.eql(u8, words.next() orelse continue, "MemAvailable")) continue;
++        const kib = std.fmt.parseInt(u64, words.next() orelse return null, 10) catch return null;
++        if (!std.mem.eql(u8, words.next() orelse return null, "kB")) return null;
++        return std.math.mul(u64, kib, 1024) catch null;
++    }
++    return null;
++}
++
++const t = std.testing;
++
++test "GLM host cache: TF_GLM_HOST_CACHE_GIB reads auto, off, or whole pages of GiB, and refuses anything else" {
++    try t.expectEqual(auto, try asked(null));
++    try t.expectEqual(auto, try asked(""));
++    try t.expectEqual(auto, try asked(" Auto "));
++    try t.expectEqual(@as(u64, 0), try asked("0"));
++    try t.expectEqual(@as(u64, 12 << 30), try asked("12"));
++    try t.expectEqual(@as(u64, 1 << 30), try asked("1.0001")); // down to whole 2 MiB pages
++    try t.expectEqual(@as(u64, 0), try asked("0.001"));
++    for ([_][]const u8{ "-1", "x", "nan", "inf", "5000" }) |bad| try t.expectError(error.BadHostCache, asked(bad));
++}
++
++test "GLM host cache: auto takes a quarter of what is available, at most 16 GiB over the ranks; asked sizes are totals" {
++    const g: u64 = 1 << 30;
++    try t.expectEqual(@as(u64, 7 * g + g / 4), allowance(auto, 58 * g, 2)); // 58 / 4 = 14.5 over two ranks
++    try t.expectEqual(@as(u64, 8 * g), allowance(auto, 200 * g, 2)); // the 16 GiB cap
++    try t.expectEqual(@as(u64, 16 * g), allowance(auto, 200 * g, 1));
++    try t.expectEqual(@as(u64, 0), allowance(auto, 15 * g, 2)); // too little available: none
++    try t.expectEqual(@as(u64, 0), allowance(auto, null, 2));
++    try t.expectEqual(@as(u64, 12 * g), allowance(24 * g, 58 * g, 2)); // asked: its share a rank
++    try t.expectEqual(@as(u64, 11 * g), allowance(40 * g, 30 * g, 2)); // but never the last 8 GiB available
++    try t.expectEqual(@as(u64, 4 * g), allowance(8 * g, null, 2));
++    try t.expectEqual(@as(u64, 0), allowance(0, 58 * g, 2));
++    try t.expectEqual(@as(u64, 0), allowance(auto, 58 * g, 2) % page);
++}
++
++test "GLM host cache: MemAvailable parses from meminfo's text, and this host's reads" {
++    try t.expectEqual(@as(?u64, 65536 * 1024), parseAvailable("MemTotal:       131072 kB\nMemFree:          1024 kB\nMemAvailable:    65536 kB\n"));
++    try t.expectEqual(@as(?u64, null), parseAvailable("MemTotal: 5 kB\n"));
++    try t.expectEqual(@as(?u64, null), parseAvailable("MemAvailable: x kB\n"));
++    if (@import("builtin").os.tag == .linux) try t.expect(available() != null);
++}
+diff --git a/zig/src/families/glm/cuda_snapshot_layout.zig b/zig/src/families/glm/cuda_snapshot_layout.zig
+index b01d943e..4c49755a 100644
+--- a/zig/src/families/glm/cuda_snapshot_layout.zig
++++ b/zig/src/families/glm/cuda_snapshot_layout.zig
+@@ -9,7 +9,7 @@ const sparse = @import("cuda_sparse.zig");
+ /// `len` bytes from `live`, or on a paged sequence's pages `span` bytes a page, the pages `page` bytes apart.
+ pub const Part = struct { live: u64, len: usize, span: usize = 0, page: u64 = 0 };
+ pub const Plan = struct {
+-    parts: [5 * (@import("config.zig").max_layers + 1) + 2]Part = undefined,
++    parts: [5 * (@import("config.zig").max_layers + 1) + 3]Part = undefined, // and one outside the arena (`outside`)
+     count: usize = 0,
+     len: usize = 0,
+     ids: []const u32 = &.{}, // a paged sequence's pages in row order
+@@ -68,6 +68,15 @@ pub const Plan = struct {
+         p.count += 1;
+     }
+ 
++    /// `len` bytes the sequence's arena does not hold (DFlash2's context ring for the slot), after every arena part.
++    pub fn outside(p: *Plan, live: u64, len: usize) !void {
++        if (len == 0) return;
++        if (live == 0 or p.count == p.parts.len) return error.SnapshotShape;
++        p.len = try std.math.add(usize, p.len, len);
++        p.parts[p.count] = .{ .live = live, .len = len };
++        p.count += 1;
++    }
++
+     /// Where a part's bytes from `done` on sit, as many as lie in a row there.
+     pub fn piece(p: *const Plan, part: Part, done: usize) Part {
+         if (part.span == 0) return .{ .live = part.live + done, .len = part.len - done };
+diff --git a/zig/src/families/glm/cuda_snapshot_pages.zig b/zig/src/families/glm/cuda_snapshot_pages.zig
+index 43753bb1..9e200332 100644
+--- a/zig/src/families/glm/cuda_snapshot_pages.zig
++++ b/zig/src/families/glm/cuda_snapshot_pages.zig
+@@ -1,65 +1,142 @@
+-//! Preallocated snapshot pages inside the prompt-cache budget; a keep or restore makes no device allocation.
++//! Preallocated snapshot pages inside the prompt-cache budget; a keep or restore makes no device or host allocation.
++//! Two tiers: device pages first, then pinned host pages (TF_GLM_HOST_CACHE_GIB), a state's bytes in that order.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const kv = @import("core").kv_pool;
+ const Plan = @import("cuda_snapshot_layout.zig").Plan;
+ 
+ pub const page: usize = 2 << 20;
+-pub const Lease = kv.Lease;
++
++/// A kept state's pages: the device's first, then the host's (the plan's bytes in that order).
++pub const Lease = struct {
++    dev: kv.Lease = .{},
++    host: kv.Lease = .{},
++
++    pub fn count(l: *const Lease) usize {
++        return l.dev.ids.items.len + l.host.ids.items.len;
++    }
++
++    /// Bytes of the plan that sit in host pages (0: a device state).
++    pub fn hostBytes(l: *const Lease, len: usize) usize {
++        return len -| l.dev.ids.items.len * page;
++    }
++};
+ 
+ pub fn rounded(bytes: usize) !usize {
+     return (try std.math.add(usize, bytes, page - 1)) & ~(page - 1);
+ }
+ 
++fn pageCount(budget: u64) !usize {
++    const count = std.math.cast(usize, budget / page) orelse return error.SnapshotBudget;
++    if (count > std.math.maxInt(u32)) return error.SnapshotBudget;
++    return count;
++}
++
+ pub const Pool = struct {
+     pages: kv.Pool,
+     arena: ?cuda.DeviceBuffer,
++    host_pages: ?kv.Pool = null, // the pinned host tier's pages (null: device only)
++    host: ?cuda.HostBuffer = null,
+ 
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, budget: u64) !Pool {
+-        const count = std.math.cast(usize, budget / page) orelse return error.SnapshotBudget;
+-        if (count > std.math.maxInt(u32)) return error.SnapshotBudget;
++        return initTiers(gpa, d, budget, 0);
++    }
++
++    /// `budget` bytes of device pages and `host_budget` of pinned host pages (each rounded down to whole pages).
++    pub fn initTiers(gpa: std.mem.Allocator, d: *const cuda.Driver, budget: u64, host_budget: u64) !Pool {
++        const count = try pageCount(budget);
++        const host_count = try pageCount(host_budget);
+         var pages = try kv.Pool.init(gpa, count, page);
+         errdefer pages.deinit();
+-        const arena = if (count > 0) try cuda.DeviceBuffer.alloc(d, count * page) else null;
+-        return .{ .pages = pages, .arena = arena };
++        var arena = if (count > 0) try cuda.DeviceBuffer.alloc(d, count * page) else null;
++        errdefer if (arena) |*a| a.free();
++        if (host_count == 0) return .{ .pages = pages, .arena = arena };
++        var host_pages = try kv.Pool.init(gpa, host_count, page);
++        errdefer host_pages.deinit();
++        const host = try cuda.HostBuffer.alloc(d, host_count * page); // page-locked: copies run at the link's rate
++        return .{ .pages = pages, .arena = arena, .host_pages = host_pages, .host = host };
+     }
+ 
+     pub fn deinit(p: *Pool) void {
+         std.debug.assert(p.pages.available() == p.pages.total());
+         if (p.arena) |*a| a.free();
+         p.pages.deinit();
++        if (p.host_pages) |*h| {
++            std.debug.assert(h.available() == h.total());
++            h.deinit();
++        }
++        if (p.host) |*h| h.free();
++    }
++
++    fn hostAvailable(p: *const Pool) usize {
++        return if (p.host_pages) |*h| h.available() else 0;
+     }
+ 
++    /// Free bytes in both tiers.
+     pub fn spare(p: *const Pool) u64 {
+-        return p.pages.available() * page;
++        return (p.pages.available() + p.hostAvailable()) * page;
++    }
++
++    /// The host tier's whole size in bytes (0: none).
++    pub fn hostBytes(p: *const Pool) u64 {
++        return if (p.host_pages) |*h| h.total() * page else 0;
+     }
+ 
++    /// Bytes of host pages kept states hold now.
++    pub fn hostHeld(p: *const Pool) u64 {
++        return if (p.host_pages) |*h| (h.total() - h.available()) * page else 0;
++    }
++
++    /// `bytes` in pages: as many device pages as are free, the rest pinned host pages.
+     pub fn take(p: *Pool, bytes: usize) !Lease {
+         const n = (try rounded(bytes)) / page;
+-        if (n == 0 or n > p.pages.available()) return error.NoSnapshotRoom;
++        if (n == 0 or n > p.pages.available() + p.hostAvailable()) return error.NoSnapshotRoom;
++        const on_device = @min(n, p.pages.available());
+         var lease: Lease = .{};
+-        errdefer p.pages.finish(&lease);
+-        try p.pages.promise(&lease, n);
+-        try p.pages.cover(&lease, n, null);
++        errdefer p.give(&lease);
++        if (on_device > 0) {
++            try p.pages.promise(&lease.dev, on_device);
++            try p.pages.cover(&lease.dev, on_device, null);
++        }
++        if (n > on_device) {
++            const h = &p.host_pages.?; // the count above held host pages
++            try h.promise(&lease.host, n - on_device);
++            try h.cover(&lease.host, n - on_device, null);
++        }
+         return lease;
+     }
+ 
+     pub fn give(p: *Pool, lease: *Lease) void {
+-        p.pages.finish(lease);
++        p.pages.finish(&lease.dev);
++        if (p.host_pages) |*h| h.finish(&lease.host) else std.debug.assert(lease.host.ids.items.len == 0 and lease.host.promised == 0);
+     }
+ 
++    /// The plan's bytes into the lease's pages (`into`) or back out of them, on `stream`: device pages copy device to
++    /// device, host pages over the link (pinned, so the copies stay asynchronous on the stream).
+     pub fn move(p: *const Pool, stream: cuda.Stream, lease: *const Lease, plan: *const Plan, into: bool) !void {
+-        if (plan.len > lease.ids.items.len * page) return error.SnapshotSize;
+-        const arena = p.arena orelse return error.NoSnapshotRoom;
++        if (plan.len > lease.count() * page) return error.SnapshotSize;
++        const nd = lease.dev.ids.items.len;
++        const dev_base: u64 = if (nd > 0) (p.arena orelse return error.NoSnapshotRoom).ptr else 0;
++        const host_base: [*]u8 = if (lease.host.ids.items.len > 0) (p.host orelse return error.NoSnapshotRoom).bytes.ptr else undefined;
++        const d = if (p.arena) |a| a.d else (p.host orelse return error.NoSnapshotRoom).d;
+         var off: usize = 0;
+         for (plan.parts[0..plan.count]) |part| {
+             var done: usize = 0;
+             while (done < part.len) {
+                 const at = off + done;
+-                const target = arena.ptr + @as(u64, lease.ids.items[at / page]) * page + at % page;
++                const k = at / page;
+                 const live = plan.piece(part, done);
+                 const n = @min(live.len, page - at % page);
+-                try arena.d.check(arena.d.api.cuMemcpyDtoDAsync_v2(if (into) target else live.live, if (into) live.live else target, n, stream.handle), "cuMemcpyDtoDAsync");
++                if (k < nd) {
++                    const target = dev_base + @as(u64, lease.dev.ids.items[k]) * page + at % page;
++                    try d.check(d.api.cuMemcpyDtoDAsync_v2(if (into) target else live.live, if (into) live.live else target, n, stream.handle), "cuMemcpyDtoDAsync");
++                } else {
++                    const target = host_base + @as(usize, lease.host.ids.items[k - nd]) * page + at % page;
++                    if (into)
++                        try d.check(d.api.cuMemcpyDtoHAsync_v2(target, live.live, n, stream.handle), "cuMemcpyDtoHAsync")
++                    else
++                        try d.check(d.api.cuMemcpyHtoDAsync_v2(live.live, target, n, stream.handle), "cuMemcpyHtoDAsync");
++                }
+                 done += n;
+             }
+             off += part.len;
+diff --git a/zig/src/families/glm/cuda_snapshots.zig b/zig/src/families/glm/cuda_snapshots.zig
+index 4ffd690c..82134204 100644
+--- a/zig/src/families/glm/cuda_snapshots.zig
++++ b/zig/src/families/glm/cuda_snapshots.zig
+@@ -1,18 +1,62 @@
+ //! Prompt-sized snapshots on each rank; the existing chunk grid and the live sequence's layout do not change.
++//! A state takes device pages first, then pinned host pages (cuda_snapshot_host); beside DFlash2 it also carries the
++//! drafter's context rows up to its mark, so a resumed pass drafts from the context a fresh pass would have.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const types = @import("cuda_engine_types.zig");
++const dflash = @import("dflash.zig");
+ pub const pages = @import("cuda_snapshot_pages.zig");
+ pub const layout = @import("cuda_snapshot_layout.zig");
++pub const host_tier = @import("cuda_snapshot_host.zig");
+ 
+ pub const Setup = struct { ptr: *anyopaque, run: *const fn (*anyopaque, u64) anyerror!void };
+ 
+ pub fn prepare(e: anytype, budget: u64) !void {
++    return prepareTiers(e, budget, 0);
++}
++
++/// `budget` bytes of device pages and `host` bytes of pinned host pages, made once.
++pub fn prepareTiers(e: anytype, budget: u64, host: u64) !void {
+     if (e.snap_pages != null or e.snaps.count() != 0) return error.SnapshotCacheMade;
+-    const count = std.math.cast(u32, budget / pages.page) orelse return error.SnapshotBudget;
++    const count = std.math.cast(u32, budget / pages.page + host / pages.page) orelse return error.SnapshotBudget;
+     try e.snaps.ensureTotalCapacity(e.gpa, count);
+     try e.dropped.ensureTotalCapacity(e.gpa, @as(usize, count) + 1);
+-    e.snap_pages = try pages.Pool.init(e.gpa, e.d, budget);
++    e.snap_pages = try pages.Pool.initTiers(e.gpa, e.d, budget, host);
++}
++
++/// The pages made by `prepareTiers` freed again (no state holds any): a peer could not make its share.
++pub fn unprepare(e: anytype) void {
++    if (e.snap_pages) |*p| p.deinit();
++    e.snap_pages = null;
++}
++
++/// Every rank's device pages at `budget`, beside the host tier: the least any rank may pin of `asked` (auto: its share
++/// of the host's available memory), or, should a rank fail to pin that, the device pages alone. Each step is one
++/// agreement on every rank, so no peer waits on a missing one; the pinned bytes a rank holds come back (0: none).
++pub fn agreeTiers(e: anytype, budget: u64, asked: u64) !u64 {
++    return agreeTiersWith(e, budget, asked, if (asked == 0) null else host_tier.available());
++}
++
++/// `agreeTiers` with this rank's reading of the host's available memory (null: unread).
++pub fn agreeTiersWith(e: anytype, budget: u64, asked: u64, available: ?u64) !u64 {
++    if (asked == 0) {
++        try agree(e, budget);
++        return 0;
++    }
++    const mine = host_tier.allowance(asked, available, e.share.world);
++    const least = -(try e.shared(-@as(f64, @floatFromInt(mine)))); // the ranks' maximum of minus theirs
++    const host = host_tier.pages(if (least > 0) @intFromFloat(least) else 0);
++    if (host > 0) {
++        var failed: ?anyerror = null;
++        e.prepareTiers(budget, host) catch |err| {
++            failed = err;
++        };
++        if (try e.shared(if (failed != null) 1 else 0) == 0) return host;
++        if (failed == null) e.unprepareSnapshots();
++        if (e.share.rank == 0) std.log.warn("prompt cache: a rank could not pin {d} MiB of host memory ({s}); device pages alone", .{ host >> 20, if (failed) |err| @errorName(err) else "a peer's failure" });
++    }
++    try agree(e, budget);
++    return 0;
+ }
+ 
+ /// A failed allocation still joins the startup agreement, so a peer never waits for a missing participant.
+@@ -36,7 +80,33 @@ pub fn bytes(e: anytype, at: usize) u64 {
+     const head = mtpHead(e, at) catch return std.math.maxInt(u64);
+     // a paged sequence holds its request's rows: its prefix is counted to the capacity, in a window's bytes
+     const n = layout.Plan.size(&e.cur.st, &e.c, e.capacity, at, head) catch return std.math.maxInt(u64);
+-    return pages.rounded(n) catch std.math.maxInt(u64);
++    const ring: usize = if (e.drafter != null) dflash.ring_bytes else 0; // at most: DFlash2's ring when it holds rows
++    return pages.rounded(n + ring) catch std.math.maxInt(u64);
++}
++
++/// DFlash2's ring for the bound slot as the plan's last part, when it holds the context rows right up to `at`; where
++/// those rows start (null: no drafter, or nothing worth keeping).
++fn drafterPart(e: anytype, plan: *layout.Plan, at: usize) !?i64 {
++    const dr = e.drafter orelse return null;
++    if (std.c.getenv("TF_GLM_SNAP_DRAFTER")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return null; // A/B: resume from the mark
++    const from = dr.keptFrom(e.slot, at) orelse return null;
++    try plan.outside(try dr.ringPtr(e.slot), dflash.ring_bytes);
++    return from;
++}
++
++/// A monotonic clock in nanoseconds, for the copies' one log line.
++fn now() u64 {
++    var ts: std.c.timespec = undefined;
++    _ = std.c.clock_gettime(.MONOTONIC, &ts);
++    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
++}
++
++/// Rank 0's line for a copy that touched host pages (device copies stay quiet, as before).
++fn note(e: anytype, comptime what: []const u8, s: *const types.Snap, t0: u64) void {
++    if (e.share.rank != 0 or @import("builtin").is_test) return;
++    const host = s.lease.hostBytes(s.len);
++    if (host == 0) return;
++    std.log.info("prompt cache: " ++ what ++ " {d} tokens, {d} MiB ({d} MiB in host memory{s}) in {d:.1} ms", .{ s.pos, s.len >> 20, host >> 20, if (s.ring_from != null) ", with DFlash2's context" else "", @as(f64, @floatFromInt(now() - t0)) / 1e6 });
+ }
+ 
+ pub fn keep(e: anytype) !u64 {
+@@ -53,7 +123,8 @@ pub fn keepAs(e: anytype, id: u64) !void {
+     if (e.cur.st.pending != 0 or e.cur.st.mtp_len > e.cur.st.pos + @import("cuda_state.zig").window_rows)
+         return error.NotAtMark;
+     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
+-    const plan = try layout.Plan.init(&e.cur.st, &e.c, e.cur.st.pos, if (e.mtp) e.cur.st.mtp_len else null);
++    var plan = try layout.Plan.init(&e.cur.st, &e.c, e.cur.st.pos, if (e.mtp) e.cur.st.mtp_len else null);
++    const ring = try drafterPart(e, &plan, e.cur.st.pos);
+     var lease = try pool.take(plan.len);
+     errdefer {
+         cuda.completion.drain(e.d, e.stream, "a failed GLM snapshot copy did not drain");
+@@ -61,21 +132,29 @@ pub fn keepAs(e: anytype, id: u64) !void {
+     }
+     const cur = try e.gpa.dupe(u1, e.cur.st.cur);
+     errdefer e.gpa.free(cur);
++    const t0 = now();
+     try pool.move(e.stream, &lease, &plan, true);
+     try e.stream.synchronize();
+-    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = plan.len, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .bases = .{ e.cur.st.base, e.cur.st.mtp_base } });
++    const s: types.Snap = .{ .lease = lease, .len = plan.len, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .bases = .{ e.cur.st.base, e.cur.st.mtp_base }, .ring_from = ring };
++    note(e, "kept", &s, t0);
++    e.snaps.putAssumeCapacityNoClobber(id, s);
+ }
+ 
+ pub fn restore(e: anytype, id: u64) !void {
+     const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
+     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
+-    const plan = try layout.Plan.init(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null);
++    var plan = try layout.Plan.init(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null);
++    if (s.ring_from != null) try plan.outside(try (e.drafter orelse return error.SnapshotSize).ringPtr(e.slot), dflash.ring_bytes);
+     if (plan.len != s.len) return error.SnapshotSize;
+     errdefer cuda.completion.drain(e.d, e.stream, "a failed GLM snapshot restore did not drain");
++    const t0 = now();
+     try pool.move(e.stream, &s.lease, &plan, false);
+     try e.cur.st.restoreHost(e.stream, s.pos, s.mtp_len, s.cur, s.bases);
+     e.cur.in_head = 0;
+     try e.stream.synchronize();
++    // DFlash2 drafts on from the kept context rows, as a fresh pass would; without them from the mark (never tapped)
++    if (e.drafter) |dr| if (s.ring_from) |from| try dr.resumeAt(e.slot, from, s.pos) else try dr.restart(e.slot, s.pos);
++    note(e, "restored", s, t0);
+ }
+ 
+ pub fn holds(e: anytype, id: u64) bool {
+diff --git a/zig/src/families/glm/dflash.zig b/zig/src/families/glm/dflash.zig
+index 6b67d764..2622bd14 100644
+--- a/zig/src/families/glm/dflash.zig
++++ b/zig/src/families/glm/dflash.zig
+@@ -68,10 +68,15 @@ pub const Lin = union(enum) { q4: q4.Q4, bf16: mm.Tiled };
+ /// down and the selector's projection stay bf16 (their fp32 outputs are gathered or read on the host).
+ pub const LayerW = struct { in_norm: u64, post_norm: u64, qn: u64, kn: u64, a_base: u64, m_base: u64, qkv: Lin, kv: Lin, o: Lin, gu: Lin, down: mm.Tiled, a_proj: Lin, m_proj: Lin };
+ 
++/// A ring's `first` before any row of its sequence is in it.
++pub const no_rows: i64 = std.math.maxInt(i64);
++
+ /// A stream's drafter state by slot: its ring, where its context starts, and its last verify's tap rows.
+ pub const Slot = struct {
+     ring: ?cuda.DeviceBuffer = null,
+     from: i64 = 0, // the first position the ring holds for this sequence
++    first: i64 = no_rows, // prompt rows held: the first of the run in the ring that ends at `end` (no_rows: none yet)
++    end: i64 = 0,
+     v_step: u64 = 0, // the verify that wrote its rows (Drafter.verifies then)
+     v_row0: usize = 0,
+     v_rows: usize = 0,
+@@ -202,6 +207,32 @@ pub const Drafter = struct {
+     pub fn restart(dr: *Drafter, i: u32, from: usize) !void {
+         const s = try dr.slot(i);
+         s.from = @intCast(from);
++        s.first = no_rows;
++        s.end = @intCast(from);
++        s.v_rows = 0;
++    }
++
++    /// Slot `i`'s ring (made on first use), for a kept state to copy out of or into.
++    pub fn ringPtr(dr: *Drafter, i: u32) !u64 {
++        return (try dr.slot(i)).ring.?.ptr;
++    }
++
++    /// Where the context rows a state kept at `at` carries start: the prompt rows in the ring right up to `at`, at most
++    /// a window of them (null: the pass tapped none just before `at`, so the ring holds nothing a resume could use).
++    pub fn keptFrom(dr: *const Drafter, i: u32, at: usize) ?i64 {
++        if (i >= dr.slots.items.len) return null;
++        const s = &dr.slots.items[i];
++        const end: i64 = @intCast(at);
++        if (s.ring == null or s.first == no_rows or s.end != end or s.first >= end) return null;
++        return @max(@max(s.first, s.from), end - WIN);
++    }
++
++    /// A kept state's ring copied into slot `i`: its sequence's rows `from` .. `at` are in it, as a fresh pass left them.
++    pub fn resumeAt(dr: *Drafter, i: u32, from: i64, at: usize) !void {
++        const s = try dr.slot(i);
++        s.from = from;
++        s.first = from;
++        s.end = @intCast(at);
+         s.v_rows = 0;
+     }
+ 
+@@ -209,7 +240,7 @@ pub const Drafter = struct {
+     pub fn noteVerify(dr: *Drafter, i: u32, row0: usize, rows: usize, pos0: usize, first: bool) !void {
+         if (first) dr.verifies += 1; // a shared verify's parts share one
+         const s = try dr.slot(i);
+-        s.* = .{ .ring = s.ring, .from = s.from, .v_step = dr.verifies, .v_row0 = row0, .v_rows = rows, .v_pos0 = @intCast(pos0) };
++        s.* = .{ .ring = s.ring, .from = s.from, .first = s.first, .end = s.end, .v_step = dr.verifies, .v_row0 = row0, .v_rows = rows, .v_pos0 = @intCast(pos0) };
+     }
+ 
+     /// A prompt chunk on slot `i` (rows start.. of a `len`-id prompt): its rows within the last window into the ring.
+@@ -312,4 +343,7 @@ pub fn ingestPrompt(dr: anytype, e: anytype, i: u32, start: usize, rows: usize,
+     const s = try dr.slot(i);
+     const run = (try promptRun(s.ring.?.ptr, dr.taps_prefill, start, rows, len, row0)) orelse return;
+     try dr.ingest(e, &.{run});
++    // the run the ring holds: it goes on from `end`, or starts again past a gap (rows a kept state may carry)
++    if (s.first == no_rows or run.pos0 != s.end) s.first = run.pos0;
++    s.end = run.pos0 + @as(i64, @intCast(run.n));
+ }
+diff --git a/zig/src/native/cuda_snaps.zig b/zig/src/native/cuda_snaps.zig
+index 35a5785f..113270f2 100644
+--- a/zig/src/native/cuda_snaps.zig
++++ b/zig/src/native/cuda_snaps.zig
+@@ -24,9 +24,11 @@ pub fn passRules(comptime F: type, prompt_rows: u32) api.prompt_cache.Rules {
+     return rules;
+ }
+ 
+-/// The cache's bytes less what the family sets aside for its states (`snap_ready`, as Nemotron's spare buffers).
++/// The cache's bytes less what the family sets aside for its states (`snap_ready`, as Nemotron's spare buffers), plus
++/// a host tier the family made beside them (`snap_host_tier`, GLM's pinned pages: its states take them past the card's).
+ pub fn cacheBudget(comptime F: type, target: anytype, cache: u64) !u64 {
+-    return if (@hasDecl(F, "snap_ready")) cache - try F.snap_ready(target, cache) else cache;
++    const left = if (@hasDecl(F, "snap_ready")) cache - try F.snap_ready(target, cache) else cache;
++    return if (@hasDecl(F, "snap_host_tier")) left + F.snap_host_tier(target) else left;
+ }
+ 
+ /// The family's `snap_*` copies and `image`, its disk rows (null: none); a container-level value, so the pointer holds.
+diff --git a/zig/test_support/glm_snap_driver.zig b/zig/test_support/glm_snap_driver.zig
+index 68fc4264..efec5151 100644
+--- a/zig/test_support/glm_snap_driver.zig
++++ b/zig/test_support/glm_snap_driver.zig
+@@ -8,6 +8,9 @@ pub const Driver = struct {
+     pub var syncs: usize = 0;
+     pub var fail_copy: ?usize = null;
+     pub var fail_alloc = false;
++    pub var host_copies: usize = 0; // copies to or from pinned host pages
++    pub var fail_host_alloc = false;
++    var host_blocks: [4]?[]align(4096) u8 = @splat(null);
+ 
+     pub fn init() cuda.Driver {
+         allocs = 0;
+@@ -15,11 +18,17 @@ pub const Driver = struct {
+         syncs = 0;
+         fail_copy = null;
+         fail_alloc = false;
++        host_copies = 0;
++        fail_host_alloc = false;
+         var d: cuda.Driver = undefined;
+         d.api.cuMemAlloc_v2 = alloc;
+         d.api.cuMemFree_v2 = free;
+         d.api.cuMemsetD8_v2 = zero;
+         d.api.cuMemcpyDtoDAsync_v2 = copy;
++        d.api.cuMemcpyDtoHAsync_v2 = toHost;
++        d.api.cuMemcpyHtoDAsync_v2 = fromHost;
++        d.api.cuMemHostAlloc = hostAlloc;
++        d.api.cuMemFreeHost = hostFree;
+         d.api.cuMemsetD32Async = set;
+         d.api.cuStreamSynchronize = sync;
+         d.api.cuCtxSynchronize = contextSync;
+@@ -61,6 +70,37 @@ pub const Driver = struct {
+         std.mem.copyForwards(u8, bytes(dst, n), bytes(src, n));
+         return 0;
+     }
++    fn toHost(dst: ?*anyopaque, src: u64, n: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
++        copies += 1;
++        host_copies += 1;
++        if (fail_copy == copies) return cuda.abi.error_not_ready;
++        std.mem.copyForwards(u8, bytes(@intFromPtr(dst.?), n), bytes(src, n));
++        return 0;
++    }
++    fn fromHost(dst: u64, src: ?*const anyopaque, n: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
++        copies += 1;
++        host_copies += 1;
++        if (fail_copy == copies) return cuda.abi.error_not_ready;
++        std.mem.copyForwards(u8, bytes(dst, n), bytes(@intFromPtr(src.?), n));
++        return 0;
++    }
++    fn hostAlloc(out: *?*anyopaque, n: usize, _: c_uint) callconv(.c) cuda.abi.Result {
++        if (fail_host_alloc) return 2;
++        for (&host_blocks) |*b| if (b.* == null) {
++            b.* = std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(4096), n) catch return 2;
++            out.* = b.*.?.ptr;
++            return 0;
++        };
++        return 2;
++    }
++    fn hostFree(p: ?*anyopaque) callconv(.c) cuda.abi.Result {
++        for (&host_blocks) |*b| if (b.*) |s| if (@intFromPtr(s.ptr) == @intFromPtr(p.?)) {
++            std.testing.allocator.free(s);
++            b.* = null;
++            return 0;
++        };
++        return 1;
++    }
+     fn set(dst: u64, v: c_uint, n: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+         const p: [*]u32 = @ptrFromInt(dst);
+         @memset(p[0..n], v);
+-- 
+2.53.0
+

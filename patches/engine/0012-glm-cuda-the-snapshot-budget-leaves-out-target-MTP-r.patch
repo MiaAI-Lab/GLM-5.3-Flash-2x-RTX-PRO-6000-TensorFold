@@ -1,0 +1,95 @@
+From 1255051536a4c81db1e77faf76ab83c5008d43f3 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 14:42:11 +0200
+Subject: [PATCH 12/13] glm cuda: the snapshot budget leaves out target MTP
+ rows a drafter never fills
+
+Beside a drafter the prompt passes no longer absorb rows into the target MTP layer's caches,
+so a kept state's mtp_len stays 0 and keepAs saves no head rows. snapshots.bytes still
+budgeted them up to a window past the prefix whenever the head is loaded, which only made
+the prompt cache refuse states that fit. mtpHead now gives keepAs's own count: none without
+the head, 0 beside a drafter, else up to a window past `at`. e.mtp itself is unchanged; it
+also gates speculative serving and the shared buffers, and DFlash2 borrows the head's
+quantized draft weights.
+
+The host test now sets the engine's drafter (null) where it built the rest by hand, and
+checks that a drafter's budget at 34,816 rows is smaller and stays page-aligned.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNmHb8tWDWv2KnBDVCM
+---
+ zig/glm_snapshot_host.zig               |  8 ++++++++
+ zig/src/families/glm/cuda_snapshots.zig | 10 +++++++++-
+ zig/test_support/glm_snap_fixture.zig   |  1 +
+ 3 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/zig/glm_snapshot_host.zig b/zig/glm_snapshot_host.zig
+index 70cc555f..3eeb889b 100644
+--- a/zig/glm_snapshot_host.zig
++++ b/zig/glm_snapshot_host.zig
+@@ -43,6 +43,7 @@ test "GLM snapshots: a short prefix fits 4 GiB even with a 524288-token configur
+     e.cur = &seq;
+     e.c = w.config;
+     e.mtp = true;
++    e.drafter = null; // the target MTP head absorbs prompts: its rows are budgeted
+     e.capacity = seq.st.capacity;
+     for ([_]u32{ 2048, 34816, 266240 }) |at| {
+         std.debug.print("GLM snapshot sizing rank=0 world=2 at={d} bytes={d} arena={d}\n", .{ at, glm.native.snap_bytes(&e, at), seq.st.arena.buf.len });
+@@ -54,6 +55,12 @@ test "GLM snapshots: a short prefix fits 4 GiB even with a 524288-token configur
+     try t.expect(short < longer);
+     try t.expect(longer < seq.st.arena.buf.len);
+     try t.expectEqual(@as(u64, 0), short % (2 << 20));
++    // beside a drafter (DFlash2) the prompts leave the head's caches empty (mtp_len 0): their rows leave the budget
++    e.drafter = @ptrFromInt(4096); // only its presence is read
++    const drafted = glm.native.snap_bytes(&e, 34816);
++    e.drafter = null;
++    try t.expect(drafted < longer);
++    try t.expectEqual(@as(u64, 0), drafted % (2 << 20));
+ }
+ 
+ const rec = @import("test_support/glm_snap_driver.zig").Driver;
+@@ -423,6 +430,7 @@ test "GLM snapshots: 0.3 GiB fits the first default TP2 prefix at 256K but not a
+     e.cur = &seq;
+     e.c = w.config;
+     e.mtp = true;
++    e.drafter = null; // the target MTP head absorbs prompts: its rows are budgeted
+     e.capacity = seq.st.capacity;
+     const minimum = glm.native.snap_min_bytes(&e);
+     const budget: u64 = 322122547;
+diff --git a/zig/src/families/glm/cuda_snapshots.zig b/zig/src/families/glm/cuda_snapshots.zig
+index 08101ab6..4ffd690c 100644
+--- a/zig/src/families/glm/cuda_snapshots.zig
++++ b/zig/src/families/glm/cuda_snapshots.zig
+@@ -24,8 +24,16 @@ pub fn agree(e: anytype, budget: u64) !void {
+     if (try e.shared(if (failed != null) 1 else 0) > 0) return failed orelse error.PeerSnapshotCache;
+ }
+ 
++/// The target MTP rows a state at `at` holds, as `keepAs` will save them: none without the head; beside a drafter its
++/// prompts leave the head's caches empty (cuda_engine prefillChunk), so mtp_len stays 0; else up to a window past `at`.
++fn mtpHead(e: anytype, at: usize) error{Overflow}!?usize {
++    if (!e.mtp) return null;
++    if (e.drafter != null) return 0;
++    return @min(e.capacity, try std.math.add(usize, at, @import("cuda_state.zig").window_rows));
++}
++
+ pub fn bytes(e: anytype, at: usize) u64 {
+-    const head: ?usize = if (e.mtp) @min(e.capacity, std.math.add(usize, at, @import("cuda_state.zig").window_rows) catch return std.math.maxInt(u64)) else null;
++    const head = mtpHead(e, at) catch return std.math.maxInt(u64);
+     // a paged sequence holds its request's rows: its prefix is counted to the capacity, in a window's bytes
+     const n = layout.Plan.size(&e.cur.st, &e.c, e.capacity, at, head) catch return std.math.maxInt(u64);
+     return pages.rounded(n) catch std.math.maxInt(u64);
+diff --git a/zig/test_support/glm_snap_fixture.zig b/zig/test_support/glm_snap_fixture.zig
+index 8490e04d..c0beada2 100644
+--- a/zig/test_support/glm_snap_fixture.zig
++++ b/zig/test_support/glm_snap_fixture.zig
+@@ -30,6 +30,7 @@ pub const Fixture = struct {
+         f.e.share = w.share;
+         f.e.capacity = f.seq.st.capacity;
+         f.e.mtp = mtp;
++        f.e.drafter = null; // snapshots.bytes budgets the head's rows unless a drafter is loaded
+         f.e.snaps = .empty;
+         f.e.snap_pages = null;
+         f.e.snap_setup = null;
+-- 
+2.53.0
+

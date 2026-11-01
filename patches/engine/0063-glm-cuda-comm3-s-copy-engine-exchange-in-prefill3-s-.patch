@@ -1,0 +1,145 @@
+From f8948f5723c68188ad4629ac976607fd89e8c212 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 20:06:19 +0200
+Subject: [PATCH 63/63] glm cuda: comm3's copy-engine exchange in prefill3's
+ partials and shareGlued; the ranks' fingerprint layout 14
+
+prefill3 moved the pieced exchanges into Forward pieces' partials() and shareGlued(), which a paired step's
+exchangeGlue also calls; comm3's TF_GLM_CE_EXCHANGE=1 branch sat in the old inline code, so the merge took it out.
+Both now take the piece's index and, with f.ce, push by copy engines into the piece's flag slot, as comm3 did.
+
+A paired step's twin has no f.ce (Engine.view gives it to the registered prompt buffers alone), so its exchanges stay
+on NCCL while the first chunk's go by copy engines, through the one room they share (0038). That keeps step order:
+- both chunks' exchanges and glue post on one side stream, and a copy-engine put is a cuMemcpyDtoDAsync on it;
+- a rank pushes chunk a's next site into the peer's room only after its side stream finished chunk b's split glued
+  exchange of the site before, whose NCCL receive completes only once the peer sent, which the peer's side stream does
+  after its glue read the room; the other way, b's NCCL receive into a rank's own room follows that rank's own glue
+  of a in stream order, after its wait for the peer's push.
+The twin's Pieces take their own copy-engine flag slots (ce_slot0 + 2 x max_pieces, as comm3 reserved them), unused
+while the twin stays on NCCL.
+
+The fingerprint gained both num3's numerics and prefill3's pair, each of which had taken layout 13: it is 14 now.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj6TMcvsfVhxuBcBLg
+---
+ zig/src/families/glm/cuda_forward.zig        |  4 +++-
+ zig/src/families/glm/cuda_forward_pair.zig   |  4 ++--
+ zig/src/families/glm/cuda_forward_pieces.zig | 18 ++++++++++--------
+ zig/src/families/glm/cuda_ranks.zig          |  2 +-
+ 4 files changed, 16 insertions(+), 12 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index ef1574e5..a58204d2 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -143,7 +143,9 @@ pub const Pieces = struct {
+ 
+     /// A paired step's second chunk on `of`'s side stream: every rank posts both chunks' exchanges in one order.
+     pub fn initTwin(d: *const cuda.Driver, of: *const Pieces) !Pieces {
+-        return make(d, of.count, of.side, false);
++        var p = try make(d, of.count, of.side, false);
++        p.ce_slot0 = of.ce_slot0 + 2 * max_pieces; // copy-engine flag slots of its own (cuda_ce.slot), were it to push
++        return p;
+     }
+ 
+     fn make(d: *const cuda.Driver, count: usize, side: cuda.Stream, owns_side: bool) !Pieces {
+diff --git a/zig/src/families/glm/cuda_forward_pair.zig b/zig/src/families/glm/cuda_forward_pair.zig
+index a739d4a2..2cf9f3a5 100644
+--- a/zig/src/families/glm/cuda_forward_pair.zig
++++ b/zig/src/families/glm/cuda_forward_pair.zig
+@@ -75,14 +75,14 @@ fn exchangeGlue(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut:
+         for (f.ranks) |r| try f.fillRows(r, r.w.layers[j], site, lo, piece[1], if (split) r.b.part + lo * D * 4 else room(r, lo) + r.w.share.rank * n * D * 4);
+         try p.filled[q].record(f.stream);
+         try p.side.wait(p.filled[q]);
+-        try pieces.partials(f, p, lo, n, split);
++        try pieces.partials(f, p, q, lo, n, split);
+         if (split) {
+             for (f.ranks) |r| {
+                 const mine = share(n, world, r.w.share.rank);
+                 try g.glueRows(r, j, site, lo + mine[0], lo + mine[1], room(r, lo));
+             }
+             if (site == .ffn) if (f.taps) |t| try pieces.tapPiece(f, p.side, t, j, lo, n); // the rows this glue posted
+-            try pieces.shareGlued(f, p, lo, n, last);
++            try pieces.shareGlued(f, p, q, lo, n, last);
+         } else {
+             for (f.ranks) |r| try g.glueRows(r, j, site, lo, piece[1], room(r, lo));
+             if (site == .ffn) if (f.taps) |t| try pieces.tapPiece(f, p.side, t, j, lo, n);
+diff --git a/zig/src/families/glm/cuda_forward_pieces.zig b/zig/src/families/glm/cuda_forward_pieces.zig
+index 528f7a90..654172c2 100644
+--- a/zig/src/families/glm/cuda_forward_pieces.zig
++++ b/zig/src/families/glm/cuda_forward_pieces.zig
+@@ -26,7 +26,7 @@ pub fn exchangePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site,
+         try p.side.wait(p.filled[q]);
+         stamp.end();
+         stamp = prof.span(f.prof, p.side, .partials);
+-        try partials(f, p, lo, n, split);
++        try partials(f, p, q, lo, n, split);
+         stamp.end();
+         try p.gathered[q].record(p.side);
+     }
+@@ -58,7 +58,7 @@ pub fn gluePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut
+         try p.side.wait(p.glues[q]);
+         stamp.end();
+         stamp = prof.span(f.prof, p.side, .glued);
+-        try shareGlued(f, p, lo, n, last);
++        try shareGlued(f, p, q, lo, n, last);
+         stamp.end();
+         try p.shared[q].record(p.side);
+         sent |= @as(usize, 1) << @intCast(q);
+@@ -110,8 +110,9 @@ pub fn shareTaps(f: *const Forward, t: taps.Taps, cut: []const [2]usize) !void {
+     }
+ }
+ 
+-/// A piece's partials on the side stream: gathered whole, or split (each rank's rows of every partial to their owner).
+-pub fn partials(f: *const Forward, p: *const Pieces, lo: usize, n: usize, split: bool) !void {
++/// A piece's partials on the side stream: gathered whole, or split (each rank's rows of every partial to their owner;
++/// with `f.ce`, TF_GLM_CE_EXCHANGE=1, by copy-engine pushes into the peer's room and piece `q`'s flag slot).
++pub fn partials(f: *const Forward, p: *const Pieces, q: usize, lo: usize, n: usize, split: bool) !void {
+     const D = f.ranks[0].w.config.hidden;
+     const world = f.ranks[0].w.share.world;
+     const bytes = n * D * 4;
+@@ -137,14 +138,15 @@ pub fn partials(f: *const Forward, p: *const Pieces, lo: usize, n: usize, split:
+             const mine = share(n, world, me);
+             const own = mine[1] - mine[0];
+             const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
+-            if (f.ring) try relay.partials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D) else try relay.splitPartials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D);
++            if (f.ce) |ce| try ce_x.partials(f, ce, p, q, lo, n) else if (f.ring) try relay.partials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D) else try relay.splitPartials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D);
+             try f.copy(p.side, room(r, lo) + me * own * D * 4, r.b.part + (lo + mine[0]) * D * 4, own * D * 4);
+         },
+     }
+ }
+ 
+-/// A split piece's glued rows (normed, or hidden after the last layer) to every rank on the side stream.
+-pub fn shareGlued(f: *const Forward, p: *const Pieces, lo: usize, n: usize, last: bool) !void {
++/// A split piece's glued rows (normed, or hidden after the last layer) to every rank on the side stream (with `f.ce`
++/// by copy engines, piece `q`'s flag slot).
++pub fn shareGlued(f: *const Forward, p: *const Pieces, q: usize, lo: usize, n: usize, last: bool) !void {
+     const D: usize = f.ranks[0].w.config.hidden;
+     const world = f.ranks[0].w.share.world;
+     switch (f.exchange) {
+@@ -161,7 +163,7 @@ pub fn shareGlued(f: *const Forward, p: *const Pieces, lo: usize, n: usize, last
+             const me = r.w.share.rank;
+             const rows_of = if (last) r.b.hidden else r.b.normed;
+             const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
+-            if (f.ring) try relay.glued(x.lib, x.comm, p.side, plan, rows_of, lo, D) else try relay.splitGlued(x.lib, x.comm, p.side, plan, rows_of, lo, D);
++            if (f.ce) |ce| try ce_x.glued(f, ce, p, q, rows_of, lo, n) else if (f.ring) try relay.glued(x.lib, x.comm, p.side, plan, rows_of, lo, D) else try relay.splitGlued(x.lib, x.comm, p.side, plan, rows_of, lo, D);
+         },
+     }
+ }
+diff --git a/zig/src/families/glm/cuda_ranks.zig b/zig/src/families/glm/cuda_ranks.zig
+index 862d3387..66346617 100644
+--- a/zig/src/families/glm/cuda_ranks.zig
++++ b/zig/src/families/glm/cuda_ranks.zig
+@@ -131,7 +131,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
+ 
+ /// What every rank must agree on, as bytes the communicator carries.
+ pub const Fingerprint = extern struct {
+-    layout: u32 = 13, // this struct's version
++    layout: u32 = 14, // this struct's version (13 was num3's numerics or prefill3's pair alone)
+     world: u32,
+     rank: u32,
+     kv8: u32 = 0,
+-- 
+2.53.0
+

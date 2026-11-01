@@ -1,0 +1,74 @@
+From 10d04282f237fc5c28cc446f9950a4edbf0ddbed Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 18:07:21 +0200
+Subject: [PATCH 32/63] glm cuda: a step the link refuses leaves rank 0's
+ pending keep for the next one; the pages test's link starts with none
+
+On mem2's paged streams, beginOn can send more page ids than the link holds (TooManyIds). Leader.send now refuses
+such a step before a pending keep is sent or put on it, so a refused step can never lose a keep rank 0 has already
+committed. glm_pages_host's hand-built Link (`= undefined`, then ids and asleep) also sets keep_pending to null:
+left undefined it read as a pending keep and sent it through a fake device (test-glm-pages-host 11/12 -> 12/12).
+A new pages test refuses a begin packet twice under a pending keep and finds the keep still pending, unsent
+(13/13; without the guard it crashes sending the keep).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj6TMcvsfVhxuBcBLg
+---
+ zig/glm_pages_host.zig               | 21 +++++++++++++++++++++
+ zig/src/families/glm/cuda_follow.zig |  1 +
+ 2 files changed, 22 insertions(+)
+
+diff --git a/zig/glm_pages_host.zig b/zig/glm_pages_host.zig
+index 66f964c7..69b2994f 100644
+--- a/zig/glm_pages_host.zig
++++ b/zig/glm_pages_host.zig
+@@ -228,6 +228,7 @@ test "GLM pages: a failed begin packet cancels its lease and lane before a retry
+     var link: glm.follow.Link = undefined;
+     link.ids = &.{};
+     link.asleep = false;
++    link.keep_pending = null;
+     var back: glm.lanes.Lanes = .{ .x = .{ .e = &f.e, .link = &link } };
+     defer back.deinit();
+     var stream = try lanes.Stream.init(t.allocator, .{ .id = "page-test", .prompt = &.{100}, .max_new = 8 });
+@@ -244,6 +245,26 @@ test "GLM pages: a failed begin packet cancels its lease and lane before a retry
+     }
+ }
+ 
++test "GLM pages: a begin packet the link refuses leaves rank 0's pending keep for the next step" {
++    var f: Fixture = undefined;
++    try f.init(2);
++    defer f.deinit();
++    try f.e.bind(0);
++    f.e.dropped = .empty;
++    f.e.m.glue.put_words = .{ .d = &f.d, .handle = null };
++    var link: glm.follow.Link = undefined;
++    link.ids = &.{};
++    link.asleep = false;
++    link.keep_pending = .{ .slot = 0, .rows = 3 }; // committed on rank 0, not yet sent: it must not be sent or lost
++    const x: glm.follow.Leader = .{ .e = &f.e, .link = &link };
++    for (0..2) |_| {
++        try t.expectError(error.TooManyIds, x.beginOn(null, &.{ 4, 5 }));
++        try t.expect(link.keep_pending != null);
++        try t.expectEqual(@as(u32, 0), link.keep_pending.?.slot);
++        try t.expectEqual(@as(u32, 3), link.keep_pending.?.rows);
++    }
++}
++
+ test "GLM pages: a failed seat binding returns its pages and lane before retry" {
+     var f: Fixture = undefined;
+     try f.init(2);
+diff --git a/zig/src/families/glm/cuda_follow.zig b/zig/src/families/glm/cuda_follow.zig
+index 50d37562..7c95a256 100644
+--- a/zig/src/families/glm/cuda_follow.zig
++++ b/zig/src/families/glm/cuda_follow.zig
+@@ -144,6 +144,7 @@ pub const Leader = struct {
+             cuda.tp_watch.wake();
+             x.link.asleep = false;
+         }
++        if (ids.len > x.link.ids.len) return error.TooManyIds; // refused whole: a pending keep stays for the next step
+         if (x.link.keep_pending) |kp| {
+             x.link.keep_pending = null;
+             const kind: Kind = @fromBackingInt(@intCast(hh.kind));
+-- 
+2.53.0
+

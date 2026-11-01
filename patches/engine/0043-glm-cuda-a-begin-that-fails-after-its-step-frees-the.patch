@@ -1,0 +1,662 @@
+From 67b2bfb5f02e8d89f0e3ab1877b3648d399611b8 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 18:18:50 +0200
+Subject: [PATCH 43/63] glm cuda: a begin that fails after its step frees the
+ slot on every rank; a request at --context opens
+
+The round-3 reviews' four findings (opt/codex-round3.md, opt/deepseek-paged-review.md), each with host tests:
+
+- P1, TP ranks left inconsistent: Leader.beginOn sends the begin step (with the stream's page ids), then runs rank 0's
+  own begin. When that failed (a lazy DFlash2 ring allocation, a reset's memset), the lanes' opening released the slot
+  on rank 0 alone, so a follower kept it mapped and the next begin on it was BadStep, ending the TP server. Rank 0's
+  begin failing after its step went out now sends a release step for the slot: every rank frees it as rank 0 does.
+  The follower's step handler moves into follow.apply (the loop is unchanged), so a host test drives the real one.
+- A thin model with no paged caches (KDA layers alone, no target MTP head: TF_GLM_LAYERS=1 with --no-drafts or
+  DFlash2) gave a zero-byte page, and the pool's plan divided by it. Engine.init keeps every stream's window when the
+  loaded layers have nothing to page (pages.pageable), on every rank alike; pages.layout refuses such a model by name
+  (error.NoPagedCaches) instead of reaching the plan.
+- A request of exactly --context was refused: the opening refused prompt + max_tokens + a window equal to the capacity
+  (capacity = context + 8 rounded up to 64, so whenever context + 8 is a multiple of 64), and prefillStart refused a
+  prompt whose first window ends at the capacity. Both allow equality now (Lanes.fitsContext, Engine.promptFits), as
+  does the batched prompts' check; the last window's rows still end inside the capacity.
+- A checkpoint without an MTP layer (num_nextn_predict_layers 0), drafts on and no --drafter, selected the MTP head,
+  loaded nothing, then failed every draft with NoDraftHead. engine.heads now loads no head and turns speculation off
+  there (one warning on rank 0); DFlash2 still borrows the draft head (the rank's lm_head rows) without an MTP layer.
+
+Tests (mutations of each fix fail them): test-glm-fp8-pages-host 15/15 (a begin failing after its step: rank 0's
+steps are recorded off its link and replayed through follow.apply on a follower; a request of 8,000 + 184 at
+--context 8,184 opens, + 185 is PromptTooLong), test-glm-kv-pages-host 25/25 (thin model; exact-context checks at six
+contexts), test-glm-fp8-kv-host 20/20 (engine.heads).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj6TMcvsfVhxuBcBLg
+---
+ zig/build/glm_family_host.zig            |   2 +-
+ zig/glm_fp8_pages_host.zig               | 133 +++++++++++++++
+ zig/src/families/glm/cuda_engine.zig     |  47 ++++-
+ zig/src/families/glm/cuda_follow.zig     | 208 ++++++++++++-----------
+ zig/src/families/glm/cuda_lanes.zig      |   8 +-
+ zig/src/families/glm/cuda_native.zig     |   1 +
+ zig/src/families/glm/cuda_pages.zig      |   8 +
+ zig/src/families/glm/cuda_pages_test.zig |  38 +++++
+ zig/src/families/glm/cuda_prompts.zig    |   2 +-
+ 9 files changed, 341 insertions(+), 106 deletions(-)
+
+diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
+index 40e4fc9b..f8cab27b 100644
+--- a/zig/build/glm_family_host.zig
++++ b/zig/build/glm_family_host.zig
+@@ -19,7 +19,7 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
+     const index_emulated = b.addRunArtifact(index_emulate);
+     index_emulated.expectExitCode(0);
+     b.step("test-glm-index-emulate", "GLM's prompt indexer kernels as host C++ against a plain top-K and a model of tf_glm_scores").dependOn(&index_emulated.step);
+-    const kv8_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM FP8 KV:"} }));
++    const kv8_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{ "GLM FP8 KV:", "GLM heads:" } }));
+     b.step("test-glm-fp8-kv-host", "GLM latent cache layout, mode agreement and recorded CUDA launches without devices").dependOn(&kv8_run.step);
+     step.dependOn(&kv8_run.step);
+     const profile_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM prompt profile:"} }));
+diff --git a/zig/glm_fp8_pages_host.zig b/zig/glm_fp8_pages_host.zig
+index 3af46ccc..80592316 100644
+--- a/zig/glm_fp8_pages_host.zig
++++ b/zig/glm_fp8_pages_host.zig
+@@ -361,6 +361,139 @@ test "GLM FP8 pages: a stream cut off at its opening gives back its pages and la
+     }
+ }
+ 
++/// Rank 0's steps as its link sends them (a put_words launch: the header's 16 words, then its ids), and a fault in
++/// the next sequence reset (State.reset's first memset, the begin's own work after its step went out).
++const Wire = struct {
++    var n: usize = 0;
++    var heads: [8]glm.follow.Header = undefined;
++    var ids: [8][64]u32 = undefined;
++    var lens: [8]usize = undefined;
++    var fail_reset = false;
++    fn launch(_: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, params: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
++        const p = params.?;
++        const count: *const u32 = @ptrCast(@alignCast(p[1].?));
++        const w: *const glm.follow.Words = @ptrCast(@alignCast(p[2].?));
++        if (n == heads.len) return 1;
++        @memcpy(std.mem.asBytes(&heads[n]), std.mem.sliceAsBytes(w.w[0..16]));
++        lens[n] = count.* - 16;
++        @memcpy(ids[n][0..lens[n]], w.w[16..][0..lens[n]]);
++        n += 1;
++        return 0;
++    }
++    fn bcast(_: u64, _: u64, _: usize, _: cuda.nccl.DataType, _: c_int, _: cuda.nccl.Comm, _: cuda.abi.Stream) callconv(.c) cuda.nccl.Result {
++        return 0;
++    }
++    fn reset(_: u64, _: u8, _: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
++        return if (fail_reset) cuda.abi.error_not_ready else 0;
++    }
++    fn kind(i: usize) glm.follow.Kind {
++        return @fromBackingInt(heads[i].kind);
++    }
++    /// Steps `from..n` on a follower's engine through its own step handler, as its loop runs them.
++    fn replay(e: *glm.engine.Engine, from: usize) !void {
++        var link: glm.follow.Link = undefined; // begin and release read no link
++        var s: glm.follow.Scratch = .{};
++        for (from..n) |i| try t.expect(try glm.follow.apply(e, &link, heads[i], ids[i][0..lens[i]], &s));
++    }
++};
++
++/// A rank's engine as `begin` reaches it: no drafter, no states dropped, a reset that may fail (Wire.reset).
++fn beginReady(f: *Fixture) void {
++    f.d.api.cuMemsetD8Async = Wire.reset;
++    f.e.drafter = null;
++    f.e.dropped = .empty;
++}
++
++test "GLM FP8 pages: a begin that fails on rank 0 after its step went out frees the slot on every rank, so its next begin maps on the follower" {
++    var f: Fixture = undefined; // rank 0
++    try f.init(2, false, 8);
++    defer f.deinit();
++    beginReady(&f);
++    var lib: cuda.nccl.Library = undefined;
++    lib.api.ncclBroadcast = Wire.bcast;
++    f.d.api.cuLaunchKernel = Wire.launch;
++    f.e.m.glue.put_words = .{ .d = &f.d, .handle = null };
++    var words: [64]u32 = undefined;
++    var link: glm.follow.Link = .{ .d = &f.d, .lib = &lib, .comm = null, .stream = f.e.stream, .buf = .{ .d = &f.d, .ptr = 1 << 20, .len = 64 + words.len * 4 }, .ids = &words, .gpa = t.allocator, .wait = false };
++    var back: glm.lanes.Lanes = .{ .x = .{ .e = &f.e, .link = &link } };
++    defer back.deinit();
++    var stream = try lanes.Stream.init(t.allocator, .{ .id = "fp8-begin-test", .prompt = &.{ 100, 101, 102 }, .max_new = 600 });
++    defer stream.deinit(t.allocator);
++    const b = back.backend();
++    Wire.n = 0;
++    Wire.fail_reset = true; // the begin step goes out, then rank 0's own reset fails
++    try t.expectError(error.NotReady, b.vtable.prefill_step.?(b.ptr, &stream));
++    Wire.fail_reset = false;
++    // rank 0 gave its pages and lane back; the other ranks heard the begin, then a release of the same slot
++    try t.expectEqual(@as(usize, 0), back.lanes.count());
++    try t.expect(f.p.pool.idle() and f.census().free == 8);
++    try t.expectEqual(@as(usize, 2), Wire.n);
++    try t.expectEqual(glm.follow.Kind.begin, Wire.kind(0));
++    try t.expectEqualSlices(u32, &.{ 0, 1 }, Wire.ids[0][0..Wire.lens[0]]);
++    try t.expectEqual(glm.follow.Kind.release, Wire.kind(1));
++    try t.expectEqual(Wire.heads[0].slot, Wire.heads[1].slot);
++    const slot = Wire.heads[0].slot;
++
++    var g: Fixture = undefined; // rank 1, its pool rank 0's
++    const live = F.live; // the driver's count is one for both ranks: prepare starts it again
++    try g.prepare(false, 4096);
++    F.live += live;
++    const l = try glm.pages.layout(t.allocator, &g.e, 0);
++    g.p = try glm.pages.Pages.follow(t.allocator, &g.e, 2, 8, l.pageBytes());
++    g.e.pages = g.p;
++    defer g.deinit();
++    beginReady(&g);
++    const saved = Wire.n;
++    Wire.n = 1; // the begin alone: the slot stays this rank's, and the next begin on it is BadStep (the reported fault)
++    try Wire.replay(&g.e, 0);
++    try t.expect(g.p.used[slot]);
++    try t.expectError(error.BadStep, g.p.map(slot, &.{ 0, 1 }));
++    Wire.n = saved;
++    try Wire.replay(&g.e, 1); // the release rank 0 sent after it
++    try t.expect(!g.p.used[slot] and g.st(slot).capacity == 0);
++    // the retry: its begin maps on the follower, and its end frees the slot on both ranks
++    const ids = try back.seat(&stream, 3, 600);
++    try back.x.beginOn(null, ids);
++    try t.expectEqual(glm.follow.Kind.begin, Wire.kind(2));
++    try Wire.replay(&g.e, 2);
++    try t.expect(g.p.used[slot]);
++    try t.expectEqualSlices(u32, ids, g.st(slot).pages);
++    b.vtable.release(b.ptr, &stream);
++    try t.expectEqual(glm.follow.Kind.release, Wire.kind(3));
++    try Wire.replay(&g.e, 3);
++    try t.expect(!g.p.used[slot] and f.p.pool.idle() and f.census().free == 8);
++}
++
++test "GLM FP8 pages: a request exactly at --context opens (8,000 + 184 at 8,184), one token past it is PromptTooLong" {
++    var f: Fixture = undefined;
++    try f.prepare(false, glm.native.capacity(8184)); // 8,184 + a verify window: 8,192 rows, already a multiple of 64
++    try t.expectEqual(@as(usize, 8192), f.e.capacity);
++    const l = try glm.pages.layout(t.allocator, &f.e, 0);
++    f.p = try glm.pages.Pages.init(t.allocator, &f.e, l, 2, 16, true);
++    f.p.poison = false;
++    f.e.pages = f.p;
++    defer f.deinit();
++    try f.e.bind(0);
++    f.e.dropped = .empty;
++    var link: glm.follow.Link = undefined;
++    link.ids = &.{}; // its begin step cannot carry page ids: an opening past the context check stops there
++    link.asleep = false;
++    var back: glm.lanes.Lanes = .{ .x = .{ .e = &f.e, .link = &link } };
++    defer back.deinit();
++    const prompt = try t.allocator.alloc(u32, 8000);
++    defer t.allocator.free(prompt);
++    @memset(prompt, 7);
++    const b = back.backend();
++    for ([_]u32{ 184, 185 }) |max_new| {
++        var stream = try lanes.Stream.init(t.allocator, .{ .id = "fp8-context-test", .prompt = prompt, .max_new = max_new });
++        defer stream.deinit(t.allocator);
++        // 8,000 + 184 + 8 == 8,192: its 16 pages taken, then the begin step; 8,000 + 185 is refused before any page
++        try t.expectError(if (max_new == 184) error.TooManyIds else error.PromptTooLong, b.vtable.prefill_step.?(b.ptr, &stream));
++        try t.expect(f.p.pool.idle() and f.census().free == 16 and back.lanes.count() == 0);
++    }
++    try t.expectEqual(@as(usize, 16), glm.pages.need(l, 8000, 184)); // the table's every entry: the pool's whole
++}
++
+ test "GLM FP8 pages: a refused table upload cancels the lease, and a retry takes and returns every page" {
+     var f: Fixture = undefined;
+     try f.init(2, false, 8);
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 4acc1fdd..9a21cc72 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -48,6 +48,30 @@ const Snap = types.Snap;
+ pub const Resume = types.Resume;
+ pub const Marks = types.Marks;
+ 
++/// The heads a load brings and whether the engine speculates. Beside DFlash2 only the draft head it borrows loads (the
++/// target MTP layer, its caches and buffers stay out); without a drafter the MTP layer's chains draft, and a checkpoint
++/// with no MTP layer (`mtp_layers` 0) then has nothing to draft with, so it loads no head and decodes plain.
++pub fn heads(drafts: bool, drafter: bool, mtp_layers: u32) struct { heads: weights.Heads, drafts: bool } {
++    if (!drafts) return .{ .heads = .none, .drafts = false };
++    if (drafter) return .{ .heads = .draft, .drafts = true };
++    return if (mtp_layers > 0) .{ .heads = .mtp, .drafts = true } else .{ .heads = .none, .drafts = false };
++}
++
++test "GLM heads: no MTP layer and no drafter loads no head and decodes plain; DFlash2 still borrows the draft head" {
++    const H = weights.Heads;
++    try std.testing.expectEqual(H.mtp, heads(true, false, 1).heads);
++    try std.testing.expect(heads(true, false, 1).drafts);
++    try std.testing.expectEqual(H.none, heads(true, false, 0).heads); // was .mtp: nothing loaded, then NoDraftHead
++    try std.testing.expect(!heads(true, false, 0).drafts);
++    try std.testing.expectEqual(H.draft, heads(true, true, 0).heads); // the draft head is the rank's lm_head rows
++    try std.testing.expect(heads(true, true, 0).drafts);
++    try std.testing.expectEqual(H.draft, heads(true, true, 1).heads);
++    for ([_]u32{ 0, 1 }) |n| for ([_]bool{ false, true }) |dr| {
++        try std.testing.expectEqual(H.none, heads(false, dr, n).heads);
++        try std.testing.expect(!heads(false, dr, n).drafts);
++    };
++}
++
+ pub const Engine = struct {
+     gpa: std.mem.Allocator,
+     io: std.Io,
+@@ -152,7 +176,9 @@ pub const Engine = struct {
+         if (o.settings.layers > c.layers) return error.BadLayers;
+         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
+         for (layers, 0..) |*l, i| l.* = @intCast(i);
+-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .side = side, .moe_fuse = envOn("TF_GLM_MOE_FUSE"), .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .drafts = o.drafts, .mtp = false };
++        const sel = heads(o.drafts, o.drafter, c.mtp); // every rank alike: the same config and options (cuda_ranks)
++        if (o.drafts and !sel.drafts and rank == 0) std.log.warn("glm: the checkpoint has no MTP layer (num_nextn_predict_layers 0) and no --drafter is given: decoding without drafts", .{});
++        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .side = side, .moe_fuse = envOn("TF_GLM_MOE_FUSE"), .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .drafts = sel.drafts, .mtp = false };
+         const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
+         if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
+         const Tile = struct {
+@@ -169,9 +195,7 @@ pub const Engine = struct {
+             }
+         };
+         const tiler: Tile = .{ .gpa = gpa, .mk = &e.m.mm, .s = stream, .d = d, .enabled = o.settings.tiled, .dense = o.settings.dense_bits, .head = o.settings.head_bits, .packs = &e.packs };
+-        // beside DFlash2 only the draft head it borrows loads: the target MTP layer, its caches and buffers stay out
+-        const heads: weights.Heads = if (!o.drafts) .none else if (o.drafter) .draft else .mtp;
+-        e.w = try @import("cuda_load_owner.zig").finish(try weights.load(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, heads), tiler, Tile.apply);
++        e.w = try @import("cuda_load_owner.zig").finish(try weights.load(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, sel.heads), tiler, Tile.apply);
+         errdefer e.w.deinit();
+         errdefer {
+             gpa.free(e.packs.ptrs);
+@@ -181,7 +205,11 @@ pub const Engine = struct {
+         e.m.mm.prompt_fixed_k = o.settings.prompt_fixed_k;
+         e.m.tiled = o.settings.tiled;
+         if (o.settings.tiled) e.m.packs = &e.packs;
+-        if (o.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it
++        if (e.settings.pages and !pages_mod.pageable(e)) { // the same layers and heads on every rank: they all keep windows
++            e.settings.pages = false;
++            if (rank == 0) std.log.info("kv pages: the loaded layers keep no KV rows to page (no DSA layer, no target MTP head): each stream keeps its own window", .{});
++        }
++        if (e.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it
+         errdefer {
+             e.free(0);
+             e.seqs.deinit(gpa);
+@@ -193,7 +221,7 @@ pub const Engine = struct {
+         errdefer e.bd.deinit();
+         if (e.mtp) e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
+         errdefer if (e.bm) |*b| b.deinit();
+-        if (o.drafts) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
++        if (e.drafts) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
+         errdefer if (e.bs) |*b| b.deinit();
+         e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world * pick_rows);
+         errdefer e.pairs.free();
+@@ -367,9 +395,14 @@ pub const Engine = struct {
+         }
+     }
+ 
++    /// A prompt of `len` ids and the verify window after it inside a sequence of `capacity` rows (equal fits).
++    pub fn promptFits(len: usize, capacity: usize) bool {
++        return len > 0 and len + fw.window_rows <= capacity;
++    }
++
+     /// Where a prompt pass of `len` ids starts: 0, or `from`'s position with its kept state restored.
+     fn prefillStart(e: *Engine, len: usize, from: ?Resume) !usize {
+-        if (len == 0 or len + fw.window_rows >= e.cur.st.capacity) return error.PromptTooLong;
++        if (!promptFits(len, e.cur.st.capacity)) return error.PromptTooLong;
+         const r = from orelse return 0;
+         if (r.at == 0 or r.at >= len or r.at % fw.prefill_rows != 0) return error.BadResume;
+         try e.restoreState(r.id); // DFlash2's context too: its kept rows, or from r.at when it kept none
+diff --git a/zig/src/families/glm/cuda_follow.zig b/zig/src/families/glm/cuda_follow.zig
+index 6c179eb7..8a9c333c 100644
+--- a/zig/src/families/glm/cuda_follow.zig
++++ b/zig/src/families/glm/cuda_follow.zig
+@@ -194,6 +194,8 @@ pub const Leader = struct {
+     }
+ 
+     /// `begin` on a paged sequence: the page ids it maps (rank 0's lease) go with the step, to every rank's table.
++    /// Rank 0's own begin failing after the step went out sends a release step: the other ranks began the slot (and
++    /// mapped its pages), so they free it as the caller frees it here, and its next begin maps there again.
+     pub fn beginOn(x: Leader, s: ?sampler.Sampling, pages: []const u32) !void {
+         try x.flush();
+         const c = sampler.check(s);
+@@ -207,7 +209,10 @@ pub const Leader = struct {
+             h.top_k = v.top_k;
+         }
+         try x.send(h, pages);
+-        try x.e.begin(c);
++        x.e.begin(c) catch |err| {
++            x.send(.{ .kind = @backingInt(Kind.release) }, &.{}) catch |why| std.log.err("slot {d}: the other ranks' release after rank 0's begin failed ({s}): {s}", .{ x.e.slot, @errorName(err), @errorName(why) });
++            return err;
++        };
+     }
+ 
+     /// Every rank's prompt cache at rank 0's device budget, and the host tier `asked` (snapshots.agreeTiers): the
+@@ -351,107 +356,118 @@ fn structuredStep(h: Header) bool {
+ 
+ /// A rank other than 0 runs rank 0's steps until it ends; a cancelled prefill is error.Cancelled and the loop goes on.
+ pub fn follow(e: *Engine, link: *Link) !void {
+-    var drafts: [engine.max_drafts]u32 = undefined;
+-    var chances: [engine.max_drafts]f64 = undefined;
+-    var sampled: [16]u32 = undefined;
++    var scratch: Scratch = .{};
+     cuda.tp_watch.sleep(e.io); // rank 0 starts with no stream: its first step wakes this rank
+     while (true) {
+         const step = try link.receive();
+-        var h = step.h;
+-        const kind: Kind = @fromBackingInt(@intCast(h.kind));
+-        if (h.flags & keep_flag != 0) { // rank 0's last keep, on this step's slot, before the step (as its keep step was)
+-            try e.bind(h.slot);
+-            try e.keep((h.flags >> 16) & 0xff);
+-            h.flags &= 0xffff;
+-        }
+-        if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many and kind != .idle and kind != .snapshots and kind != .pool) try e.bind(h.slot);
+-        e.prompt_logprobs = if (promptRows(h)) .{} else null;
+-        e.structured = structuredStep(h); // rank 0 alone masks them
+-        switch (kind) {
+-            .begin => {
+-                if (step.ids.len > 0) try (e.pages orelse return error.BadStep).map(h.slot, step.ids);
+-                try e.beginFollowing(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null);
+-            },
+-            .pool => {
+-                if (e.pages != null) return error.BadStep;
+-                e.pages = try pages_mod.Pages.follow(e.gpa, e, h.depth, @intCast(h.a), h.seed);
+-            },
+-            .prefill => {
+-                const ids = try e.gpa.dupe(u32, step.ids);
+-                defer e.gpa.free(ids);
+-                const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
+-                _ = e.prefill(ids, from, null, null) catch |err| switch (err) {
+-                    error.Cancelled => {},
+-                    else => return err,
+-                };
+-            },
+-            .chunk => {
+-                const ids = try e.gpa.dupe(u32, step.ids);
+-                defer e.gpa.free(ids);
+-                const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
+-                e.index_split = indexSplit(h);
+-                _ = e.prefillChunk(ids, h.depth, h.top_k, from, null, null) catch |err| switch (err) {
+-                    error.Cancelled => {},
+-                    else => return err,
+-                };
+-            },
+-            .verify => { // rank 0 alone reads the draws: this rank joins their gathers and leaves the tokens on the device
+-                e.discard_draws = true;
+-                defer e.discard_draws = false;
+-                try e.verify(step.ids, sampled[0..step.ids.len], 0);
+-            },
+-            .redraw => _ = try e.redrawFirst(@intCast(h.a), 0),
+-            .shared => {
+-                const k = h.depth;
+-                if (k == 0 or k > engine.max_shared or step.ids.len < 2 * k) return error.BadStep;
+-                var parts: [engine.max_shared]engine.Part = undefined;
+-                var outs: [engine.shared_rows]u32 = undefined;
+-                var at: usize = 2 * k;
+-                var row: usize = 0;
+-                for (parts[0..k], 0..) |*p, i| {
+-                    const n = step.ids[2 * i + 1];
+-                    if (at + n > step.ids.len or row + n > outs.len) return error.BadStep;
+-                    p.* = .{ .slot = step.ids[2 * i], .ids = step.ids[at..][0..n], .out = outs[row..][0..n] };
+-                    at += n;
+-                    row += n;
+-                }
+-                e.discard_draws = true;
+-                defer e.discard_draws = false;
+-                try e.verifyShared(parts[0..k]);
+-            },
+-            .many => {
+-                var parts: [engine.max_together]engine.Prompt = undefined;
+-                const decoded = try prompt_wire.decode(step.ids, h.depth, e.capacity, &parts);
+-                var firsts: [engine.max_together]u32 = undefined;
+-                try e.prefillMany(decoded, &firsts);
+-            },
+-            .keep => try e.keep(@intCast(h.a)),
+-            .draft => {
+-                const ids = try e.gpa.dupe(u32, step.ids);
+-                defer e.gpa.free(ids);
+-                try e.draft(h.flags & 1 != 0, ids, h.depth, &drafts, if (h.flags & 2 != 0) &chances else null);
+-            },
+-            .block => {
+-                const k = h.depth;
+-                if (k == 0 or k > dflash.MAX_S or step.ids.len != 3 * k) return error.BadStep;
+-                var reqs: [dflash.MAX_S]dflash.Req = undefined;
+-                for (reqs[0..k], 0..) |*q, i| q.* = .{ .slot = step.ids[3 * i], .pos = 0, .n = step.ids[3 * i + 1], .anchor = step.ids[3 * i + 2] };
+-                if (h.flags & 1 != 0) try e.ingestBlock(reqs[0..k]) else try e.draftBlock(reqs[0..k]);
+-            },
+-            .image => {
+-                const v = e.images orelse return error.NoVision; // the ranks agreed on --vision (cuda_ranks)
+-                try v.take(h.slot, step.ids);
+-                try link.rows(v.rows.ptr, v.rowCount() * vcfg.out_hidden * 2);
+-            },
+-            .snapshots => _ = try @import("cuda_snapshots.zig").agreeTiers(e, h.a, h.seed),
+-            .drop => for (step.ids) |id| e.dropState(id),
+-            .release => e.release(h.slot),
+-            .idle => cuda.tp_watch.sleep(e.io),
+-            .end => return cuda.tp_watch.ended(), // rank 0 ends on purpose: its line closing from here is expected
+-        }
++        if (!try apply(e, link, step.h, step.ids, &scratch)) return cuda.tp_watch.ended(); // rank 0 ended on purpose
+     }
+ }
+ 
++/// A follower's rows of rank 0's draws, which only rank 0 reads.
++pub const Scratch = struct {
++    drafts: [engine.max_drafts]u32 = undefined,
++    chances: [engine.max_drafts]f64 = undefined,
++    sampled: [16]u32 = undefined,
++};
++
++/// One of rank 0's steps on this rank (`ids` its ids); false at the end step.
++pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scratch) !bool {
++    var h = h_in;
++    const kind: Kind = @fromBackingInt(@intCast(h.kind));
++    if (h.flags & keep_flag != 0) { // rank 0's last keep, on this step's slot, before the step (as its keep step was)
++        try e.bind(h.slot);
++        try e.keep((h.flags >> 16) & 0xff);
++        h.flags &= 0xffff;
++    }
++    if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many and kind != .idle and kind != .snapshots and kind != .pool) try e.bind(h.slot);
++    e.prompt_logprobs = if (promptRows(h)) .{} else null;
++    e.structured = structuredStep(h); // rank 0 alone masks them
++    switch (kind) {
++        .begin => {
++            if (ids_in.len > 0) try (e.pages orelse return error.BadStep).map(h.slot, ids_in);
++            try e.beginFollowing(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null);
++        },
++        .pool => {
++            if (e.pages != null) return error.BadStep;
++            e.pages = try pages_mod.Pages.follow(e.gpa, e, h.depth, @intCast(h.a), h.seed);
++        },
++        .prefill => {
++            const ids = try e.gpa.dupe(u32, ids_in);
++            defer e.gpa.free(ids);
++            const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
++            _ = e.prefill(ids, from, null, null) catch |err| switch (err) {
++                error.Cancelled => {},
++                else => return err,
++            };
++        },
++        .chunk => {
++            const ids = try e.gpa.dupe(u32, ids_in);
++            defer e.gpa.free(ids);
++            const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
++            e.index_split = indexSplit(h);
++            _ = e.prefillChunk(ids, h.depth, h.top_k, from, null, null) catch |err| switch (err) {
++                error.Cancelled => {},
++                else => return err,
++            };
++        },
++        .verify => { // rank 0 alone reads the draws: this rank joins their gathers and leaves the tokens on the device
++            e.discard_draws = true;
++            defer e.discard_draws = false;
++            try e.verify(ids_in, s.sampled[0..ids_in.len], 0);
++        },
++        .redraw => _ = try e.redrawFirst(@intCast(h.a), 0),
++        .shared => {
++            const k = h.depth;
++            if (k == 0 or k > engine.max_shared or ids_in.len < 2 * k) return error.BadStep;
++            var parts: [engine.max_shared]engine.Part = undefined;
++            var outs: [engine.shared_rows]u32 = undefined;
++            var at: usize = 2 * k;
++            var row: usize = 0;
++            for (parts[0..k], 0..) |*p, i| {
++                const n = ids_in[2 * i + 1];
++                if (at + n > ids_in.len or row + n > outs.len) return error.BadStep;
++                p.* = .{ .slot = ids_in[2 * i], .ids = ids_in[at..][0..n], .out = outs[row..][0..n] };
++                at += n;
++                row += n;
++            }
++            e.discard_draws = true;
++            defer e.discard_draws = false;
++            try e.verifyShared(parts[0..k]);
++        },
++        .many => {
++            var parts: [engine.max_together]engine.Prompt = undefined;
++            const decoded = try prompt_wire.decode(ids_in, h.depth, e.capacity, &parts);
++            var firsts: [engine.max_together]u32 = undefined;
++            try e.prefillMany(decoded, &firsts);
++        },
++        .keep => try e.keep(@intCast(h.a)),
++        .draft => {
++            const ids = try e.gpa.dupe(u32, ids_in);
++            defer e.gpa.free(ids);
++            try e.draft(h.flags & 1 != 0, ids, h.depth, &s.drafts, if (h.flags & 2 != 0) &s.chances else null);
++        },
++        .block => {
++            const k = h.depth;
++            if (k == 0 or k > dflash.MAX_S or ids_in.len != 3 * k) return error.BadStep;
++            var reqs: [dflash.MAX_S]dflash.Req = undefined;
++            for (reqs[0..k], 0..) |*q, i| q.* = .{ .slot = ids_in[3 * i], .pos = 0, .n = ids_in[3 * i + 1], .anchor = ids_in[3 * i + 2] };
++            if (h.flags & 1 != 0) try e.ingestBlock(reqs[0..k]) else try e.draftBlock(reqs[0..k]);
++        },
++        .image => {
++            const v = e.images orelse return error.NoVision; // the ranks agreed on --vision (cuda_ranks)
++            try v.take(h.slot, ids_in);
++            try link.rows(v.rows.ptr, v.rowCount() * vcfg.out_hidden * 2);
++        },
++        .snapshots => _ = try @import("cuda_snapshots.zig").agreeTiers(e, h.a, h.seed),
++        .drop => for (ids_in) |id| e.dropState(id),
++        .release => e.release(h.slot),
++        .idle => cuda.tp_watch.sleep(e.io),
++        .end => return false, // rank 0 ends on purpose: its line closing from here is expected
++    }
++    return true;
++}
++
+ test "a step's header is 64 bytes and keeps its fields" {
+     const h: Header = .{ .kind = @backingInt(Kind.draft), .n = 3, .depth = 2, .flags = 1, .a = 7, .seed = 1 << 62, .temperature = 0.6, .top_p = 0.95, .top_k = 20 };
+     const bytes = std.mem.asBytes(&h);
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index be05ca3e..d1ce9340 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -291,7 +291,7 @@ pub const Lanes = struct {
+     /// A prompt pass begins: the stream's slot bound and its sequence fresh; where the pass resumes (a kept state).
+     fn opening(self: *Lanes, s: *lanes.Stream) !?engine.Resume {
+         const ids = s.prompt();
+-        if (ids.len + s.max_new + max_rows >= self.x.e.capacity) return error.PromptTooLong;
++        if (!fitsContext(ids.len, s.max_new, self.x.e.capacity)) return error.PromptTooLong;
+         const pages = try self.seat(s, ids.len, s.max_new);
+         errdefer {
+             self.x.e.release(self.lanes.get(s).?.slot);
+@@ -304,6 +304,12 @@ pub const Lanes = struct {
+         return if (s.prompt_logprobs != null) null else self.resumeFrom(s, ids.len); // prompt rows need every row
+     }
+ 
++    /// A prompt, its reply and the last verify window inside the capacity: equal still fits (the window's last row is
++    /// row capacity - 1 at most), so a request of exactly --context opens (capacity = context + a window, rounded up).
++    pub fn fitsContext(prompt: usize, max_new: usize, capacity: usize) bool {
++        return prompt + max_new + max_rows <= capacity;
++    }
++
+     /// The stream's slot, its pages, then its sequence: a slot past the paged ones waits before binding makes a window.
+     pub fn seat(self: *Lanes, s: *const lanes.Stream, prompt: usize, max_new: usize) ![]const u32 {
+         const l = try self.claim(s);
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index ded91e2c..bc346026 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -440,6 +440,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.Fp8OnPages => "--kv-cache fp8 keeps a window per stream: unset TF_KV_PAGES, or set it to auto or off",
+         error.BadKvPages => "TF_KV_PAGES: give auto, on (or 1, all) or off (or 0)",
+         error.PoolTooSmall => "this request's prompt and max_tokens need more KV pages than the whole pool holds, even with every other stream done: shorten the prompt or lower max_tokens",
++        error.NoPagedCaches => "TF_KV_PAGES: the loaded layers keep no KV rows to page (no DSA layer, no target MTP head): unset TF_KV_PAGES or set it off",
+         error.TooManyRanks => std.fmt.comptimePrint(
+             "GLM-5.3-Flash on CUDA runs on at most {d} ranks: set TF_GLM_WORLD to {d} or fewer",
+             .{ ranks.max_world, ranks.max_world },
+diff --git a/zig/src/families/glm/cuda_pages.zig b/zig/src/families/glm/cuda_pages.zig
+index f3ffbf27..f08d01cb 100644
+--- a/zig/src/families/glm/cuda_pages.zig
++++ b/zig/src/families/glm/cuda_pages.zig
+@@ -14,7 +14,9 @@ pub fn tableLen(capacity: usize) usize {
+ 
+ /// What a stream of engine `e` holds: its fixed part and table (and `extra`, its other buffers), and a token's bytes
+ /// on the pages: 13,056 in bf16 with the target MTP head, 6,380 in E4M3 beside DFlash2 (no head part).
++/// A layout of no token bytes (no DSA layer, no target MTP head) is error.NoPagedCaches: the pool divides by its page.
+ pub fn layout(gpa: std.mem.Allocator, e: *const Engine, extra: u64) !kv.Layout {
++    if (!pageable(e)) return error.NoPagedCaches;
+     const fixed = try state.State.pagedBytesOf(gpa, &e.w, e.capacity, tableLen(e.capacity), e.mtp);
+     const page = pageBytes(e);
+     return .{ .fixed_bytes = fixed + extra, .token_bytes = page / state.page_rows, .page_tokens = state.page_rows, .snap_bytes = 0 };
+@@ -25,6 +27,12 @@ pub fn pageBytes(e: *const Engine) u64 {
+     return state.pageBytesOf(&e.w, e.settings.kv8, e.mtp);
+ }
+ 
++/// Whether engine `e` has caches to page: a thin model of KDA layers alone (TF_GLM_LAYERS) without the target MTP head
++/// has none, so its sequences keep their windows (of no KV rows) whatever TF_KV_PAGES says.
++pub fn pageable(e: *const Engine) bool {
++    return pageBytes(e) > 0;
++}
++
+ /// A paged sequence of engine `e`'s format on the pages at `at`.
+ fn pagedState(e: *const Engine, at: state.Paged) !fw.State {
+     return fw.State.initPagedFormat(e.gpa, e.d, &e.w, e.capacity, at, e.settings.kv8, e.mtp);
+diff --git a/zig/src/families/glm/cuda_pages_test.zig b/zig/src/families/glm/cuda_pages_test.zig
+index 010f6cd3..ede81b1a 100644
+--- a/zig/src/families/glm/cuda_pages_test.zig
++++ b/zig/src/families/glm/cuda_pages_test.zig
+@@ -315,3 +315,41 @@ test "a request needing more pages than the whole pool is admitted at once and r
+     p.close(1);
+     try expect(p.fits(600, 100));
+ }
++
++test "TF_KV_PAGES on a model of KDA layers alone without the MTP head: nothing to page, so its layout is refused by name" {
++    var f: Fake = undefined;
++    try f.init(std.testing.allocator);
++    for (&f.layers) |*l| l.mixer = .{ .kda = undefined }; // TF_GLM_LAYERS=1: no DSA layer is loaded
++    for ([_]bool{ false, true }) |kv8| {
++        f.e.settings.kv8 = kv8;
++        f.e.mtp = false; // --no-drafts or DFlash2
++        try expectEqual(@as(u64, 0), pages_mod.pageBytes(&f.e)); // a zero-byte page: the pool's plan would divide by it
++        try expect(!pages_mod.pageable(&f.e)); // Engine.init keeps every stream's window instead
++        try std.testing.expectError(error.NoPagedCaches, pages_mod.layout(std.testing.allocator, &f.e, 0));
++        f.e.mtp = true; // the target MTP head's cache alone still pages
++        try expect(pages_mod.pageable(&f.e));
++        try expect((try pages_mod.layout(std.testing.allocator, &f.e, 0)).token_bytes > 0);
++    }
++    f.e.mtp = false;
++    f.layers[1].mixer = .{ .mla = undefined }; // one DSA layer pages without the head
++    try expect(pages_mod.pageable(&f.e));
++    try expect(@import("cuda_native.zig").explain(null, error.NoPagedCaches) != null);
++    try expectEqual(@as(usize, 0), f.e.seqs.items.len); // nothing was made for it
++}
++
++test "capacity keeps a request exactly at --context: prompt + max_tokens == context passes the opening and prompt checks" {
++    const native = @import("cuda_native.zig");
++    for ([_]usize{ 8184, 8192, 8191, 245_760, 864_256, 1_048_576 }) |context| {
++        const cap = native.capacity(context);
++        for ([_]usize{ 1, 184, context / 2 }) |max_new| {
++            const prompt = context - max_new;
++            try expect(Lanes.fitsContext(prompt, max_new, cap));
++            const rows = pages_mod.tableLen(prompt + max_new + 8) * @import("cuda_state.zig").page_rows; // its pages' rows
++            try expect(Engine.promptFits(prompt, @min(rows, cap))); // a paged stream's capacity (Pages.mapped)
++            try expect(Engine.promptFits(prompt + max_new, cap)); // a prompt-only turn at the context too
++        }
++        try expect(!Lanes.fitsContext(cap - 8, 1, cap)); // a window past the capacity
++        try expect(!Engine.promptFits(cap - 7, cap));
++        try expect(!Engine.promptFits(0, cap));
++    }
++}
+diff --git a/zig/src/families/glm/cuda_prompts.zig b/zig/src/families/glm/cuda_prompts.zig
+index 0e076d75..eef2e895 100644
+--- a/zig/src/families/glm/cuda_prompts.zig
++++ b/zig/src/families/glm/cuda_prompts.zig
+@@ -10,7 +10,7 @@ pub fn fits(parts: []const engine.Prompt, capacity: usize) bool {
+     if (parts.len == 0 or parts.len > engine.max_together) return false;
+     var rows: usize = 0;
+     for (parts, 0..) |p, i| {
+-        if (p.ids.len == 0 or p.ids.len > fw.prefill_rows or p.ids.len + fw.window_rows >= capacity) return false;
++        if (p.ids.len == 0 or p.ids.len > fw.prefill_rows or p.ids.len + fw.window_rows > capacity) return false;
+         for (parts[0..i]) |q| if (q.slot == p.slot) return false;
+         rows += p.ids.len;
+     }
+-- 
+2.53.0
+

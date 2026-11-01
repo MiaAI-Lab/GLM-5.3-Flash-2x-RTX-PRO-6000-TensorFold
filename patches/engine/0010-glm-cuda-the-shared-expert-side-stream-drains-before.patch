@@ -1,0 +1,58 @@
+From 2defaf4e0dd02852736c6a601ced4a40b8e3fcec Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 14:38:08 +0200
+Subject: [PATCH 10/13] glm cuda: the shared-expert side stream drains before
+ its work's buffers can go
+
+A decode window's MoE block forks the shared expert onto Engine.side and joins it in the
+fill. If anything failed between the fork and the join, the side stream could still be
+running when the caller reused the block's scratch, and teardown synchronized only the main
+stream before freeing buffers and weights. moe.body now synchronizes the side stream on any
+error from the fork on; Engine.deinit drains it right after the main stream, and init's
+error path drains it before the buffers' errdefers run. Successful calls are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNmHb8tWDWv2KnBDVCM
+---
+ zig/src/families/glm/cuda_engine.zig | 2 ++
+ zig/src/families/glm/cuda_moe.zig    | 5 ++++-
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index d1a1a50f..6103b81a 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -203,12 +203,14 @@ pub const Engine = struct {
+         e.shared_buf = try cuda.DeviceBuffer.alloc(d, 8);
+         errdefer e.shared_buf.free();
+         errdefer @import("cuda_load_owner.zig").drain(stream, d);
++        errdefer if (e.side) |x| @import("cuda_load_owner.zig").drain(x.s, d); // before the buffers it reads go
+         try e.stream.synchronize();
+         return e;
+     }
+ 
+     pub fn deinit(e: *Engine) void {
+         e.stream.synchronize() catch {};
++        if (e.side) |x| x.s.synchronize() catch {}; // shared-expert work still in flight reads buffers and weights freed below
+         e.gpa.free(e.packs.ptrs);
+         e.gpa.free(e.packs.bits);
+         if (e.drafter) |dr| dr.deinit();
+diff --git a/zig/src/families/glm/cuda_moe.zig b/zig/src/families/glm/cuda_moe.zig
+index c215b8f8..ace54a05 100644
+--- a/zig/src/families/glm/cuda_moe.zig
++++ b/zig/src/families/glm/cuda_moe.zig
+@@ -64,7 +64,10 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
+     const d = l.routed.dims;
+     const slots = l.top_k + 1;
+     const shared_id: i32 = @intCast(l.count);
+-    if (forks(k, prompt)) { // the shared expert of every row on the side stream, from the block's input as it stands now
++    const forked = forks(k, prompt);
++    // a failure from the fork on leaves no side work behind it: the caller may reuse the scratch or free the buffers
++    errdefer if (forked) k.side.?.s.synchronize() catch {};
++    if (forked) { // the shared expert of every row on the side stream, from the block's input as it stands now
+         const sd = k.side.?;
+         try sd.fork.record(stream);
+         try sd.s.wait(sd.fork);
+-- 
+2.53.0
+

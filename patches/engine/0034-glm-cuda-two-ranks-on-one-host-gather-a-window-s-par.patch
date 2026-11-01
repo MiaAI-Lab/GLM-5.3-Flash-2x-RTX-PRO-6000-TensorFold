@@ -1,0 +1,557 @@
+From 990c761ef82bab4babc5e9f509258a7edb7822e0 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Fri, 30 Oct 2026 15:54:51 +0200
+Subject: [PATCH 34/63] glm cuda: two ranks on one host gather a window's
+ partials by peer stores, not NCCL
+
+At TP=2 on one host, every all-gather on the engine stream of at most 512 KiB a rank (a decode or verify window's
+fp32 partials, up to 32 shared rows; the drafter's partials and top lists; the greedy pick's pairs) goes through
+tp_group's new p2p hook instead of ncclAllGather. Each rank's tf_glm_p2p_gather blocks store its share into the
+peer's inbox (CUDA IPC, mapped at startup), release a flag line there, acquire their own, and copy the peer's share
+into the gathered buffer. The gathered buffer holds the same bytes in the same slots, and hcPost sums them in rank
+order as before, so the bits are unchanged. Two parities keep consecutive epochs apart (the host's
+epoch counter skips 0, the flags' initial value, by wrapping to 2, so the parities alternate across the wrap too); a
+wait past TF_GLM_P2P_GATHER_TIMEOUT_S (60) or an aborted group writes a status word that Group.check raises.
+
+Both ranks always meet in the setup exchange; a rank that wants it off (TF_GLM_P2P_GATHER=0) or cannot map the
+other's memory leaves both on NCCL. Larger gathers and other streams' stay on NCCL. TF_GLM_P2P_GATHER_MAX_KB caps it.
+
+Measured on 2x RTX PRO 6000 (PCIe Gen5 x8 each, PHB): 16 KiB a rank 3.2-3.6 us a launched call against
+ncclAllGather's 10.3 us; in a 90-site decode-shaped chain 3.3 against 6.1 us exposed at one row, 8.4 against 16.9
+at eight. Kernel check (3000 mixed-size calls, 16 B to 512 KiB): no mismatch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UQVvNj6TMcvsfVhxuBcBLg
+---
+ zig/kernels/cuda/glm_glue.cu         |   1 +
+ zig/kernels/cuda/glm_glue_p2p.cuh    |  79 ++++++++++++
+ zig/src/cuda/ipc.zig                 |  36 ++++++
+ zig/src/cuda/p2p_gather.zig          | 181 +++++++++++++++++++++++++++
+ zig/src/cuda/root.zig                |   2 +
+ zig/src/cuda/tp_group.zig            |  13 ++
+ zig/src/families/glm/cuda.zig        |   1 +
+ zig/src/families/glm/cuda_glue.zig   |   1 +
+ zig/src/families/glm/cuda_native.zig |   5 +
+ zig/src/families/glm/cuda_p2p.zig    |  64 ++++++++++
+ 10 files changed, 383 insertions(+)
+ create mode 100644 zig/kernels/cuda/glm_glue_p2p.cuh
+ create mode 100644 zig/src/cuda/ipc.zig
+ create mode 100644 zig/src/cuda/p2p_gather.zig
+ create mode 100644 zig/src/families/glm/cuda_p2p.zig
+
+diff --git a/zig/kernels/cuda/glm_glue.cu b/zig/kernels/cuda/glm_glue.cu
+index 06f2ba94..1b78ab59 100644
+--- a/zig/kernels/cuda/glm_glue.cu
++++ b/zig/kernels/cuda/glm_glue.cu
+@@ -8,3 +8,4 @@
+ #include "glm_glue_index.cuh"
+ #include "glm_glue_bmm.cuh"
+ #include "glm_glue_attn.cuh"
++#include "glm_glue_p2p.cuh"
+diff --git a/zig/kernels/cuda/glm_glue_p2p.cuh b/zig/kernels/cuda/glm_glue_p2p.cuh
+new file mode 100644
+index 00000000..e8172531
+--- /dev/null
++++ b/zig/kernels/cuda/glm_glue_p2p.cuh
+@@ -0,0 +1,79 @@
++// Two ranks on one host: a small all-gather as one-shot stores into the peer's memory (cuda/p2p_gather.zig).
++#pragma once
++
++#include <stdint.h>
++
++namespace glm_p2p {
++
++constexpr int kMaxBlocks = 32;  // p2p_gather.zig max_blocks: a flag line per block and parity
++constexpr int kFlagWords = 32;  // one 128-byte line a flag
++
++__device__ __forceinline__ uint32_t ld_acquire_sys(const uint32_t* p) {
++  uint32_t v;
++  asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
++  return v;
++}
++__device__ __forceinline__ void st_release_sys(uint32_t* p, uint32_t v) {
++  asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
++}
++__device__ __forceinline__ uint32_t ld_volatile(const uint32_t* p) {
++  uint32_t v;
++  asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
++  return v;
++}
++__device__ __forceinline__ void st_volatile(uint32_t* p, uint32_t v) {
++  asm volatile("st.volatile.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
++}
++__device__ __forceinline__ uint64_t now_ns() {
++  uint64_t t;
++  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
++  return t;
++}
++
++}  // namespace glm_p2p
++
++// all = [rank 0's packs][rank 1's]: block b stores its share of `mine` in the peer's inbox (parity epoch & 1),
++// releases its flag there, acquires its own flag, then copies the peer's share from its inbox to all[peer].
++// A rank reaches epoch e + 2 only after the peer's e + 1 flag, so a parity's slot is never written while read.
++// A wait past timeout_ns or a raised abort word (status[0]) writes the epoch to status[1]; the host checks it.
++extern "C" __global__ void __launch_bounds__(512) tf_glm_p2p_gather(const uint4* mine, uint4* all, int64_t n16,
++                                                                     int rank, int copy_mine, uint4* peer_inbox,
++                                                                     uint32_t* peer_flags, const uint4* my_inbox,
++                                                                     const uint32_t* my_flags, int64_t slot16,
++                                                                     uint32_t epoch, uint64_t timeout_ns,
++                                                                     uint32_t* status) {
++  using namespace glm_p2p;
++  const int b = blockIdx.x;
++  const int64_t per = (n16 + gridDim.x - 1) / gridDim.x;
++  const int64_t lo = min(n16, (int64_t)b * per), hi = min(n16, lo + per);
++  const int par = epoch & 1;
++  uint4* to = peer_inbox + par * slot16;
++  for (int64_t i = lo + threadIdx.x; i < hi; i += blockDim.x) to[i] = mine[i];
++  if (copy_mine)
++    for (int64_t i = lo + threadIdx.x; i < hi; i += blockDim.x) all[rank * n16 + i] = mine[i];
++  __shared__ int ok;
++  __syncthreads();
++  if (threadIdx.x == 0) {
++    __threadfence_system();
++    st_release_sys(peer_flags + (par * kMaxBlocks + b) * kFlagWords, epoch);
++    const uint32_t* f = my_flags + (par * kMaxBlocks + b) * kFlagWords;
++    int good = 1;
++    uint64_t t0 = 0;
++    for (uint32_t spins = 1; (int32_t)(ld_acquire_sys(f) - epoch) < 0; ++spins) {
++      if ((spins & 1023) != 0) continue;
++      const uint64_t t = now_ns();
++      if (t0 == 0) t0 = t;
++      if (t - t0 > timeout_ns || ld_volatile(status) != 0) {
++        good = 0;
++        break;
++      }
++    }
++    if (!good) st_volatile(status + 1, epoch);
++    ok = good;
++  }
++  __syncthreads();
++  if (!ok) return;
++  const uint4* from = my_inbox + par * slot16;
++  uint4* out = all + (1 - rank) * n16;
++  for (int64_t i = lo + threadIdx.x; i < hi; i += blockDim.x) out[i] = __ldcg(from + i);
++}
+diff --git a/zig/src/cuda/ipc.zig b/zig/src/cuda/ipc.zig
+new file mode 100644
+index 00000000..beba2e02
+--- /dev/null
++++ b/zig/src/cuda/ipc.zig
+@@ -0,0 +1,36 @@
++//! CUDA IPC and stream memory operations that abi.Api does not carry, looked up apart so an older table stays whole.
++const std = @import("std");
++const abi = @import("abi.zig");
++
++pub const Handle = extern struct { reserved: [64]u8 };
++
++/// CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS
++pub const lazy_enable_peer_access: c_uint = 1;
++/// CU_STREAM_WAIT_VALUE_GEQ
++pub const wait_geq: c_uint = 0;
++/// CU_STREAM_WRITE_VALUE_DEFAULT: a system-wide memory fence on the stream before the write
++pub const write_default: c_uint = 0;
++
++pub const Ipc = struct {
++    lib: std.DynLib,
++    get: *const fn (*Handle, abi.DevicePtr) callconv(.c) abi.Result,
++    open: *const fn (*abi.DevicePtr, Handle, c_uint) callconv(.c) abi.Result,
++    close: *const fn (abi.DevicePtr) callconv(.c) abi.Result,
++    range: *const fn (*abi.DevicePtr, *usize, abi.DevicePtr) callconv(.c) abi.Result,
++    wait32: *const fn (abi.Stream, abi.DevicePtr, u32, c_uint) callconv(.c) abi.Result,
++    write32: *const fn (abi.Stream, abi.DevicePtr, u32, c_uint) callconv(.c) abi.Result,
++
++    pub fn load() !Ipc {
++        var lib = std.DynLib.open("libcuda.so.1") catch return error.DriverUnavailable;
++        errdefer lib.close();
++        return .{
++            .get = lib.lookup(@FieldType(Ipc, "get"), "cuIpcGetMemHandle") orelse return error.MissingSymbol,
++            .open = lib.lookup(@FieldType(Ipc, "open"), "cuIpcOpenMemHandle_v2") orelse return error.MissingSymbol,
++            .close = lib.lookup(@FieldType(Ipc, "close"), "cuIpcCloseMemHandle") orelse return error.MissingSymbol,
++            .range = lib.lookup(@FieldType(Ipc, "range"), "cuMemGetAddressRange_v2") orelse return error.MissingSymbol,
++            .wait32 = lib.lookup(@FieldType(Ipc, "wait32"), "cuStreamWaitValue32_v2") orelse return error.MissingSymbol,
++            .write32 = lib.lookup(@FieldType(Ipc, "write32"), "cuStreamWriteValue32_v2") orelse return error.MissingSymbol,
++            .lib = lib,
++        };
++    }
++};
+diff --git a/zig/src/cuda/p2p_gather.zig b/zig/src/cuda/p2p_gather.zig
+new file mode 100644
+index 00000000..d0ece46a
+--- /dev/null
++++ b/zig/src/cuda/p2p_gather.zig
+@@ -0,0 +1,181 @@
++//! Two ranks on one host: a stream's small all-gathers as one-shot stores into the peer's memory (CUDA IPC), no NCCL.
++const std = @import("std");
++const abi = @import("abi.zig");
++const Driver = @import("driver.zig").Driver;
++const memory = @import("memory.zig");
++const launch = @import("launch.zig");
++const Function = @import("module.zig").Function;
++const Stream = @import("stream.zig").Stream;
++const tp_group = @import("tp_group.zig");
++
++/// glm_glue_p2p.cuh's kMaxBlocks and kFlagWords: a 128-byte flag line per block and parity.
++pub const max_blocks = 32;
++const flag_bytes = 128;
++const threads = 512;
++const block_bytes = 8 << 10; // a block a share of this many bytes, up to max_blocks
++
++const ipc_mod = @import("ipc.zig");
++const Ipc = ipc_mod.Ipc;
++const IpcHandle = ipc_mod.Handle;
++const ipc_lazy_enable_peer_access = ipc_mod.lazy_enable_peer_access;
++
++/// A rank's region: inbox [2 parities][cap bytes], then flags [2 parities][max_blocks][128 bytes].
++pub fn regionBytes(cap: usize) usize {
++    return 2 * cap + 2 * max_blocks * flag_bytes;
++}
++
++/// Blocks for `bytes` a rank: one per 8 KiB share, 1 to max_blocks; both ranks compute it from the size alone.
++pub fn blocksFor(bytes: usize) u32 {
++    return @intCast(std.math.clamp(std.math.divCeil(usize, bytes, block_bytes) catch 1, 1, max_blocks));
++}
++
++/// The epoch after `e`: 0 is the flags' initial value, so the wrap goes 0xFFFFFFFF -> 2, which keeps the parities
++/// alternating (a second odd epoch in a row would store into the inbox slot the peer may still be reading).
++pub fn nextEpoch(e: u32) u32 {
++    const n = e +% 1;
++    return if (n == 0) 2 else n;
++}
++
++/// What a rank tells the other while the two set up: wanted and ready, its cap, its region's handle.
++const Offer = extern struct { ok: u32, cap_kib: u32, handle: IpcHandle };
++
++pub const Gather = struct {
++    d: *const Driver,
++    gpa: std.mem.Allocator,
++    ipc: Ipc,
++    f: Function,
++    stream: abi.Stream, // the one stream whose gathers come this way; any other stream's stay on NCCL
++    rank: u32,
++    cap: usize, // bytes a rank at most (the smaller rank's), a multiple of 16
++    region: abi.DevicePtr = 0, // this rank's inbox and flags (the peer writes them)
++    peer: abi.DevicePtr = 0, // the peer's region, opened through its handle
++    status: memory.HostBuffer, // mapped words: [0] abort (the host raises it), [1] a failed wait's epoch (the GPU)
++    status_dev: abi.DevicePtr,
++    timeout_ns: u64,
++    epoch: u32 = 1,
++    gathers: u64 = 0,
++
++    /// Both ranks call it; it returns a gather only when both wanted it and both mapped the other's region.
++    pub fn open(gpa: std.mem.Allocator, d: *const Driver, g: *const tp_group.Group, s: Stream, f: Function, wanted: bool, cap: usize, timeout_ns: u64) !?*Gather {
++        if (g.world != 2) return null;
++        const self = try gpa.create(Gather);
++        var keep = false;
++        defer if (!keep) gpa.destroy(self);
++        self.* = .{ .d = d, .gpa = gpa, .ipc = undefined, .f = f, .stream = s.handle, .rank = @intCast(g.rank), .cap = cap / 16 * 16, .status = undefined, .status_dev = 0, .timeout_ns = timeout_ns };
++        var mine: Offer = .{ .ok = 0, .cap_kib = @intCast(self.cap >> 10), .handle = std.mem.zeroes(IpcHandle) };
++        var have_ipc = false;
++        var have_status = false;
++        if (wanted and self.cap >= 16) prepare: {
++            self.ipc = Ipc.load() catch break :prepare;
++            have_ipc = true;
++            self.status = memory.HostBuffer.allocMapped(d, 4096) catch break :prepare;
++            have_status = true;
++            @memset(self.status.bytes, 0);
++            self.status_dev = self.status.device() catch break :prepare;
++            if (d.api.cuMemAlloc_v2(&self.region, regionBytes(self.cap)) != abi.success) {
++                self.region = 0;
++                break :prepare;
++            }
++            if (d.api.cuMemsetD8_v2(self.region, 0, regionBytes(self.cap)) != abi.success) break :prepare;
++            if (self.ipc.get(&mine.handle, self.region) != abi.success) break :prepare;
++            mine.ok = 1;
++        }
++        var both: [2]Offer = undefined;
++        try g.gather(Offer, d, s, mine, &both);
++        const peer = both[1 - self.rank];
++        var opened: u32 = 0;
++        if (mine.ok == 1 and peer.ok == 1) {
++            self.cap = @as(usize, @min(mine.cap_kib, peer.cap_kib)) << 10; // both ranks test the same cap
++            if (self.ipc.open(&self.peer, peer.handle, ipc_lazy_enable_peer_access) == abi.success) opened = 1 else self.peer = 0;
++        }
++        var agreed: [2]u32 = undefined;
++        try g.gather(u32, d, s, opened, &agreed);
++        if (agreed[0] == 1 and agreed[1] == 1) {
++            keep = true;
++            return self;
++        }
++        if (self.peer != 0) _ = self.ipc.close(self.peer);
++        if (self.region != 0) _ = d.api.cuMemFree_v2(self.region);
++        if (have_status) self.status.free();
++        if (have_ipc) self.ipc.lib.close();
++        return null;
++    }
++
++    /// Whether a gather on `s` of `bytes` a rank goes this way: stream and size alone decide, alike on both ranks.
++    pub fn fits(x: *const Gather, s: abi.Stream, bytes: usize) bool {
++        return s == x.stream and bytes > 0 and bytes <= x.cap and bytes % 16 == 0;
++    }
++
++    /// Both ranks' `bytes` from `mine` into `all` in rank order (as ncclAllGather); misaligned is an error.
++    pub fn gather(x: *Gather, s: Stream, mine: abi.DevicePtr, all: abi.DevicePtr, bytes: usize) !void {
++        if (mine % 16 != 0 or all % 16 != 0) return error.Misaligned;
++        const flags = x.cap * 2;
++        var a: launch.Args = .{};
++        a.add(mine);
++        a.add(all);
++        a.add(@as(i64, @intCast(bytes / 16)));
++        a.add(@as(c_int, @intCast(x.rank)));
++        a.add(@as(c_int, @intFromBool(mine != all + x.rank * bytes)));
++        a.add(x.peer);
++        a.add(x.peer + flags);
++        a.add(x.region);
++        a.add(x.region + flags);
++        a.add(@as(i64, @intCast(x.cap / 16)));
++        a.add(x.epoch);
++        a.add(x.timeout_ns);
++        a.add(x.status_dev);
++        try launch.launch(x.f, .{ .grid = .{ .x = blocksFor(bytes) }, .block = .{ .x = threads } }, s, &a);
++        x.epoch = nextEpoch(x.epoch);
++        x.gathers += 1;
++    }
++
++    /// An error if a wait timed out or was aborted on the GPU (the host checks after a synchronize that reads a gather).
++    pub fn check(x: *const Gather) !void {
++        const words = x.status.slice(u32);
++        const bad = @atomicLoad(u32, &words[1], .acquire);
++        if (bad == 0) return;
++        std.log.err("P2P all-gather {d} of rank {d} waited past its limit or was aborted: the peer never wrote it", .{ bad, x.rank });
++        return error.P2pGatherFailed;
++    }
++
++    /// Raised from any thread: a kernel still waiting for the peer gives up within a few microseconds.
++    pub fn abort(x: *Gather) void {
++        @atomicStore(u32, &x.status.slice(u32)[0], 1, .release);
++    }
++
++    pub fn deinit(x: *Gather) void {
++        if (x.peer != 0) _ = x.ipc.close(x.peer);
++        if (x.region != 0) _ = x.d.api.cuMemFree_v2(x.region);
++        x.status.free();
++        x.ipc.lib.close();
++        x.gpa.destroy(x);
++    }
++};
++
++test "both ranks take the same grid and path from the size alone" {
++    try std.testing.expectEqual(@as(u32, 1), blocksFor(16));
++    try std.testing.expectEqual(@as(u32, 2), blocksFor(16 << 10));
++    try std.testing.expectEqual(@as(u32, 16), blocksFor(128 << 10));
++    try std.testing.expectEqual(@as(u32, max_blocks), blocksFor(512 << 10));
++    try std.testing.expectEqual(@as(u32, max_blocks), blocksFor(4 << 20));
++    try std.testing.expectEqual(@as(usize, 2 * (512 << 10) + 2 * 32 * 128), regionBytes(512 << 10));
++    var x: Gather = undefined;
++    x.stream = null;
++    x.cap = 512 << 10;
++    try std.testing.expect(x.fits(null, 16 << 10));
++    try std.testing.expect(!x.fits(null, (512 << 10) + 16));
++    try std.testing.expect(!x.fits(null, 24));
++    try std.testing.expect(!x.fits(null, 0));
++}
++
++test "epochs never take 0 and their parities alternate across the wrap" {
++    var e: u32 = 0xFFFF_FFFD;
++    for (0..6) |_| {
++        const n = nextEpoch(e);
++        try std.testing.expect(n != 0);
++        try std.testing.expect((n & 1) != (e & 1));
++        try std.testing.expect(@as(i32, @bitCast(n -% e)) > 0); // the kernel's wait reads it as later
++        e = n;
++    }
++    try std.testing.expectEqual(@as(u32, 2), nextEpoch(0xFFFF_FFFF));
++}
+diff --git a/zig/src/cuda/root.zig b/zig/src/cuda/root.zig
+index 5489b019..ce332958 100644
+--- a/zig/src/cuda/root.zig
++++ b/zig/src/cuda/root.zig
+@@ -55,6 +55,7 @@ pub const sample = @import("sample.zig");
+ pub const rank_scatter = @import("rank_scatter.zig");
+ pub const relay_plan = @import("relay_plan.zig");
+ pub const tp_group = @import("tp_group.zig");
++pub const p2p_gather = @import("p2p_gather.zig");
+ pub const tp_watch = @import("tp_watch.zig");
+ pub const p2p_report = @import("p2p_report.zig");
+ pub const ck = @import("ck.zig");
+@@ -102,6 +103,7 @@ test {
+     _ = @import("experts_waves.zig");
+     _ = @import("sample.zig");
+     _ = @import("roce.zig");
++    _ = @import("p2p_gather.zig");
+     _ = @import("roce_nap.zig");
+     _ = @import("rank_scatter.zig");
+     _ = @import("relay_plan.zig");
+diff --git a/zig/src/cuda/tp_group.zig b/zig/src/cuda/tp_group.zig
+index 749522d1..0c8b82ed 100644
+--- a/zig/src/cuda/tp_group.zig
++++ b/zig/src/cuda/tp_group.zig
+@@ -6,6 +6,8 @@ const stream_ = @import("stream.zig");
+ const memory = @import("memory.zig");
+ const roce = @import("roce.zig");
+ const p2p_report = @import("p2p_report.zig");
++const p2p_gather = @import("p2p_gather.zig");
++const Function = @import("module.zig").Function;
+ 
+ const Stream = stream_.Stream;
+ 
+@@ -16,6 +18,7 @@ pub const Group = struct {
+     world: usize,
+     aborted: std.atomic.Value(bool) = .init(false),
+     fast: ?*roce.Gather = null, // two ranks' small all-gathers by RoCE writes (openRoce), when both ranks brought it up
++    p2p: ?*p2p_gather.Gather = null, // two ranks on one host: one stream's small all-gathers by peer stores (openP2p)
+ 
+     /// Rank `rank` of `world` (NCCL opened at run time; NCCL_COMM_ID names rank 0's address, every rank the same).
+     pub fn open(d: *const driver.Driver, rank: usize, world: usize) !Group {
+@@ -35,6 +38,7 @@ pub const Group = struct {
+ 
+     pub fn close(g: *Group) void {
+         p2p_report.ready(); // a transport line still owed is reported before the communicator goes
++        if (g.p2p) |p| p.deinit();
+         if (g.fast) |f| f.deinit();
+         g.destroyComm();
+         g.lib.close();
+@@ -46,9 +50,16 @@ pub const Group = struct {
+     }
+ 
+     pub fn abort(g: *Group) void {
++        if (g.p2p) |p| p.abort(); // a peer-store gather still waiting gives up too
+         if (!g.aborted.swap(true, .acq_rel)) _ = g.lib.api.ncclCommAbort(g.comm);
+     }
+ 
++    /// Two ranks on one host: gathers on `s` up to `cap` bytes a rank go by peer stores if both ranks want and map it.
++    pub fn openP2p(g: *Group, gpa: std.mem.Allocator, d: *const driver.Driver, s: Stream, f: Function, wanted: bool, cap: usize, timeout_ns: u64) !void {
++        if (g.world != 2 or g.p2p != null) return;
++        g.p2p = try p2p_gather.Gather.open(gpa, d, g, s, f, wanted, cap, timeout_ns);
++    }
++
+     /// Two ranks: gathers up to `max_bytes` a rank go by RoCE writes if both ranks bring it up; else NCCL keeps them.
+     pub fn openRoce(g: *Group, gpa: std.mem.Allocator, io: std.Io, d: *const driver.Driver, s: Stream, max_bytes: usize) !void {
+         if (g.world != 2 or g.fast != null) return;
+@@ -57,11 +68,13 @@ pub const Group = struct {
+ 
+     /// A failed RoCE gather's error (its rows hold nothing valid): call it after a synchronize that reads a gather.
+     pub fn check(g: *const Group) !void {
++        if (g.p2p) |p| try p.check();
+         if (g.fast) |f| try f.check();
+     }
+ 
+     /// `bytes` at `mine` from every rank into `all` in rank order (world * bytes there), on `s`.
+     pub fn allGather(g: *const Group, s: Stream, mine: u64, all: u64, bytes: usize) !void {
++        if (g.p2p) |p| if (p.fits(s.handle, bytes)) return p.gather(s, mine, all, bytes);
+         if (g.fast) |f| if (f.fits(bytes)) return f.gather(s.handle, mine, all, bytes);
+         try g.lib.check(g.lib.api.ncclAllGather(mine, all, bytes, .u8, g.comm, s.handle), "ncclAllGather");
+     }
+diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
+index 3d551201..ccb7d3f0 100644
+--- a/zig/src/families/glm/cuda.zig
++++ b/zig/src/families/glm/cuda.zig
+@@ -48,6 +48,7 @@ test {
+     _ = @import("cuda_images_interleave_test.zig");
+     _ = @import("cuda_pages_test.zig");
+     _ = @import("cuda_ranks_test.zig");
++    _ = @import("cuda_p2p.zig");
+     _ = experts;
+     _ = exl3;
+     _ = vision;
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index 33f1b488..1aa6cd94 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -26,6 +26,7 @@ pub const Kernels = struct {
+     top1: cuda.Function,
+     top1_sums: cuda.Function,
+     put_words: cuda.Function,
++    p2p_gather: cuda.Function, // the TP group's peer-store all-gather (cuda/p2p_gather.zig)
+     embed_b16: cuda.Function,
+     conv_shift: cuda.Function,
+     swiglu_512: cuda.Function,
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index 8d3a4339..0b71c420 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -267,6 +267,11 @@ fn finishRank(a: OpenArgs) !Loaded {
+     }
+     try own.group.openRoce(gpa, io, ctx.d, own.e.stream, roce_bytes); // both ranks bring it up or neither does
+     errdefer if (own.group.fast) |f| f.deinit();
++    try @import("cuda_p2p.zig").open(gpa, ctx.d, &own.group, own.e.stream, own.e.m.glue.p2p_gather); // both ranks, or neither
++    errdefer if (own.group.p2p) |x| {
++        x.deinit();
++        own.group.p2p = null;
++    };
+     own.e.group = &own.group;
+     own.link = try follow.Link.init(gpa, ctx.d, &own.group.lib, own.group.comm, own.e.stream, try linkCapacity(cap, o.vision));
+     errdefer own.link.deinit();
+diff --git a/zig/src/families/glm/cuda_p2p.zig b/zig/src/families/glm/cuda_p2p.zig
+new file mode 100644
+index 00000000..3c7bfdca
+--- /dev/null
++++ b/zig/src/families/glm/cuda_p2p.zig
+@@ -0,0 +1,64 @@
++//! GLM's two ranks on one host: the decode and verify all-gathers by peer stores (cuda/p2p_gather.zig), not NCCL.
++const std = @import("std");
++const cuda = @import("cuda");
++
++/// TF_GLM_P2P_GATHER (1 on, 0 off), TF_GLM_P2P_GATHER_MAX_KB (a rank's largest share) and _TIMEOUT_S (a wait's limit).
++pub const Settings = struct {
++    on: bool = true,
++    cap: usize = 512 << 10, // 32 rows of 4096 fp32 partials: the widest shared window (cuda_engine.shared_rows)
++    timeout_ns: u64 = 60 * std.time.ns_per_s,
++
++    pub fn read(get: *const fn ([:0]const u8) ?[]const u8) !Settings {
++        var s: Settings = .{};
++        if (get("TF_GLM_P2P_GATHER")) |v| s.on = if (std.mem.eql(u8, v, "1")) true else if (std.mem.eql(u8, v, "0")) false else return error.BadP2pGather;
++        if (get("TF_GLM_P2P_GATHER_MAX_KB")) |v| {
++            const kib = std.fmt.parseInt(usize, v, 10) catch return error.BadP2pGather;
++            if (kib == 0 or kib > 16 << 10) return error.BadP2pGather;
++            s.cap = kib << 10;
++        }
++        if (get("TF_GLM_P2P_GATHER_TIMEOUT_S")) |v| {
++            const secs = std.fmt.parseInt(u64, v, 10) catch return error.BadP2pGather;
++            if (secs == 0 or secs > 3600) return error.BadP2pGather;
++            s.timeout_ns = secs * std.time.ns_per_s;
++        }
++        return s;
++    }
++};
++
++fn environment(name: [:0]const u8) ?[]const u8 {
++    return std.mem.span(std.c.getenv(name) orelse return null);
++}
++
++/// Both ranks call it after NCCL and the engine are up; a rank that wants it off, or cannot map it, keeps both on NCCL.
++pub fn open(gpa: std.mem.Allocator, d: *const cuda.Driver, g: *cuda.tp_group.Group, s: cuda.Stream, f: cuda.Function) !void {
++    if (g.world != 2 or g.fast != null) return; // RoCE already carries a two-host pair's small gathers
++    // a bad value turns it off on this rank: the other rank still meets it in openP2p's exchange, so neither waits
++    const set = Settings.read(&environment) catch blk: {
++        std.log.err("TF_GLM_P2P_GATHER: 0 or 1; TF_GLM_P2P_GATHER_MAX_KB: 1 to 16384; TF_GLM_P2P_GATHER_TIMEOUT_S: 1 to 3600 (off)", .{});
++        break :blk Settings{ .on = false };
++    };
++    try g.openP2p(gpa, d, s, f, set.on, set.cap, set.timeout_ns);
++    if (g.p2p) |p| std.log.info("p2p gather: the engine stream's all-gathers up to {d} KiB a rank by peer stores (TF_GLM_P2P_GATHER=0: NCCL)", .{p.cap >> 10}) else std.log.info("p2p gather: off ({s}); NCCL carries every all-gather", .{if (set.on) "a rank could not map the other's memory" else "TF_GLM_P2P_GATHER=0 on a rank"});
++}
++
++test "settings: on by default at 512 KiB, each knob checked" {
++    const F = struct {
++        var pairs: []const [2][]const u8 = &.{};
++        fn get(name: [:0]const u8) ?[]const u8 {
++            for (pairs) |p| if (std.mem.eql(u8, p[0], name)) return p[1];
++            return null;
++        }
++    };
++    F.pairs = &.{};
++    const d = try Settings.read(&F.get);
++    try std.testing.expect(d.on);
++    try std.testing.expectEqual(@as(usize, 512 << 10), d.cap);
++    F.pairs = &.{ .{ "TF_GLM_P2P_GATHER", "0" }, .{ "TF_GLM_P2P_GATHER_MAX_KB", "64" } };
++    const o = try Settings.read(&F.get);
++    try std.testing.expect(!o.on);
++    try std.testing.expectEqual(@as(usize, 64 << 10), o.cap);
++    F.pairs = &.{.{ "TF_GLM_P2P_GATHER", "yes" }};
++    try std.testing.expectError(error.BadP2pGather, Settings.read(&F.get));
++    F.pairs = &.{.{ "TF_GLM_P2P_GATHER_MAX_KB", "0" }};
++    try std.testing.expectError(error.BadP2pGather, Settings.read(&F.get));
++}
+-- 
+2.53.0
+

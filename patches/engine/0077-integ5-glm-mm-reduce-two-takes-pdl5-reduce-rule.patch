@@ -1,0 +1,92 @@
+integ5: glm_mm_reduce_two (glue5's two-problem reduce) takes pdl5's reduce rule (TF_GLM_PDL_CHAIN's reduce).
+
+- glm_mm.cu: glm_mm_reduce_two calls qmm_frag::grid_wait() right after its existing qmm_frag::grid_launch(), before it
+  reads `part`, writes `out` or exits, exactly as pdl5 0067 made glm_mm_reduce do.
+- cuda_mm.matmulTwo: the reduce launches with `.pdl = k.chain.reduce`, as matmul's reduce does since pdl5 0067 (the
+  two-problem matmul itself already launched with `.pdl = k.pdl`, as glm_mm). The shared expert's side stream never
+  calls matmulTwo (DSA prepare runs on the main stream).
+- glm_mm_policy_host.zig: the reduce's attribute follows chain.reduce at 1/8/32 rows (glue5's own test keeps the chain
+  off and still sees an ordinary launch).
+Without this the stack is correct too (an ordinary launch waits for the matmul), but the DSA layers' two-problem
+reduces would lose pdl5's reduce overlap (up to 2 a DSA layer, q_b's pair only with sparse rows: 11-22 a step). Exact by construction: the same arithmetic;
+every access to the matmul's partials after the wait. TF_GLM_PDL_CHAIN without `reduce`, or TF_GLM_PDL=0, launches
+it plainly; TF_GLM_MM_TWO=0 takes the two lone matmul + reduce launches instead.
+
+diff --git a/zig/glm_mm_policy_host.zig b/zig/glm_mm_policy_host.zig
+index 7a6edf4f..f053cbbe 100644
+--- a/zig/glm_mm_policy_host.zig
++++ b/zig/glm_mm_policy_host.zig
+@@ -141,7 +141,7 @@ test "decode two-problem launches keep each problem's split K, one reduce for bo
+         try std.testing.expect(cuda.configs[0].pdl);
+         try std.testing.expectEqual(@as(u32, 20000), cuda.symbols[1]);
+         try std.testing.expectEqual(@as(u32, @intCast((rows * sh[0] + 255) / 256 + (rows * sh[2] + 255) / 256)), cuda.configs[1].grid.x);
+-        try std.testing.expect(!cuda.configs[1].pdl); // as glm_mm_reduce: an ordinary launch
++        try std.testing.expect(!cuda.configs[1].pdl); // k.chain is off here: an ordinary launch (chain.reduce: below)
+         // the two problems' slices never overlap, and the scratch they need is no less than both calls' own
+         try std.testing.expect(mm.partBytes(rows, p[0].w) + mm.partBytes(rows, p[1].w) <= need);
+         // refusals: nothing launched
+@@ -176,3 +176,27 @@ test "decode two-problem launches keep each problem's split K, one reduce for bo
+     try std.testing.expectEqual(@as(usize, 1), cuda.count);
+     try std.testing.expectEqual(@as(u32, 192 + 197), cuda.configs[0].grid.x);
+ }
++
++test "TF_GLM_PDL_CHAIN: a two-problem call's reduce launches as the matmul's dependent only with chain.reduce" {
++    var two: [4][3]cuda.Function = undefined;
++    for (&two, 0..) |*ws, wi| for (ws, 0..) |*f, i| {
++        f.* = .{ .id = @intCast(10000 + wi * 10 + i) };
++    };
++    const p = [2]mm.Two{
++        .{ .x = 4096, .ldx = 4096, .w = .{ .w = 8192, .s = 12288, .n = 2048, .k = 4096, .bits = 8 }, .out = 1 << 20 },
++        .{ .x = 4096, .ldx = 4096, .w = .{ .w = 16384, .s = 20480, .n = 160, .k = 4096, .bits = 8 }, .out = 1 << 21 },
++    };
++    for ([_]bool{ false, true }) |on| for ([_]usize{ 1, 8, 32 }) |rows| {
++        var k = kernels;
++        k.two = two;
++        k.reduce_two = .{ .id = 20000 };
++        k.pdl = true;
++        k.chain.reduce = on;
++        cuda.count = 0;
++        try std.testing.expect(try mm.matmulTwo(&k, .{}, p, 1 << 24, 1 << 30, rows));
++        try std.testing.expectEqual(@as(usize, 2), cuda.count);
++        try std.testing.expect(cuda.configs[0].pdl); // the matmul's own, as glm_mm's
++        try std.testing.expectEqual(@as(u32, 20000), cuda.symbols[1]);
++        try std.testing.expectEqual(on, cuda.configs[1].pdl);
++    };
++}
+diff --git a/zig/kernels/cuda/glm_mm.cu b/zig/kernels/cuda/glm_mm.cu
+index aa844b65..cc57316f 100644
+--- a/zig/kernels/cuda/glm_mm.cu
++++ b/zig/kernels/cuda/glm_mm.cu
+@@ -315,7 +315,9 @@ GLM_MM_TWO(8)
+ GLM_MM_TWO(16)
+ 
+ // Both problems' K slices added in slice order, then rounded once: glm_mm_reduce's sums for each (x: problem 0's
+-// blocks, then problem 1's; a problem of one slice has none).
++// blocks, then problem 1's; a problem of one slice has none). Dependent launch (TF_GLM_PDL_CHAIN's reduce, as
++// glm_mm_reduce): it may start while the two-problem matmul that writes `part` runs, so every thread waits for that
++// grid before it reads `part` or writes `out` (or exits).
+ struct MmReduceTwo {
+     const float* part[2];
+     void* out[2];
+@@ -325,6 +327,7 @@ struct MmReduceTwo {
+ };
+ extern "C" __global__ void glm_mm_reduce_two(const MmReduceTwo r) {
+     qmm_frag::grid_launch();
++    qmm_frag::grid_wait();
+     const int z = (int)blockIdx.x >= r.blocks0 ? 1 : 0;
+     const long long i = (long long)((int)blockIdx.x - (z ? r.blocks0 : 0)) * blockDim.x + threadIdx.x;
+     const long long total = r.total[z];
+diff --git a/zig/src/families/glm/cuda_mm.zig b/zig/src/families/glm/cuda_mm.zig
+index 1aed3d1f..14d83c83 100644
+--- a/zig/src/families/glm/cuda_mm.zig
++++ b/zig/src/families/glm/cuda_mm.zig
+@@ -366,7 +366,8 @@ pub fn matmulTwo(k: *const Kernels, s: cuda.Stream, p: [2]Two, part: u64, part_b
+     r.f32 = 0;
+     var b: cuda.Args = .{};
+     b.add(r);
+-    try cuda.launch.launch(red, .{ .grid = .{ .x = @intCast(r.blocks0 + @divTrunc(r.total[1] + 255, 256)) }, .block = .{ .x = 256 } }, s, &b);
++    // with chain.reduce it may start while the matmul runs: it waits for it before reading `part` (as matmul's reduce)
++    try cuda.launch.launch(red, .{ .grid = .{ .x = @intCast(r.blocks0 + @divTrunc(r.total[1] + 255, 256)) }, .block = .{ .x = 256 }, .pdl = k.chain.reduce }, s, &b);
+     return true;
+ }
+ 

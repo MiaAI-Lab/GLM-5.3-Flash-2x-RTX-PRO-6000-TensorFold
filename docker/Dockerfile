@@ -1,0 +1,171 @@
+# TensorFold native (Zig) CUDA server for GLM-5.3-Flash EXL3 on RTX PRO 6000 Blackwell (sm_120).
+#
+# Build context: the recipe repository root (this file is docker/Dockerfile; patches/engine/*.patch are COPYed).
+#   docker build -f docker/Dockerfile \
+#     --build-arg TF_REPO=https://github.com/ashhart/TensorFold.git \
+#     --build-arg TF_REF=<40-hex commit> \
+#     --build-arg ZIG_VERSION=0.17.0 --build-arg ZIG_SHA256=<sha256 of zig-x86_64-linux-0.17.0.tar.xz> \
+#     --build-arg SM=120 --build-arg PATCHES_HASH=<hash> -t tensorfold-glm53-zig:<tag> .
+# See docker/README.md.
+
+ARG CUDA_VERSION=13.3.1
+ARG UBUNTU=ubuntu24.04
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Toolchain: CUDA devel (nvcc 13.3, g++ 13 as nvcc's host compiler) plus git/curl/cmake/nasm and Zig.
+FROM nvidia/cuda:${CUDA_VERSION}-devel-${UBUNTU} AS toolchain
+ARG ZIG_VERSION=0.17.0
+ARG ZIG_SHA256
+ARG ZIG_ARCH=x86_64
+ARG ZIG_URL=https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive LC_ALL=C.UTF-8
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl git xz-utils cmake nasm \
+ && rm -rf /var/lib/apt/lists/*
+RUN test -n "${ZIG_SHA256}" || { echo "ZIG_SHA256 build arg is required" >&2; exit 1; } \
+ && curl -fsSL --retry 3 -o /tmp/zig.tar.xz "${ZIG_URL}" \
+ && echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c - \
+ && mkdir -p /opt/zig \
+ && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 \
+ && rm /tmp/zig.tar.xz \
+ && ln -s /opt/zig/zig /usr/local/bin/zig \
+ && test "$(zig version)" = "${ZIG_VERSION}"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Pinned image decoders for --vision: the server refuses JPEG/WebP inputs unless it finds exactly libjpeg-turbo
+# 3.1.4.1 and libwebp 1.6.0 (zig/src/core/picture/{jpeg,webp}.zig); Ubuntu's packages are other releases.
+# They are installed in lib/ beside the server, where it looks first. PNG needs no library.
+FROM toolchain AS codecs
+ARG JPEG_TURBO_VERSION=3.1.4.1
+ARG JPEG_TURBO_SHA256=ecae8008e2cc9ade2f2c1bb9d5e6d4fb73e7c433866a056bd82980741571a022
+ARG WEBP_VERSION=1.6.0
+ARG WEBP_SHA256=e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564
+WORKDIR /build
+RUN curl -fsSL --retry 3 -o jpeg.tar.gz \
+      "https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/${JPEG_TURBO_VERSION}/libjpeg-turbo-${JPEG_TURBO_VERSION}.tar.gz" \
+ && echo "${JPEG_TURBO_SHA256}  jpeg.tar.gz" | sha256sum -c - \
+ && mkdir jpeg && tar -xzf jpeg.tar.gz -C jpeg --strip-components=1 \
+ && cmake -S jpeg -B jpeg/out -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/codecs -DCMAKE_INSTALL_LIBDIR=lib \
+      -DENABLE_SHARED=ON -DENABLE_STATIC=OFF -DWITH_TURBOJPEG=ON -DWITH_JAVA=OFF -DWITH_TOOLS=OFF -DWITH_TESTS=OFF \
+ && cmake --build jpeg/out -j"$(nproc)" --target turbojpeg \
+ && install -D -m 0755 "$(readlink -f jpeg/out/libturbojpeg.so.0)" /codecs/lib/libturbojpeg.so.0 \
+ && install -D -m 0644 jpeg/LICENSE.md /codecs/LICENSES/libjpeg-turbo-LICENSE.md
+RUN curl -fsSL --retry 3 -o webp.tar.gz \
+      "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-${WEBP_VERSION}.tar.gz" \
+ && echo "${WEBP_SHA256}  webp.tar.gz" | sha256sum -c - \
+ && mkdir webp && tar -xzf webp.tar.gz -C webp --strip-components=1 \
+ && cmake -S webp -B webp/out -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+      -DWEBP_BUILD_ANIM_UTILS=OFF -DWEBP_BUILD_CWEBP=OFF -DWEBP_BUILD_DWEBP=OFF -DWEBP_BUILD_GIF2WEBP=OFF \
+      -DWEBP_BUILD_IMG2WEBP=OFF -DWEBP_BUILD_VWEBP=OFF -DWEBP_BUILD_WEBPINFO=OFF -DWEBP_BUILD_WEBPMUX=OFF \
+      -DWEBP_BUILD_EXTRAS=OFF -DWEBP_BUILD_LIBWEBPMUX=OFF \
+ && cmake --build webp/out -j"$(nproc)" --target webpdecoder \
+ && install -D -m 0755 "$(readlink -f webp/out/libwebpdecoder.so.3)" /codecs/lib/libwebpdecoder.so.3 \
+ && install -D -m 0644 webp/COPYING /codecs/LICENSES/libwebp-COPYING \
+ && ldd /codecs/lib/libturbojpeg.so.0 /codecs/lib/libwebpdecoder.so.3
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Engine build: TensorFold at TF_REF, patches/engine/*.patch applied in filename order, kernels for SM only.
+FROM toolchain AS build
+ARG XGRAMMAR_REPO=https://github.com/mlc-ai/xgrammar.git
+ARG XGRAMMAR_TAG=v0.2.8
+ARG XGRAMMAR_COMMIT=97787376faee5ed8466cfad57c99855e4ce2f6aa
+RUN git clone -q --depth 1 --branch "${XGRAMMAR_TAG}" --recurse-submodules "${XGRAMMAR_REPO}" /src/xgrammar \
+ && test "$(git -C /src/xgrammar rev-parse HEAD)" = "${XGRAMMAR_COMMIT}" \
+ && test "$(git -C /src/xgrammar describe --tags --exact-match)" = "${XGRAMMAR_TAG}"
+
+ARG TF_REPO=https://github.com/ashhart/TensorFold.git
+ARG TF_REF
+WORKDIR /src/tensorfold
+RUN test -n "${TF_REF}" || { echo "TF_REF build arg is required" >&2; exit 1; } \
+ && git init -q . \
+ && git remote add origin "${TF_REPO}" \
+ && git fetch -q --depth 1 origin "${TF_REF}" \
+ && git checkout -q --detach FETCH_HEAD \
+ && commit="$(git rev-parse HEAD)" \
+ && if [[ "${TF_REF}" =~ ^[0-9a-f]{40}$ ]] && [[ "${commit}" != "${TF_REF}" ]]; then \
+      echo "fetched ${commit}, expected ${TF_REF}" >&2; exit 1; fi \
+ && echo "TensorFold ${TF_REPO} ${TF_REF} -> ${commit}"
+
+# Only *.patch files apply (a .gitkeep or README may sit beside them); an empty set builds upstream as is.
+COPY patches/engine/ /opt/tf-patches/engine/
+RUN shopt -s nullglob \
+ && patches=(/opt/tf-patches/engine/*.patch) \
+ && for p in "${patches[@]}"; do \
+      echo "apply ${p##*/}"; git apply --check "${p}" && git apply "${p}" || exit 1; \
+    done \
+ && echo "${#patches[@]} engine patch(es) applied" \
+ && git status --short | sed -n '1,50p'
+
+ARG ZIG_VERSION=0.17.0
+ARG SM=120
+ARG ZIG_CPU=native
+ARG ZIG_JOBS=
+ARG STRIP=false
+# TOOLS=1 adds `zig build install`: the CUDA dev CLI (bin/tensorfold: run, digest, kl, ...), tf-cuda-test (GPU kernel
+# suites), tf-tp-test and tf-tp-watch-check. It costs ~4 more minutes (tf-cuda-test is the longest Zig compile).
+ARG TOOLS=1
+ARG PREFIX=/opt/tensorfold
+# Every build compiles all kernels and executables again: upstream's build runs `nvcc --version` as a side-effect step
+# whose output feeds every fatbin's cache key, so Zig's cache never hits across invocations. Only Zig's global cache
+# (build runner, compiler_rt, libc++) is kept between builds, in a BuildKit cache mount.
+RUN --mount=type=cache,id=tensorfold-zig-global,target=/root/.cache/zig \
+    test "$(cat .zig-version)" = "${ZIG_VERSION}" \
+      || { echo "TensorFold needs Zig $(cat .zig-version), ZIG_VERSION=${ZIG_VERSION}" >&2; exit 1; } \
+ && steps="native grammar" && if [[ "${TOOLS}" == 1 ]]; then steps="install ${steps}"; fi \
+ && start=${SECONDS} \
+ && zig build ${steps} --prefix "${PREFIX}" --summary failures \
+      ${ZIG_JOBS:+-j${ZIG_JOBS}} -Doptimize=fast -Dcpu="${ZIG_CPU}" -Dstrip="${STRIP}" \
+      -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm="${SM}" -Dxgrammar=/src/xgrammar \
+ && echo "zig build ${steps}: $((SECONDS - start)) s" \
+ && rm -f "${PREFIX}"/bin/tf-qwen35-* \
+ && "${PREFIX}/native/bin/tensorfold-native" --version
+
+COPY --from=codecs /codecs/lib/ ${PREFIX}/native/lib/
+COPY --from=codecs /codecs/LICENSES/ ${PREFIX}/LICENSES/
+RUN shopt -s nullglob \
+ && mkdir -p "${PREFIX}/LICENSES/tensorfold" \
+ && cp -r LICENSE NOTICE THIRD_PARTY_NOTICES.md LICENSES "${PREFIX}/LICENSES/tensorfold/" \
+ && cp /src/xgrammar/LICENSE "${PREFIX}/LICENSES/xgrammar-Apache-2.0.txt" \
+ && cp /src/xgrammar/NOTICE "${PREFIX}/LICENSES/xgrammar-NOTICE.txt" \
+ && cp /src/xgrammar/3rdparty/dlpack/LICENSE "${PREFIX}/LICENSES/dlpack-Apache-2.0.txt" \
+ && patches=(/opt/tf-patches/engine/*.patch) \
+ && { echo "tf_repo=${TF_REPO}"; echo "tf_ref=${TF_REF}"; echo "tf_commit=$(git rev-parse HEAD)"; \
+      echo "tf_version=$("${PREFIX}/native/bin/tensorfold-native" --version)"; \
+      echo "zig=${ZIG_VERSION} cpu=${ZIG_CPU} sm=${SM} optimize=fast strip=${STRIP}"; \
+      echo "nvcc=$(nvcc --version | grep -o 'V[0-9][0-9.]*' | head -1)"; echo "xgrammar=${XGRAMMAR_TAG} ${XGRAMMAR_COMMIT}"; \
+      echo "patches=${#patches[@]}"; for p in "${patches[@]}"; do sha256sum "${p}"; done; \
+    } > "${PREFIX}/BUILD-INFO" \
+ && cat "${PREFIX}/BUILD-INFO"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Runtime: the CUDA runtime image already carries everything the server dlopens besides the driver:
+# libcublasLt.so.13 / libcublas.so.13 (cuBLAS 13.6) and libnccl.so.2 (NCCL 2.30.7 >= the engine's 2.30.0 minimum).
+# libcuda.so.1 and libnvidia-ml.so.1 come from the host driver through the NVIDIA container runtime (--gpus).
+# The native engine uses no cuDNN.
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU} AS runtime
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG PREFIX=/opt/tensorfold
+ARG TF_REPO
+ARG TF_REF
+ARG SM=120
+ARG ZIG_VERSION=0.17.0
+ARG PATCHES_HASH=dev
+COPY --from=build ${PREFIX}/ ${PREFIX}/
+# `tensorfold` is the server too, as upstream's packaging links it (its docs run `tensorfold serve`); the CUDA dev CLI
+# that a source install names bin/tensorfold is linked as `tensorfold-cuda`.
+RUN shopt -s nullglob \
+ && ln -s "${PREFIX}/native/bin/tensorfold-native" /usr/local/bin/tensorfold-native \
+ && ln -s "${PREFIX}/native/bin/tensorfold-native" /usr/local/bin/tensorfold \
+ && for exe in "${PREFIX}"/bin/*; do \
+      name="${exe##*/}"; [[ "${name}" == tensorfold ]] && name=tensorfold-cuda; ln -s "${exe}" "/usr/local/bin/${name}"; \
+    done \
+ && tensorfold-native --version
+LABEL tf.patches="${PATCHES_HASH}" \
+      tf.engine="zig" \
+      tf.ref="${TF_REF}" \
+      tf.repo="${TF_REPO}" \
+      tf.sm="${SM}" \
+      tf.zig="${ZIG_VERSION}"
+WORKDIR /workspace
+CMD ["tensorfold-native", "--help"]

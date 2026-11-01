@@ -1,0 +1,979 @@
+From 9c9d01114c4a8e1127a06178629377d20e63c306 Mon Sep 17 00:00:00 2001
+From: Bizuayeu <30091157+Bizuayeu@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 01:24:06 +0900
+Subject: [PATCH 50/63] glm cuda: a prompt step takes two chunks while no other
+ stream decodes, each one's exchanges and glue under the other's sites
+
+---
+ zig/src/families/glm/cuda.zig                |   2 +
+ zig/src/families/glm/cuda_engine.zig         |  14 ++-
+ zig/src/families/glm/cuda_follow.zig         |  15 ++-
+ zig/src/families/glm/cuda_forward.zig        |  27 +++--
+ zig/src/families/glm/cuda_forward_pair.zig   |  85 ++++++++++++++
+ zig/src/families/glm/cuda_forward_pieces.zig | 105 +++++++++--------
+ zig/src/families/glm/cuda_lanes.zig          |  14 ++-
+ zig/src/families/glm/cuda_lanes_test.zig     |  21 +++-
+ zig/src/families/glm/cuda_prompt_pair.zig    | 114 +++++++++++++++++++
+ zig/src/families/glm/cuda_ranks.zig          |  12 ++
+ zig/src/families/glm/cuda_ranks_test.zig     |  24 +++-
+ zig/src/families/glm/cuda_state.zig          |  27 ++++-
+ zig/tests/cuda/glm_pair_tests.zig            | 103 +++++++++++++++++
+ zig/tests/cuda/main.zig                      |   3 +
+ 14 files changed, 495 insertions(+), 71 deletions(-)
+ create mode 100644 zig/src/families/glm/cuda_forward_pair.zig
+ create mode 100644 zig/src/families/glm/cuda_prompt_pair.zig
+ create mode 100644 zig/tests/cuda/glm_pair_tests.zig
+
+diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
+index 0d3177d9..5da590e6 100644
+--- a/zig/src/families/glm/cuda.zig
++++ b/zig/src/families/glm/cuda.zig
+@@ -31,6 +31,7 @@ pub const sampler = @import("cuda_sampler.zig");
+ pub const prompt_sink = @import("cuda_prompt_sink.zig");
+ pub const prompt_logprobs = @import("cuda_prompt_logprobs.zig");
+ pub const engine = @import("cuda_engine.zig");
++pub const prompt_pair = @import("cuda_prompt_pair.zig");
+ pub const pages = @import("cuda_pages.zig");
+ pub const open_owner = @import("cuda_open_owner.zig");
+ pub const images = @import("cuda_images.zig");
+@@ -51,6 +52,7 @@ test {
+     _ = @import("cuda_p2p.zig");
+     _ = @import("cuda_ce.zig");
+     _ = @import("cuda_lanes_test.zig");
++    _ = prompt_pair;
+     _ = experts;
+     _ = exl3;
+     _ = vision;
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 9a21cc72..2cd4f1b3 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -18,6 +18,7 @@ const mm_mod = @import("cuda_mm.zig");
+ const dflash = @import("dflash.zig");
+ const prof_mod = @import("cuda_prof.zig");
+ const pages_mod = @import("cuda_pages.zig");
++const prompt_pair = @import("cuda_prompt_pair.zig");
+ pub const Options = @import("cuda_engine_types.zig").Options;
+ 
+ /// Rank 0's own word on its request (cancelled or not); the other ranks have none and hear rank 0's.
+@@ -99,6 +100,7 @@ pub const Engine = struct {
+     side: ?@import("cuda_moe.zig").Side = null, // decode windows' shared expert stream and events (TF_GLM_SHARED_SIDE=0: none)
+     w: weights.Weights,
+     bp: fw.Buffers, // prompt chunks
++    pair: ?prompt_pair.Pair = null, // TF_GLM_PROMPT_PAIR: a paired prompt step's second chunk
+     bd: fw.Buffers, // verify windows
+     bm: ?fw.Buffers = null, // the target MTP head's rows (only with its layer loaded)
+     bs: ?fw.Buffers = null, // shared verify windows (with drafts, as the lane core shares only then)
+@@ -169,7 +171,7 @@ pub const Engine = struct {
+         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
+         var m = try fw.Modules.load(d, ctx);
+         errdefer m.deinit();
+-        var pieces = try fw.Pieces.init(d, o.settings.pieces);
++        var pieces = try fw.Pieces.init(d, o.settings.pieces, o.settings.pair);
+         errdefer pieces.deinit();
+         var side = try sideStream(d);
+         errdefer if (side) |*x| freeSide(x);
+@@ -217,6 +219,8 @@ pub const Engine = struct {
+         e.bp = try fw.Buffers.init(d, &e.w, fw.prefill_rows, true, o.capacity);
+         errdefer e.bp.deinit();
+         e.initNumerics();
++        if (o.settings.pair) e.pair = try prompt_pair.Pair.init(d, &e.w, &e.bp, &e.pieces, o.capacity);
++        errdefer if (e.pair) |*p| p.deinit();
+         e.bd = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
+         errdefer e.bd.deinit();
+         if (e.mtp) e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
+@@ -266,6 +270,7 @@ pub const Engine = struct {
+         if (e.bs) |*b| b.deinit();
+         if (e.bm) |*b| b.deinit();
+         e.bd.deinit();
++        if (e.pair) |*p| p.deinit();
+         e.bp.deinit();
+         if (e.pages) |p| p.deinit();
+         for (0..e.seqs.items.len) |i| e.free(i);
+@@ -293,10 +298,11 @@ pub const Engine = struct {
+         return .{ .nccl = .{ .lib = e.lib, .comm = e.comm, .group = e.group } };
+     }
+ 
+-    fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
++    pub fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
+         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
+         const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
+-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .side = if (b == &e.bp) null else e.side, .moe_fuse = e.moe_fuse, .ce = if (b == &e.bp) e.ce else null };
++        const twin = if (e.pair) |*p| (if (b == &p.bp) &p.pieces else null) else null;
++        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else twin, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .side = if (b.prefill) null else e.side, .moe_fuse = e.moe_fuse, .ce = if (b == &e.bp) e.ce else null }; // prompt buffers (the pair's twin too) keep the shared expert on their stream; the twin's exchanges stay on NCCL (its rows are not registered)
+     }
+ 
+     /// An on-by-default switch: off only when `name` is "0".
+@@ -416,6 +422,7 @@ pub const Engine = struct {
+         if ((from != null or start == 0) and try e.prefillStart(len, from) != start) return error.BadChunk;
+         if (start >= len or start % fw.prefill_rows != 0) return error.BadChunk;
+         const rows = @min(len - start, fw.prefill_rows);
++        if (part.len > rows + 1) return prompt_pair.prefill(e, part, start, len, cancel, marks);
+         if (part.len != @min(len - start, rows + 1)) return error.BadChunk;
+         var one: [1]fw.Rank = undefined;
+         var f = e.view(&e.bp, &one);
+@@ -608,6 +615,7 @@ pub const Engine = struct {
+     }
+ 
+     pub const holdPrompt = @import("cuda_prompt_hold.zig").save;
++    pub const pairedAt = prompt_pair.pairedAt;
+     pub const prefillMany = @import("cuda_prompts.zig").prefillMany;
+ 
+     /// forward.commit of the last window's first `n` rows (the KDA replay when fewer than it ran).
+diff --git a/zig/src/families/glm/cuda_follow.zig b/zig/src/families/glm/cuda_follow.zig
+index 49425c00..f82dd8d9 100644
+--- a/zig/src/families/glm/cuda_follow.zig
++++ b/zig/src/families/glm/cuda_follow.zig
+@@ -131,6 +131,9 @@ pub const Link = struct {
+     }
+ };
+ 
++/// A prompt step's outcome (Leader.chunk): the first token once it ends the prompt, and the rows it took.
++pub const Chunk = struct { first: ?u32, rows: usize };
++
+ /// Rank 0's engine: every step goes to the other ranks first.
+ pub const Leader = struct {
+     e: *Engine,
+@@ -243,15 +246,17 @@ pub const Leader = struct {
+         return x.e.prefill(ids, from, cancel, marks);
+     }
+ 
+-    /// One chunk of a prompt pass on every rank (Engine.prefillChunk); the first token once the chunk ends the prompt.
+-    pub fn chunk(x: Leader, ids: []const u32, start: usize, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks) !?u32 {
++    /// One prompt step on every rank (Engine.prefillChunk): a chunk, or two when `pair` and Engine.pairedAt allow.
++    pub fn chunk(x: Leader, ids: []const u32, start: usize, pair: bool, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks) !Chunk {
+         if (start >= ids.len) return error.BadChunk;
+         try x.flush();
+-        const part = ids[start..@min(ids.len, start + engine.prompt_rows + 1)];
+-        const split = sparse.splitAt(start, x.e.settings.index_split, x.e.share.world);
++        const n: usize = if (pair and x.e.pairedAt(start, ids.len, marks)) 2 else 1;
++        const part = ids[start..@min(ids.len, start + n * engine.prompt_rows + 1)];
++        const split = sparse.splitAt(start, x.e.settings.index_split, x.e.share.world); // a paired step's chunks share it
+         try x.send(.{ .kind = @backingInt(Kind.chunk), .flags = x.rows() | @as(u32, @intFromBool(split)) << 1, .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part);
+         x.e.index_split = split;
+-        return x.e.prefillChunk(part, start, ids.len, from, cancel, marks);
++        const first = try x.e.prefillChunk(part, start, ids.len, from, cancel, marks);
++        return .{ .first = first, .rows = @min(ids.len - start, n * engine.prompt_rows) };
+     }
+ 
+     /// `bits`: the rows' grammar words (structured output, with Engine.structured), else 0.
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 33505691..ef1574e5 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -133,10 +133,21 @@ pub const Pieces = struct {
+     gathered: [max_pieces]cuda.Event,
+     glues: [max_pieces]cuda.Event, // split: a piece's own rows glued
+     shared: [max_pieces]cuda.Event, // split: every rank's glued rows of a piece in
++    owns_side: bool = true, // a paired step's second chunk (initTwin) runs on the first's side stream
+ 
+-    pub fn init(d: *const cuda.Driver, count: usize) !Pieces {
++    /// With `pair` (TF_GLM_PROMPT_PAIR) the side stream runs at the highest priority, ahead of the main stream's grids.
++    pub fn init(d: *const cuda.Driver, count: usize, pair: bool) !Pieces {
+         if (count == 0 or count > max_pieces) return error.BadPieces;
+-        var p: Pieces = .{ .count = count, .side = try cuda.Stream.init(d, false), .filled = undefined, .gathered = undefined, .glues = undefined, .shared = undefined };
++        return make(d, count, if (pair) try cuda.Stream.initPriority(d, .highest) else try cuda.Stream.init(d, false), true);
++    }
++
++    /// A paired step's second chunk on `of`'s side stream: every rank posts both chunks' exchanges in one order.
++    pub fn initTwin(d: *const cuda.Driver, of: *const Pieces) !Pieces {
++        return make(d, of.count, of.side, false);
++    }
++
++    fn make(d: *const cuda.Driver, count: usize, side: cuda.Stream, owns_side: bool) !Pieces {
++        var p: Pieces = .{ .count = count, .side = side, .filled = undefined, .gathered = undefined, .glues = undefined, .shared = undefined, .owns_side = owns_side };
+         for (&p.filled, &p.gathered, &p.glues, &p.shared) |*a, *b, *g, *s| {
+             a.* = try cuda.Event.init(d, false);
+             b.* = try cuda.Event.init(d, false);
+@@ -153,7 +164,7 @@ pub const Pieces = struct {
+             g.deinit();
+             s.deinit();
+         }
+-        p.side.deinit();
++        if (p.owns_side) p.side.deinit();
+         p.* = undefined;
+     }
+ };
+@@ -229,7 +240,7 @@ pub const Forward = struct {
+     }
+ 
+     /// forward._pre: hc_pre of every row at a site into b.normed, xs, post and comb.
+-    fn pre(f: *const Forward, r: Rank, hc: weights.Hc, norm: glue.Norm, rows: usize) !void {
++    pub fn pre(f: *const Forward, r: Rank, hc: weights.Hc, norm: glue.Norm, rows: usize) !void {
+         const stamp = prof_mod.span(f.prof, f.stream, .glue);
+         defer stamp.end();
+         const c = &r.w.config;
+@@ -245,7 +256,7 @@ pub const Forward = struct {
+     }
+ 
+     /// forward._mixer: the layer's KDA or DSA block on b.normed; `li`/`di`: its index among loaded KDA / DSA layers.
+-    fn mixer(f: *const Forward, r: Rank, l: weights.Layer, li: usize, di: usize, rows: usize, nch: usize, out: ?u64) !void {
++    pub fn mixer(f: *const Forward, r: Rank, l: weights.Layer, li: usize, di: usize, rows: usize, nch: usize, out: ?u64) !void {
+         const c = &r.w.config;
+         const b = r.b;
+         const st = r.st;
+@@ -284,7 +295,7 @@ pub const Forward = struct {
+     }
+ 
+     /// forward._ffn: the dense MLP or MoE block on b.normed into this rank's slot.
+-    fn ffn(f: *const Forward, r: Rank, l: weights.Layer, rows: usize, out: ?u64) !void {
++    pub fn ffn(f: *const Forward, r: Rank, l: weights.Layer, rows: usize, out: ?u64) !void {
+         const stamp = prof_mod.span(f.prof, f.stream, .ffn);
+         defer stamp.end();
+         const c = &r.w.config;
+@@ -409,6 +420,8 @@ pub const Forward = struct {
+         if (f.taps) |t| try f.shareTaps(t, cut);
+     }
+ 
++    pub const pairBody = @import("cuda_forward_pair.zig").pairBody;
++
+     /// forward.forward of `ids`: logits in b.logits; a prompt chunk's KDA layers committed, a window's at `commit`.
+     pub fn run(f: *const Forward, ids: []const i32) !void {
+         const R = ids.len;
+@@ -471,7 +484,7 @@ pub const Forward = struct {
+     }
+ 
+     /// The final norm and this rank's rows of the head (a prompt buffer's last row only).
+-    fn finish(f: *const Forward, R: usize) !void {
++    pub fn finish(f: *const Forward, R: usize) !void {
+         prof_mod.context(f.prof, null, null, .chunk);
+         const stamp = prof_mod.span(f.prof, f.stream, .head);
+         defer stamp.end();
+diff --git a/zig/src/families/glm/cuda_forward_pair.zig b/zig/src/families/glm/cuda_forward_pair.zig
+new file mode 100644
+index 00000000..eec6992e
+--- /dev/null
++++ b/zig/src/families/glm/cuda_forward_pair.zig
+@@ -0,0 +1,85 @@
++//! A paired prompt step's pass (TF_GLM_PROMPT_PAIR): two chunks site by site, each one's exchanges under the other's.
++const glue = @import("cuda_glue.zig");
++const latent = @import("cuda_latent.zig");
++const fw = @import("cuda_forward.zig");
++const pieces = @import("cuda_forward_pieces.zig");
++const Forward = fw.Forward;
++const Pieces = fw.Pieces;
++const Site = fw.Forward.Site;
++const room = fw.Forward.room;
++const share = fw.Forward.share;
++
++/// Two consecutive prompt chunks of one sequence (`b` a view of `a`'s at its end), each on `pieced`'s kernels and bits.
++pub fn pairBody(a: *const Forward, b: *const Forward, ra: usize, rb: usize) !void {
++    const two = [_]*const Forward{ a, b };
++    const rows = [_]usize{ ra, rb };
++    var cuts: [2][fw.max_pieces][2]usize = undefined;
++    var n: [2]usize = undefined;
++    for (two, rows, 0..) |f, R, i| {
++        if (f.pieces == null or f.prof != null or f.taps != null) return error.BadPair;
++        const c = &f.ranks[0].w.config;
++        for (f.ranks) |r| {
++            if (r.segs.len > 0 or !r.b.prefill or R == 0 or R > r.b.rows) return error.BadPair;
++            try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
++        }
++        if (f.images) |im| for (f.ranks) |r| try im.v.splice(f.stream, im.slot, r.st.pos, r.st.pos + R, r.b.x, c.hc);
++        n[i] = fw.ranges(R, f.pieces.?.count, &cuts[i]);
++        if (n[i] == 1 and !f.splits(R)) return error.BadPair; // run would take this chunk whole
++        for (f.ranks) |r| try f.pre(r, r.w.layers[0].attn_hc, r.w.layers[0].in_norm, R);
++    }
++    const layers = a.ranks[0].w.layers;
++    var li: usize = 0;
++    var di: usize = 0;
++    for (layers, 0..) |l, j| {
++        // b's mixer follows a's on the main stream, so a's caches, KDA state and conv rows of this layer are in
++        for (two, rows, 0..) |f, R, i| {
++            if (j > 0) try awaitShared(f, f.pieces.?, n[i]);
++            for (f.ranks) |r| try f.mixer(r, r.w.layers[j], li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), null);
++            try exchangeGlue(f, f.pieces.?, j, .mixer, cuts[i][0..n[i]]);
++        }
++        for (two, rows, 0..) |f, R, i| {
++            try awaitShared(f, f.pieces.?, n[i]);
++            for (f.ranks) |r| try f.ffn(r, r.w.layers[j], R, null);
++            try exchangeGlue(f, f.pieces.?, j, .ffn, cuts[i][0..n[i]]);
++        }
++        switch (l.mixer) {
++            .kda => li += 1,
++            .mla => di += 1,
++        }
++    }
++    for (two, rows, 0..) |f, R, i| {
++        try awaitShared(f, f.pieces.?, n[i]);
++        try f.finish(R);
++    }
++}
++
++/// A paired site: each piece filled on the main stream, then on the side stream its exchange, glue and (split) sharing.
++fn exchangeGlue(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut: []const [2]usize) !void {
++    const D = f.ranks[0].w.config.hidden;
++    const world = f.ranks[0].w.share.world;
++    const last = site == .ffn and j + 1 == f.ranks[0].w.layers.len;
++    var g = f.*; // the glue's launches go on the side stream
++    g.stream = p.side;
++    for (cut, 0..) |piece, q| {
++        const lo = piece[0];
++        const n = piece[1] - lo;
++        const split = f.splits(n);
++        for (f.ranks) |r| try f.fillRows(r, r.w.layers[j], site, lo, piece[1], if (split) r.b.part + lo * D * 4 else room(r, lo) + r.w.share.rank * n * D * 4);
++        try p.filled[q].record(f.stream);
++        try p.side.wait(p.filled[q]);
++        try pieces.partials(f, p, lo, n, split);
++        if (split) {
++            for (f.ranks) |r| {
++                const mine = share(n, world, r.w.share.rank);
++                try g.glueRows(r, j, site, lo + mine[0], lo + mine[1], room(r, lo));
++            }
++            try pieces.shareGlued(f, p, lo, n, last);
++        } else for (f.ranks) |r| try g.glueRows(r, j, site, lo, piece[1], room(r, lo));
++        try p.shared[q].record(p.side);
++    }
++}
++
++/// Before a paired chunk's next site: its last site's pieces glued and shared on the side stream.
++fn awaitShared(f: *const Forward, p: *const Pieces, count: usize) !void {
++    for (p.shared[0..count]) |e| try f.stream.wait(e);
++}
+diff --git a/zig/src/families/glm/cuda_forward_pieces.zig b/zig/src/families/glm/cuda_forward_pieces.zig
+index d744fb26..d02ecf69 100644
+--- a/zig/src/families/glm/cuda_forward_pieces.zig
++++ b/zig/src/families/glm/cuda_forward_pieces.zig
+@@ -14,7 +14,6 @@ const share = fw.Forward.share;
+ pub fn exchangePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut: []const [2]usize) !void {
+     defer prof.context(f.prof, j, null, if (site == .mixer) .mixer else .ffn);
+     const D = f.ranks[0].w.config.hidden;
+-    const world = f.ranks[0].w.share.world;
+     for (cut, 0..) |piece, q| {
+         prof.context(f.prof, j, q, if (site == .mixer) .mixer else .ffn);
+         const lo = piece[0];
+@@ -26,33 +25,7 @@ pub fn exchangePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site,
+         try p.side.wait(p.filled[q]);
+         stamp.end();
+         stamp = prof.span(f.prof, p.side, .partials);
+-        const bytes = n * D * 4;
+-        if (!split) switch (f.exchange) {
+-            .local => for (f.ranks) |to| for (f.ranks) |from| {
+-                if (to.w.share.rank == from.w.share.rank) continue;
+-                const off = from.w.share.rank * bytes;
+-                try f.copy(p.side, room(to, lo) + off, room(from, lo) + off, bytes);
+-            },
+-            .nccl => |x| {
+-                const r = f.ranks[0];
+-                try x.lib.check(x.lib.api.ncclAllGather(room(r, lo) + r.w.share.rank * bytes, room(r, lo), n * D, .f32, x.comm, p.side.handle), "ncclAllGather");
+-            },
+-        } else switch (f.exchange) {
+-            .local => for (f.ranks) |to| {
+-                const mine = share(n, world, to.w.share.rank);
+-                const own = mine[1] - mine[0];
+-                for (f.ranks) |from| try f.copy(p.side, room(to, lo) + from.w.share.rank * own * D * 4, from.b.part + (lo + mine[0]) * D * 4, own * D * 4);
+-            },
+-            .nccl => |x| {
+-                const r = f.ranks[0];
+-                const me = r.w.share.rank;
+-                const mine = share(n, world, me);
+-                const own = mine[1] - mine[0];
+-                const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
+-                if (f.ce) |ce| try ce_x.partials(f, ce, p, q, lo, n) else if (f.ring) try relay.partials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D) else try relay.splitPartials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D);
+-                try f.copy(p.side, room(r, lo) + me * own * D * 4, r.b.part + (lo + mine[0]) * D * 4, own * D * 4);
+-            },
+-        }
++        try partials(f, p, lo, n, split);
+         stamp.end();
+         try p.gathered[q].record(p.side);
+     }
+@@ -61,8 +34,6 @@ pub fn exchangePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site,
+ /// overlap.Overlap.glue: each piece's glue once its exchange is in, its rows then shared on the second stream.
+ pub fn gluePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut: []const [2]usize) !void {
+     defer prof.context(f.prof, j, null, if (site == .mixer) .mixer else .ffn);
+-    const c = &f.ranks[0].w.config;
+-    const D: usize = c.hidden;
+     const world = f.ranks[0].w.share.world;
+     const last = site == .ffn and j + 1 == f.ranks[0].w.layers.len;
+     var sent: usize = 0;
+@@ -86,23 +57,7 @@ pub fn gluePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut
+         try p.side.wait(p.glues[q]);
+         stamp.end();
+         stamp = prof.span(f.prof, p.side, .glued);
+-        switch (f.exchange) {
+-            .local => for (f.ranks) |from| {
+-                const mine = share(n, world, from.w.share.rank);
+-                const bytes = (mine[1] - mine[0]) * D * 2;
+-                for (f.ranks) |to| if (to.w.share.rank != from.w.share.rank) {
+-                    const at = (lo + mine[0]) * D * 2;
+-                    try f.copy(p.side, (if (last) to.b.hidden else to.b.normed) + at, (if (last) from.b.hidden else from.b.normed) + at, bytes);
+-                };
+-            },
+-            .nccl => |x| {
+-                const r = f.ranks[0];
+-                const me = r.w.share.rank;
+-                const rows_of = if (last) r.b.hidden else r.b.normed;
+-                const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
+-                if (f.ce) |ce| try ce_x.glued(f, ce, p, q, rows_of, lo, n) else if (f.ring) try relay.glued(x.lib, x.comm, p.side, plan, rows_of, lo, D) else try relay.splitGlued(x.lib, x.comm, p.side, plan, rows_of, lo, D);
+-            },
+-        }
++        try shareGlued(f, p, lo, n, last);
+         stamp.end();
+         try p.shared[q].record(p.side);
+         sent |= @as(usize, 1) << @intCast(q);
+@@ -152,3 +107,59 @@ pub fn shareTaps(f: *const Forward, t: taps.Taps, cut: []const [2]usize) !void {
+         if (f.ring) try relay.glued(x.lib, x.comm, f.stream, plan, t.out, piece[0], dims) else try relay.splitGlued(x.lib, x.comm, f.stream, plan, t.out, piece[0], dims);
+     }
+ }
++
++/// A piece's partials on the side stream: gathered whole, or split (each rank's rows of every partial to their owner).
++pub fn partials(f: *const Forward, p: *const Pieces, lo: usize, n: usize, split: bool) !void {
++    const D = f.ranks[0].w.config.hidden;
++    const world = f.ranks[0].w.share.world;
++    const bytes = n * D * 4;
++    if (!split) switch (f.exchange) {
++        .local => for (f.ranks) |to| for (f.ranks) |from| {
++            if (to.w.share.rank == from.w.share.rank) continue;
++            const off = from.w.share.rank * bytes;
++            try f.copy(p.side, room(to, lo) + off, room(from, lo) + off, bytes);
++        },
++        .nccl => |x| {
++            const r = f.ranks[0];
++            try x.lib.check(x.lib.api.ncclAllGather(room(r, lo) + r.w.share.rank * bytes, room(r, lo), n * D, .f32, x.comm, p.side.handle), "ncclAllGather");
++        },
++    } else switch (f.exchange) {
++        .local => for (f.ranks) |to| {
++            const mine = share(n, world, to.w.share.rank);
++            const own = mine[1] - mine[0];
++            for (f.ranks) |from| try f.copy(p.side, room(to, lo) + from.w.share.rank * own * D * 4, from.b.part + (lo + mine[0]) * D * 4, own * D * 4);
++        },
++        .nccl => |x| {
++            const r = f.ranks[0];
++            const me = r.w.share.rank;
++            const mine = share(n, world, me);
++            const own = mine[1] - mine[0];
++            const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
++            if (f.ring) try relay.partials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D) else try relay.splitPartials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D);
++            try f.copy(p.side, room(r, lo) + me * own * D * 4, r.b.part + (lo + mine[0]) * D * 4, own * D * 4);
++        },
++    }
++}
++
++/// A split piece's glued rows (normed, or hidden after the last layer) to every rank on the side stream.
++pub fn shareGlued(f: *const Forward, p: *const Pieces, lo: usize, n: usize, last: bool) !void {
++    const D: usize = f.ranks[0].w.config.hidden;
++    const world = f.ranks[0].w.share.world;
++    switch (f.exchange) {
++        .local => for (f.ranks) |from| {
++            const mine = share(n, world, from.w.share.rank);
++            const bytes = (mine[1] - mine[0]) * D * 2;
++            for (f.ranks) |to| if (to.w.share.rank != from.w.share.rank) {
++                const at = (lo + mine[0]) * D * 2;
++                try f.copy(p.side, (if (last) to.b.hidden else to.b.normed) + at, (if (last) from.b.hidden else from.b.normed) + at, bytes);
++            };
++        },
++        .nccl => |x| {
++            const r = f.ranks[0];
++            const me = r.w.share.rank;
++            const rows_of = if (last) r.b.hidden else r.b.normed;
++            const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
++            if (f.ring) try relay.glued(x.lib, x.comm, p.side, plan, rows_of, lo, D) else try relay.splitGlued(x.lib, x.comm, p.side, plan, rows_of, lo, D);
++        },
++    }
++}
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index a4746770..6046c944 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -199,6 +199,13 @@ pub const Lanes = struct {
+         return l;
+     }
+ 
++    /// Whether a stream besides `s` is past its prompt pass: a paired prompt step would hold up its rounds.
++    pub fn othersDecode(self: *const Lanes, s: *const lanes.Stream) bool {
++        var it = self.lanes.iterator();
++        while (it.next()) |kv| if (kv.key_ptr.* != s and kv.value_ptr.fill == null) return true;
++        return false;
++    }
++
+     fn cancelled(ptr: ?*anyopaque) bool {
+         return @as(*lanes.Stream, @ptrCast(@alignCast(ptr.?))).isCancelled();
+     }
+@@ -261,12 +268,13 @@ pub const Lanes = struct {
+         try sink.prepare();
+         self.x.e.prompt_logprobs = sink.want();
+         defer self.x.e.prompt_logprobs = null;
+-        if (try self.x.chunk(s.prompt(), at, from, .{ .ptr = s, .check = cancelled }, marksOf(s))) |first| {
++        const step = try self.x.chunk(s.prompt(), at, !self.othersDecode(s), from, .{ .ptr = s, .check = cancelled }, marksOf(s));
++        if (step.first) |first| {
+             l.first = self.take(first);
+             l.fill = null;
+             return true;
+         }
+-        l.fill = at + engine.prompt_rows;
++        l.fill = at + step.rows;
+         if (s.settle_step) try self.x.e.stream.synchronize(); // its tail would land in the next decode round's time
+         return false;
+     }
+@@ -277,7 +285,7 @@ pub const Lanes = struct {
+         const at = l.fill orelse return;
+         if (at <= s.cached or s.reuse.hook == null) return;
+         try self.x.bind(l.slot);
+-        _ = self.x.chunk(s.prompt(), at, null, .{ .ptr = null, .check = cancelNow }, marksOf(s)) catch |err| {
++        _ = self.x.chunk(s.prompt(), at, false, null, .{ .ptr = null, .check = cancelNow }, marksOf(s)) catch |err| {
+             if (err == error.Cancelled) return;
+             return err;
+         };
+diff --git a/zig/src/families/glm/cuda_lanes_test.zig b/zig/src/families/glm/cuda_lanes_test.zig
+index 0a248eb1..b7498138 100644
+--- a/zig/src/families/glm/cuda_lanes_test.zig
++++ b/zig/src/families/glm/cuda_lanes_test.zig
+@@ -1,7 +1,8 @@
+-//! cuda_lanes' checks on the host: a lane's slot chosen before its entry exists, and given back.
++//! cuda_lanes' checks on the host: a lane's slot chosen and given back, and when a prompt step may pair.
+ const std = @import("std");
+ const lanes = @import("lanes");
+ const engine = @import("cuda_engine.zig");
++const fw = @import("cuda_forward.zig");
+ const Lanes = @import("cuda_lanes.zig").Lanes;
+ 
+ test "a lane's slot is chosen before its map entry exists" {
+@@ -40,3 +41,21 @@ test "a failed lane insertion leaves no entry, and a retry takes slot zero" {
+     fail.fail_index = std.math.maxInt(usize);
+     try std.testing.expectEqual(@as(u32, 0), (try self.claim(&stream)).slot);
+ }
++
++test "a prompt step pairs only while no other stream is past its prompt pass" {
++    var e: engine.Engine = undefined;
++    e.gpa = std.testing.allocator;
++    var self: Lanes = .{ .x = .{ .e = &e, .link = undefined } };
++    defer self.lanes.deinit(e.gpa);
++    var streams: [3]lanes.Stream = undefined;
++    const first = try self.claim(&streams[0]); // a stream's own lane, fresh as its first chunk starts
++    try std.testing.expect(!self.othersDecode(&streams[0]));
++    first.fill = fw.prefill_rows;
++    (try self.claim(&streams[1])).fill = 2 * fw.prefill_rows; // another prompt pass, partway
++    try std.testing.expect(!self.othersDecode(&streams[0]));
++    _ = try self.claim(&streams[2]); // past its prompt pass: decoding
++    try std.testing.expect(self.othersDecode(&streams[0]) and self.othersDecode(&streams[1]));
++    try std.testing.expect(!self.othersDecode(&streams[2])); // the other two still fill
++    _ = self.lanes.remove(&streams[2]); // released
++    try std.testing.expect(!self.othersDecode(&streams[0]));
++}
+diff --git a/zig/src/families/glm/cuda_prompt_pair.zig b/zig/src/families/glm/cuda_prompt_pair.zig
+new file mode 100644
+index 00000000..0a1c7f9e
+--- /dev/null
++++ b/zig/src/families/glm/cuda_prompt_pair.zig
+@@ -0,0 +1,114 @@
++//! A prompt step of two chunks in one pass (TF_GLM_PROMPT_PAIR): each chunk's exchanges under the other's sites.
++const std = @import("std");
++const cuda = @import("cuda");
++const fw = @import("cuda_forward.zig");
++const weights = @import("cuda_weights.zig");
++const snapshots = @import("cuda_snapshots.zig");
++const engine = @import("cuda_engine.zig");
++const Engine = engine.Engine;
++
++/// The fewest rows a paired step's second chunk takes: a shorter one's sites end before the first's exchanges do.
++pub const min_rows = fw.prefill_rows / 4;
++
++/// A paired step's second chunk: twins of the prompt buffers, pieces on their side stream, and its first position.
++pub const Pair = struct {
++    bp: fw.Buffers,
++    pieces: fw.Pieces,
++    pos: cuda.DeviceBuffer, // an i32: where the second chunk's view of the sequence starts
++    steps: u64 = 0, // paired steps so far (glm-pair-check counts them)
++
++    pub fn init(d: *const cuda.Driver, w: *const weights.Weights, bp: *const fw.Buffers, pieces: *const fw.Pieces, capacity: usize) !Pair {
++        var b = try fw.Buffers.initTwin(d, w, bp, capacity);
++        errdefer b.deinit();
++        var p = try fw.Pieces.initTwin(d, pieces);
++        errdefer p.deinit();
++        return .{ .bp = b, .pieces = p, .pos = try cuda.DeviceBuffer.alloc(d, 4) };
++    }
++
++    pub fn deinit(p: *Pair) void {
++        p.pos.free();
++        p.pieces.deinit();
++        p.bp.deinit();
++        p.* = undefined;
++    }
++};
++
++/// Whether a step at `start` of a `len`-id prompt takes the next chunk too: min_rows or more there, and no mark at it.
++pub fn takesTwo(start: usize, len: usize, world: usize, marks: []const u32) bool {
++    const next = start + fw.prefill_rows;
++    if (next >= len or len - next < @max(min_rows, world)) return false;
++    return std.mem.indexOfScalar(u32, marks, @intCast(next)) == null;
++}
++
++/// Rank 0's choice for the step at `start` (the others take the ids it sends); not with a drafter, prompt rows or prof.
++pub fn pairedAt(e: *const Engine, start: usize, len: usize, marks: ?engine.Marks) bool {
++    if (e.pair == null or !e.settings.pair or e.drafter != null or e.prompt_logprobs != null or e.prompt_profs[3] != null) return false;
++    if (e.pieces.count == 1 and !e.settings.split) return false; // run takes such a chunk whole
++    return takesTwo(start, len, e.share.world, if (marks) |m| m.at else &.{});
++}
++
++/// Engine.prefillChunk of two chunks (`part`: both, then the next id): one pass, then each chunk's MTP rows and commit.
++pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: ?engine.Cancel, marks: ?engine.Marks) !?u32 {
++    const ra: usize = fw.prefill_rows;
++    if (len <= start + ra) return error.BadChunk;
++    const rb: usize = @min(len - start - ra, fw.prefill_rows);
++    const pair = if (e.pair) |*p| p else return error.BadChunk;
++    if (rb < e.share.world or part.len != @min(len - start, ra + rb + 1) or e.drafter != null or e.prompt_logprobs != null) return error.BadChunk;
++    if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
++    e.gate(cancel) catch |err| {
++        if (err == error.Cancelled) try snapshots.interrupted(e, marks, @intCast(start));
++        return err;
++    };
++    var one: [1]fw.Rank = undefined;
++    var two: [1]fw.Rank = undefined;
++    var fa = e.view(&e.bp, &one);
++    var fb = e.view(&pair.bp, &two);
++    fa.prof = null;
++    fb.prof = null;
++    const st = &e.cur.st;
++    try st.ready(e.stream, ra + rb); // one rebase for both chunks, before b's view copies the rings' base
++    var sb = st.*;
++    sb.pos_dev = pair.pos.ptr;
++    try sb.setPos(e.stream, st.pos + ra);
++    two[0].st = &sb;
++    st.pending = ra;
++    st.prompt = true;
++    const ids: []const i32 = @ptrCast(part);
++    try cuda.copy_source.enqueue(e.d, e.bp.ids, std.mem.sliceAsBytes(ids[0..ra]), e.stream);
++    try cuda.copy_source.enqueue(e.d, pair.bp.ids, std.mem.sliceAsBytes(ids[ra .. ra + rb]), e.stream);
++    try fw.Forward.pairBody(&fa, &fb, ra, rb);
++    pair.steps += 1;
++    try mtpRows(e, &fa, ids[1 .. ra + 1], e.bp.fnormed);
++    try fa.commit(ra);
++    st.pending = rb;
++    st.prompt = true;
++    var first: ?u32 = null;
++    if (start + ra + rb == len) {
++        var t: [1]u32 = undefined;
++        try e.draw(pair.bp.logits, 1, len, 0, &t);
++        first = t[0];
++        try e.holdPrompt(pair.bp.fnormed + (rb - 1) * e.c.hidden * 2);
++    }
++    try mtpRows(e, &fa, ids[ra + 1 ..], pair.bp.fnormed); // the MTP head on a's buffers, over b's rows
++    try fa.commit(rb);
++    return first;
++}
++
++/// decode._absorb_rows of a chunk: the MTP head over its next ids `nxt` on its final-norm rows `hidden`.
++fn mtpRows(e: *Engine, f: *fw.Forward, nxt: []const i32, hidden: u64) !void {
++    if (!e.mtp or nxt.len == 0) return;
++    try f.mtp(nxt, &.{hidden});
++    try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + nxt.len);
++}
++
++test "a prompt step takes the next chunk when it holds min_rows or more and no kept state starts there" {
++    const C = fw.prefill_rows;
++    try std.testing.expect(takesTwo(0, 2 * C, 3, &.{}));
++    try std.testing.expect(takesTwo(0, C + min_rows, 3, &.{}));
++    try std.testing.expect(!takesTwo(0, C + min_rows - 1, 3, &.{})); // a shorter tail goes alone
++    try std.testing.expect(!takesTwo(0, C, 3, &.{}));
++    try std.testing.expect(!takesTwo(C, 2 * C, 3, &.{})); // the prompt's last chunk
++    try std.testing.expect(takesTwo(2 * C, 5 * C, 3, &.{}));
++    try std.testing.expect(!takesTwo(0, 3 * C, 3, &.{C})); // a state kept at the next chunk's start: that chunk starts a step
++    try std.testing.expect(takesTwo(0, 3 * C, 3, &.{ 2 * C, 3 * C })); // marks past the pair
++}
+diff --git a/zig/src/families/glm/cuda_ranks.zig b/zig/src/families/glm/cuda_ranks.zig
+index 94ece6ca..862d3387 100644
+--- a/zig/src/families/glm/cuda_ranks.zig
++++ b/zig/src/families/glm/cuda_ranks.zig
+@@ -15,6 +15,7 @@ pub const Settings = struct {
+     ring: bool = false, // TF_GLM_PREFILL_REDUCE=ring: split, its exchanges passed along the ring (cuda_relay)
+     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE: 1 (decode windows on KDA's three-kernel chain) or 0
+     pieces: u32 = 3, // TF_GLM_OVERLAP_PIECES: a prompt chunk's exchanges in this many row pieces (1: whole).
++    pair: bool = true, // TF_GLM_PROMPT_PAIR: 1 (while no stream decodes, a prompt step takes two chunks, each one's exchanges under the other's sites) or 0
+     index_split: u32 = 2048, // TF_GLM_INDEX_SPLIT: from this position on, rank 0 splits a prompt chunk's indexer rows (0: never)
+     heat: ?heat.Bands = null, // TF_HEAT_HIGH and TF_HEAT_LOW (upstream's names): a prompt chunk waits on every rank's hottest zone
+     layers: u32 = 0, // TF_GLM_LAYERS: the first this many layers only, a thin model for one-GPU checks (0: all)
+@@ -52,6 +53,12 @@ pub const Settings = struct {
+                 return error.BadSetting;
+             }
+         }
++        if (get("TF_GLM_PROMPT_PAIR")) |v| {
++            if (std.mem.eql(u8, v, "1")) s.pair = true else if (std.mem.eql(u8, v, "0")) s.pair = false else {
++                problem.* = "TF_GLM_PROMPT_PAIR: 0 or 1";
++                return error.BadSetting;
++            }
++        }
+         if (get("TF_GLM_OVERLAP_PIECES")) |v| {
+             s.pieces = std.fmt.parseInt(u32, v, 10) catch 0;
+             if (s.pieces < 1 or s.pieces > 8) {
+@@ -134,6 +141,7 @@ pub const Fingerprint = extern struct {
+     split: u32, // TF_GLM_PREFILL_REDUCE: 0 gather, 1 split, 2 ring
+     kda_wide: u32,
+     pieces: u32,
++    pair: u32, // TF_GLM_PROMPT_PAIR: rank 0's paired steps need the second chunk's buffers on every rank
+     layers: u32, // TF_GLM_LAYERS (0: all)
+     mtp: u32, // 1: the MTP head loads and runs (drafts on); 2: and DFlash2 (--drafter), whose rounds gather
+     vision: u32 = 0, // --vision's image tokens (0: off): rank 0 sends image rows every rank must hold
+@@ -161,6 +169,7 @@ pub const Fingerprint = extern struct {
+         split,
+         kda_wide,
+         pieces,
++        pair,
+         layers,
+         mtp,
+         vision,
+@@ -198,6 +207,7 @@ pub const Fingerprint = extern struct {
+             .split = if (!s.split) 0 else if (s.ring) 2 else 1,
+             .kda_wide = @intFromBool(s.kda_wide),
+             .pieces = s.pieces,
++            .pair = @intFromBool(s.pair),
+             .layers = s.layers,
+             .mtp = @intFromBool(mtp),
+             .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
+@@ -229,6 +239,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
+             "split",
+             "kda_wide",
+             "pieces",
++            "pair",
+             "layers",
+             "mtp",
+             "vision",
+@@ -338,6 +349,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
+         .split => "TF_GLM_PREFILL_REDUCE",
+         .kda_wide => "TF_GLM_KDA_DECODE_WIDE",
+         .pieces => "TF_GLM_OVERLAP_PIECES",
++        .pair => "TF_GLM_PROMPT_PAIR",
+         .layers => "TF_GLM_LAYERS",
+         .mtp => "--no-drafts given to some ranks and not others",
+         .vision => "--vision (or its image tokens) given to some ranks and not others",
+diff --git a/zig/src/families/glm/cuda_ranks_test.zig b/zig/src/families/glm/cuda_ranks_test.zig
+index 3afaabb9..2f83c197 100644
+--- a/zig/src/families/glm/cuda_ranks_test.zig
++++ b/zig/src/families/glm/cuda_ranks_test.zig
+@@ -186,7 +186,7 @@ test "every media limit is part of the ranks' agreement" {
+ test "every scheduling and identity field that differs stops the ranks" {
+     const zero = Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), hashBytes("/same"));
+     const one = Fingerprint.of(2, 1, .{}, 8192, true, @splat(0), @splat(0), hashBytes("/same"));
+-    inline for (.{ "layout", "world", "rank", "pages", "split", "kda_wide", "pieces", "layers", "mtp", "vision", "video_tokens", "max_images", "max_videos", "max_frames", "numerics", "capacity", "heat_high", "heat_low" }) |name| {
++    inline for (.{ "layout", "world", "rank", "pages", "split", "kda_wide", "pieces", "pair", "layers", "mtp", "vision", "video_tokens", "max_images", "max_videos", "max_frames", "numerics", "capacity", "heat_high", "heat_low" }) |name| {
+         var all = [_]Fingerprint{ zero, one };
+         @field(all[1], name) += 1;
+         try std.testing.expectEqual(@field(Fingerprint.Field, name), mismatch(&all).?.field);
+@@ -270,6 +270,28 @@ test "prompt K experiment is explicit and all ranks must agree" {
+     try std.testing.expectEqual(@as(?Mismatch, null), mismatch(&all));
+ }
+ 
++test "TF_GLM_PROMPT_PAIR: on by default, 0 or 1, and every rank must agree (the others take rank 0's paired steps)" {
++    const Reader = struct {
++        fn absent(_: [:0]const u8) ?[]const u8 {
++            return null;
++        }
++        fn off(key: [:0]const u8) ?[]const u8 {
++            return if (std.mem.eql(u8, key, "TF_GLM_PROMPT_PAIR")) "0" else null;
++        }
++        fn bad(key: [:0]const u8) ?[]const u8 {
++            return if (std.mem.eql(u8, key, "TF_GLM_PROMPT_PAIR")) "2" else null;
++        }
++    };
++    var problem: []const u8 = "";
++    try std.testing.expect((try Settings.read(Reader.absent, &problem)).pair);
++    const off = try Settings.read(Reader.off, &problem);
++    try std.testing.expect(!off.pair);
++    try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
++    try std.testing.expectEqualStrings("TF_GLM_PROMPT_PAIR: 0 or 1", problem);
++    const all = [_]Fingerprint{ Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), @splat(0)), Fingerprint.of(2, 1, off, 8192, true, @splat(0), @splat(0), @splat(0)) };
++    try std.testing.expectEqual(Mismatch{ .field = .pair, .rank = 1 }, mismatch(&all).?);
++}
++
+ test "TF_GLM_INDEX_SPLIT: 2048 by default, 0 for never, a position, and a refusal naming a value that is not one" {
+     const Reader = struct {
+         fn absent(_: [:0]const u8) ?[]const u8 {
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index cbd681a7..6c2e048d 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -178,16 +178,25 @@ pub const Buffers = struct {
+     part: u64, // fp32 [rows][dims]: this rank's partial rows a split exchange sends from
+ 
+     pub fn init(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize) !Buffers {
+-        return make(d, w, rows, prefill, capacity, rows);
++        return make(d, w, rows, prefill, capacity, rows, null);
+     }
+ 
+     /// A shared window's scratch: `rows` rows of several streams, each one's attention and KDA chain on `window_rows`.
+     pub fn initShared(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, capacity: usize) !Buffers {
+-        return make(d, w, rows, false, capacity, window_rows);
++        return make(d, w, rows, false, capacity, window_rows, null);
+     }
+ 
++    /// A paired step's second chunk: its own rows across sites and streams, and `of`'s scratch for one site's work.
++    pub fn initTwin(d: *const cuda.Driver, w: *const weights.Weights, of: *const Buffers, capacity: usize) !Buffers {
++        return make(d, w, of.rows, of.prefill, capacity, of.rows, of);
++    }
++
++    /// The fields a twin holds apart: make's sizes by index, then their names.
++    const twin_sizes = [_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 62, 63, 64, 65, 70 };
++    const twin_fields = .{ "ids", "x", "normed", "xs", "post", "comb", "hcpart", "gathered", "hidden", "fnormed", "fxs", "logits", "part" };
++
+     /// `seg`: the most rows one stream's attention takes (a decode window's rows, or a shared window's segment).
+-    fn make(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize) !Buffers {
++    fn make(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize, twin: ?*const Buffers) !Buffers {
+         const c = &w.config;
+         const s = &w.share;
+         const D: usize = c.hidden;
+@@ -255,8 +264,12 @@ pub const Buffers = struct {
+             x3[0], x3[1], x3[2], x3[3], // EXL3 experts: 8-slot picks, rotated inputs, a decode window's partials
+             if (split) rows * @max(3 * n, kw - 3 * n) * 2 else 4, // a split KDA stack's part rows
+         };
++        var held = sizes;
++        if (twin != null) for (&held, 0..) |*bytes, i| { // a twin allocates its own rows only
++            if (std.mem.indexOfScalar(usize, &twin_sizes, i) == null) bytes.* = 0;
++        };
+         var p: [sizes.len]u64 = undefined;
+-        const a = try arena(d, &sizes, &p);
++        const a = try arena(d, &held, &p);
+         var out: Buffers = .{
+             .arena = a,
+             .rows = rows,
+@@ -309,6 +322,12 @@ pub const Buffers = struct {
+         };
+         out.moe.x3 = .{ .picks = p[71], .xg = p[72], .xu = p[73], .z = p[74] };
+         out.kda.tmp = p[75];
++        if (twin) |of| {
++            var t = of.*;
++            t.arena = out.arena;
++            inline for (twin_fields) |f| @field(t, f) = @field(out, f);
++            return t;
++        }
+         return out;
+     }
+ 
+diff --git a/zig/tests/cuda/glm_pair_tests.zig b/zig/tests/cuda/glm_pair_tests.zig
+new file mode 100644
+index 00000000..ff03559e
+--- /dev/null
++++ b/zig/tests/cuda/glm_pair_tests.zig
+@@ -0,0 +1,103 @@
++//! GLM-5.3-Flash's paired prompt steps (TF_GLM_PROMPT_PAIR) against twins a chunk a step, on one Engine and its ranks.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const check = @import("check.zig");
++const Gpu = check.Gpu;
++
++/// `glm-pair-check`: prompts a step at a time, paired and not; first token, next window and every state byte equal.
++pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_int, world: c_int, id_path: []const u8) !void {
++    const glm = @import("glm_cuda");
++    var arena = std.heap.ArenaAllocator.init(gpu.gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const dc = try std.json.parseFromSliceLeaky(struct { capacity: usize = 8192 }, a, try std.Io.Dir.cwd().readFileAlloc(gpu.io, dc_path, a, .limited(1 << 26)), .{ .ignore_unknown_fields = true });
++    var lib = try cuda.nccl.Library.open();
++    defer lib.close();
++    const comm = try @import("glm_lanes_tests.zig").openComm(gpu, &lib, rank, world, id_path);
++    defer _ = lib.api.ncclCommDestroy(comm);
++    var problem: []const u8 = "";
++    const set = glm.ranks.Settings.read(&glm.ranks.environment, &problem) catch |err| {
++        std.debug.print("REFUSE {s}\n", .{problem});
++        return err;
++    };
++    try check.expect(set.pair, "glm-pair-check needs TF_GLM_PROMPT_PAIR on (unset or 1)", .{});
++    const C = glm.engine.prompt_rows;
++    const capacity = @max(dc.capacity, 4 * C);
++    const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = capacity, .mtp = true, .settings = set });
++    defer e.deinit();
++    var link = try glm.follow.Link.init(gpu.gpa, gpu.d, &lib, comm, e.stream, capacity);
++    defer link.deinit();
++    if (rank != 0) {
++        try glm.follow.follow(e, &link);
++        check.pass("rank {d} followed rank 0's paired and single prompt steps to the end", .{rank});
++        return;
++    }
++    const x: glm.follow.Leader = .{ .e = e, .link = &link };
++    defer x.end() catch {};
++    const V = e.share.vocab.len();
++    const min = glm.prompt_pair.min_rows;
++    // a pair and a tail, the shortest second chunk, a pair and a chunk, a pair to the end, a tail too short to pair
++    const lens = [_]usize{ 2 * C + 300, C + min, 3 * C, 2 * C, C + min - 1 };
++    var failed = false;
++    for (lens, 0..) |len, i| {
++        const ids = try a.alloc(u32, len);
++        for (ids, 0..) |*u, j| u.* = @intCast(100 + (j * 7919 + i * 31) % 5000);
++        var firsts: [2]u32 = undefined;
++        var outs: [2][4]u32 = undefined;
++        var logits: [2][]u16 = undefined;
++        var paired: [2]u64 = undefined;
++        for (0..2) |twin| { // twin 0 a chunk a step, twin 1 paired where it can
++            e.settings.pair = twin == 1;
++            try x.bind(@intCast(2 * i + twin));
++            try x.begin(null);
++            const before = e.pair.?.steps;
++            var at: usize = 0;
++            const t = while (true) {
++                const r = x.chunk(ids, at, true, null, null, null) catch |err| {
++                    std.debug.print("FAIL pair: prompt of {d}, twin {d}: the step at {d}: {s}\n", .{ len, twin, at, @errorName(err) });
++                    return err;
++                };
++                if (r.first) |f| break f;
++                at += r.rows;
++            };
++            paired[twin] = e.pair.?.steps - before;
++            firsts[twin] = t;
++            const win = [_]u32{ t, 101, 202, 303 };
++            try x.verify(&win, &outs[twin], 0);
++            logits[twin] = try a.alloc(u16, win.len * V);
++            try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(logits[twin].ptr, e.bd.logits, win.len * V * 2), "cuMemcpyDtoH");
++        }
++        e.settings.pair = true;
++        var want: u64 = 0; // the steps glm.prompt_pair.takesTwo pairs over this prompt
++        var at: usize = 0;
++        while (at < len) {
++            const two = glm.prompt_pair.takesTwo(at, len, e.share.world, &.{});
++            want += @intFromBool(two);
++            at += if (two) 2 * C else C;
++        }
++        if (paired[0] != 0 or paired[1] != want) {
++            std.debug.print("FAIL pair: prompt of {d}: {d} paired steps a chunk a step, {d} paired (want {d})\n", .{ len, paired[0], paired[1], want });
++            failed = true;
++        }
++        if (firsts[0] != firsts[1] or !std.mem.eql(u32, &outs[0], &outs[1]) or !std.mem.eql(u16, logits[0], logits[1])) {
++            std.debug.print("FAIL pair: prompt of {d}: first {d}/{d}, the next window's tokens or logits differ\n", .{ len, firsts[0], firsts[1] });
++            failed = true;
++        }
++        try e.stream.synchronize();
++        const st = &e.seqs.items[2 * i].?.st;
++        const tw = &e.seqs.items[2 * i + 1].?.st;
++        const n = st.arena.buf.len;
++        const h0 = try a.alloc(u8, n);
++        const h1 = try a.alloc(u8, n);
++        try st.arena.buf.download(0, h0);
++        try tw.arena.buf.download(0, h1);
++        const diff = std.mem.indexOfDiff(u8, h0, h1);
++        if (st.pos != tw.pos or st.mtp_len != tw.mtp_len or !std.mem.eql(u1, st.cur, tw.cur) or diff != null) {
++            std.debug.print("FAIL pair: prompt of {d}: the paired state differs (pos {d}/{d}, first byte {?d} of {d})\n", .{ len, st.pos, tw.pos, diff, n });
++            failed = true;
++        }
++    }
++    if (failed) return error.TestFailed;
++    check.pass("paired prompt steps at TP={d}: prompts of {any} rows equal their twins a chunk a step in the first token, the next window's logits and tokens, and every state byte", .{ world, lens });
++}
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index 14e91f46..3b5920b8 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -64,6 +64,7 @@ const lfm2_kernel_tests = @import("lfm2_kernel_tests.zig");
+ const lfm2_vision_tests = @import("lfm2_vision_tests.zig");
+ const radio_tests = @import("radio_tests.zig");
+ const glm_lanes_tests = @import("glm_lanes_tests.zig");
++const glm_pair_tests = @import("glm_pair_tests.zig");
+ const glm_split_tests = @import("glm_split_tests.zig");
+ const glm_paged_tests = @import("glm_paged_tests.zig");
+ const glm_synth = @import("glm_synth.zig");
+@@ -247,6 +248,7 @@ const usage =
+     \\  glm-lanes-cover <ckpt> <dc.json> <rank> <world> <idfile>  copy drafts, cancels, discards, eos and max_new on one lanes.Engine across requests
+     \\  glm-lanes-concurrent <ckpt> <dc.json> <rank> <world> <idfile>  concurrent streams on one lanes.Engine, each against its solo run
+     \\  glm-shared-check <ckpt> <dc.json> <rank> <world> <idfile>  shared verify windows against lone twins, logits and states byte for byte
++    \\  glm-pair-check <ckpt> <dc.json> <rank> <world> <idfile>  paired prompt steps against twins a chunk a step, logits and states byte for byte
+     \\  glm-split-check <ckpt> <dc.json> <rank> <world> <idfile>  prompt chunks with their indexer rows split across ranks against whole twins, byte for byte
+     \\  glm-paged-check <ckpt> <rank> <world> <idfile>  a paged stream (pages out of order, NaN first) against a whole-window twin
+     \\  dory MODEL LOOPS N TEXT     Dory (NVFP4): N greedy tokens from TEXT, then verify windows of 2 to 16 rows bit-equal
+@@ -472,6 +474,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "glm-lanes-cover")) return glm_lanes_tests.coverCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
+     if (std.mem.eql(u8, cmd, "glm-paged-check")) return glm_paged_tests.pagedCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
+     if (std.mem.eql(u8, cmd, "glm-shared-check")) return glm_lanes_tests.sharedCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
++    if (std.mem.eql(u8, cmd, "glm-pair-check")) return glm_pair_tests.pairCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
+     if (std.mem.eql(u8, cmd, "glm-split-check")) return glm_split_tests.splitCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
+     if (std.mem.eql(u8, cmd, "glm-synth")) {
+         const kind = if (rest.len > 1) std.meta.stringToEnum(glm_synth.Kind, rest[1]) orelse return error.UnknownCommand else .nvfp4;
+-- 
+2.53.0
+
