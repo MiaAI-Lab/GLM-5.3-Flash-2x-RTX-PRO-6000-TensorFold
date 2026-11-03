@@ -147,6 +147,8 @@ Settings are layered: `scripts/config.sh` defaults, then `.env` (literal `KEY=va
 | `MTP_DRAFTS`, `MTP_CONFIDENCE` | empty | `--mtp-drafts N`, `--mtp-confidence F` |
 | `GPUS` | `0,1` | GPU indices in rank order, two to four |
 | `PARALLEL` | `4` | `--parallel`: concurrent streams. A number is admitted only if it fits. `auto` serves up to 8, as many as fit |
+| `PREFILL_SHARE` | `0.68` | `TENSORFOLD_PREFILL_SHARE`: the share of wall time a long prompt's 2,048-row chunks get while other streams decode. Each chunk then owes the decoders `(1 - p) / p` of its own time in decode rounds before the next chunk runs. `1` gives them one round per chunk, so a chat beside a long prefill crawls; `0.68` gives them about ten (see [Prefill beside decoding](#prefill-beside-decoding)). Replies are the same at any value |
+| `PREFILL_BUDGET` | empty | `TENSORFOLD_PREFILL_BUDGET`: at most this many prompt rows filled per visit while a stream waits to decode. Empty: no cap |
 | `CONTEXT` | `auto` | `--context`, up to 1,048,576 tokens of prompt plus reply. `auto`: the largest that fits (see below) |
 | `CONTEXT_MAX` | `1048576` | The first window `auto` tries |
 | `CONTEXT_RETRY` | `1` | After a memory refusal, start once more with a window that fits |
@@ -200,6 +202,25 @@ a fixed part (about 0.4 GiB) that a smaller window does not shrink, so the estim
 `--context` window of pages aside first; if the other streams' fixed parts then don't fit, its refusal names what
 would (`fits: --parallel N, TENSORFOLD_MEMORY_RESERVE_GIB=G, --context T`), and `auto` retries with that `--context`.
 After a start, `start.sh` warns if fewer than `PARALLEL` streams or no host prompt-cache tier came up.
+
+### Prefill beside decoding
+
+A long prompt is read in 2,048-row chunks, and a chunk is atomic: the other streams decode only between chunks.
+With `PREFILL_SHARE=1` they get exactly one decode round per chunk, so during a 128K prompt a stream decoding beside it
+drops to about 4-5 tok/s, with a pause of about 420 ms before every token. `PREFILL_SHARE=p` makes each chunk owe the
+decoders `(1 - p) / p` of its own time in decode rounds, so they run longer between chunks and the long prompt's first
+token comes later. Measured at 300 W with three streams decoding when a cold 130K-token prompt arrives (the replies and
+the long prompt's reply were byte-identical at every value):
+
+| `PREFILL_SHARE` | Decode rounds per chunk | A stream's tok/s during the prefill | The long prompt's first token |
+| --- | --- | --- | --- |
+| `1` | 1 | 4-5 | 26.9 s |
+| `0.84` | about 4 | 19-22 | 31.0 s (+15%) |
+| `0.68` (default) | about 10 | 34-40 | 38.1 s (+42%) |
+
+The worst single pause stays one chunk, about 420-520 ms, at any value; only how often it comes changes. A prompt whose
+uncached part is at most 512 rows runs as one call outside the share. `PREFILL_BUDGET=N` is the other lever: it caps
+the prompt rows filled per visit while a stream waits, so decoders get their round sooner at the cost of more visits.
 
 ## Ablit weights
 

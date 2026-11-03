@@ -90,6 +90,13 @@ DRAFTER_BITS="${DRAFTER_BITS:-4}"                # --drafter-bits: 4 (default) o
 MTP_DRAFTS="${MTP_DRAFTS:-}"                     # --mtp-drafts N (empty: the engine's policy)
 MTP_CONFIDENCE="${MTP_CONFIDENCE:-}"             # --mtp-confidence F (empty: off)
 PARALLEL="${PARALLEL:-4}"                        # --parallel: streams at once (a number is required to fit; auto: up to 8)
+# TENSORFOLD_PREFILL_SHARE: the share of wall time a long prompt's 2,048-row chunks get while other streams decode. 1: one
+# decode round per chunk, so a stream decoding beside a long prefill crawls (~4-5 tok/s during a 128K prompt). 0.68: the
+# chunk owes the decoders ~10 rounds (34-40 tok/s a stream during that prefill; its own first token +42%, 26.9 -> 38.1 s);
+# 0.84: ~4 rounds (19-22 tok/s, +15%). Replies are the same at any value: it only moves when the next chunk runs.
+PREFILL_SHARE="${PREFILL_SHARE:-0.68}"
+# TENSORFOLD_PREFILL_BUDGET: prompt rows filled in one visit while a stream waits to decode (empty: no cap)
+PREFILL_BUDGET="${PREFILL_BUDGET:-}"
 # auto: the largest window that fits. The first start tries CONTEXT_MAX (the model's 1,048,576), and when the engine
 # refuses it with its memory figures, starts once more with the window they allow; the window that served is kept in
 # STATE_DIR/context-fit.tsv for the next start with the same memory settings.
@@ -103,7 +110,7 @@ KV="${KV:-fp8}"                                  # --kv-cache: fp8 (a window per
 # per stream. auto: the engine's default (bf16 on pages, fp8 windows). fp8 on pages needs engine patches 0017-0025.
 KV_PAGES="${KV_PAGES:-on}"
 DENSE="${DENSE:-q8}"                             # TF_GLM_DENSE_BITS: bf16 (16) | q8 | q6 | q4 (symmetric int codes, groups of 64)
-HEAD="${HEAD:-q8}"                             # TF_GLM_HEAD_BITS - q8 default per the GB1O campaign port (re-verify here: contract + paired NLL)
+HEAD="${HEAD:-bf16}"                             # TF_GLM_HEAD_BITS for the LM head, same choices
 MEMORY_RESERVE_GIB="${MEMORY_RESERVE_GIB:-4}"    # TENSORFOLD_MEMORY_RESERVE_GIB per GPU (engine default on 96 GB: 3)
 PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-}"         # --prompt-cache-gib (empty: engine default, 16 GiB at most of what is left)
 VISION="${VISION:-1}"                            # --vision: images (rank 0's tower)
