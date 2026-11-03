@@ -45,6 +45,7 @@ validate_config() {
     || fail E_CONFIG 'CONTEXT_FIT_MARGIN must be a fraction in (0, 1].'
   (( PORT <= 65535 && NCCL_PORT < 65535 && PORT != NCCL_PORT && PORT != NCCL_PORT + 1 )) \
     || fail E_CONFIG 'PORT and NCCL_PORT must be distinct ports (the ranks also use NCCL_PORT+1).'
+  [[ "$VISION_MAX_IMAGES" =~ ^[1-9][0-9]*$ && VISION_MAX_IMAGES -le 64 ]] || fail E_CONFIG 'VISION_MAX_IMAGES must be 1-64.'
   for key in THINKING VISION CLEAR_THINKING; do [[ "${!key}" =~ ^[01]$ ]] || fail E_CONFIG "$key must be 0 or 1."; done
   [[ -z "$REASONING_EFFORT" || "$REASONING_EFFORT" =~ ^(low|medium|high|xhigh)$ ]] || fail E_CONFIG 'REASONING_EFFORT must be low, medium, high, xhigh or empty.'
   [[ "$DRAFTER_BITS" =~ ^[04]$ ]] || fail E_CONFIG 'DRAFTER_BITS must be 4 or 0 (bf16).'

@@ -36,7 +36,7 @@ RANK_DEVICES=$(for gpu in "${GPU_IDS[@]}"; do printf '%s\n' "${GPU_IDS[@]}" | so
 # --- the context window ----------------------------------------------------------------------------------------------
 FIT_FILE="$STATE_DIR/context-fit.tsv"
 fit_key() {
-  printf '%s|' "$PATCHES_HASH" "$MODEL_DIR" "$GPUS" "$PARALLEL" "$KV" "$KV_PAGES" "$DENSE" "$HEAD" "$VISION" "$DRAFTER" "$DRAFTER_BITS" \
+  printf '%s|' "$PATCHES_HASH" "$MODEL_DIR" "$GPUS" "$PARALLEL" "$KV" "$KV_PAGES" "$DENSE" "$HEAD" "$VISION" "$VISION_MAX_IMAGES" "$DRAFTER" "$DRAFTER_BITS" \
     "$MEMORY_RESERVE_GIB" "$PROMPT_CACHE_GIB" "$CONTEXT_MAX" "$SERVE_EXTRA_ARGS" | sha256sum | cut -c1-16
 }
 remembered_context() {
@@ -121,7 +121,7 @@ build_serve_args() {
     --max-tokens "$MAX_TOKENS" --kv-cache "$KV" --no-update-check)
   if [[ "$THINKING" == 1 ]]; then SERVE_ARGS+=(--thinking); else SERVE_ARGS+=(--no-thinking); fi
   [[ -z "$REASONING_EFFORT" ]] || SERVE_ARGS+=(--reasoning-effort "$REASONING_EFFORT")
-  [[ "$VISION" != 1 ]] || SERVE_ARGS+=(--vision)
+  [[ "$VISION" != 1 ]] || SERVE_ARGS+=(--vision --vision-max-images "$VISION_MAX_IMAGES")
   [[ -z "$TEMPLATE_FILE" ]] || SERVE_ARGS+=(--chat-template /templates/chat_template.jinja)
   case "$DRAFTER" in
     dflash2) SERVE_ARGS+=(--drafter /dflash2 --drafter-bits "$DRAFTER_BITS") ;;
