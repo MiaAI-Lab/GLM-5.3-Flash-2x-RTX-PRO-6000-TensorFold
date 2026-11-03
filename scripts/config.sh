@@ -103,7 +103,7 @@ KV="${KV:-fp8}"                                  # --kv-cache: fp8 (a window per
 # per stream. auto: the engine's default (bf16 on pages, fp8 windows). fp8 on pages needs engine patches 0017-0025.
 KV_PAGES="${KV_PAGES:-on}"
 DENSE="${DENSE:-q8}"                             # TF_GLM_DENSE_BITS: bf16 (16) | q8 | q6 | q4 (symmetric int codes, groups of 64)
-HEAD="${HEAD:-bf16}"                             # TF_GLM_HEAD_BITS for the LM head, same choices
+HEAD="${HEAD:-q8}"                             # TF_GLM_HEAD_BITS - q8 default per the GB1O campaign port (re-verify here: contract + paired NLL)
 MEMORY_RESERVE_GIB="${MEMORY_RESERVE_GIB:-4}"    # TENSORFOLD_MEMORY_RESERVE_GIB per GPU (engine default on 96 GB: 3)
 PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-}"         # --prompt-cache-gib (empty: engine default, 16 GiB at most of what is left)
 VISION="${VISION:-1}"                            # --vision: images (rank 0's tower)
