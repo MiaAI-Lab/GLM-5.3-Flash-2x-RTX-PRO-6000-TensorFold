@@ -1,0 +1,34 @@
+From: MiaAI_Lab <mia.ailab1@gmail.com>
+Subject: glm-cuda: DFlash2's context input holds a 4,096-row prompt chunk
+
+0094 widens a prompt chunk to 4,096 rows, which DFlash2 then refuses: with the drafter on, the pair loads and
+smoke-tests and the first real prefill ends both ranks with DrafterContextTooWide. MAX_CTX is the bound it trips, and
+it is a capacity, not a window: promptRun's comment says row0 "is only a tap-buffer offset, never a sequence
+position", and the retention rule under it already keeps a chunk's rows from len - WIN on, returning null for a chunk
+that ends before the window. So however wide the chunk, the run handed to the drafter is at most WIN rows; what fails
+is only that the guard and the buffers are sized for a 2,048-row chunk.
+
+WIN is left at 2,048. It is the drafter's own sliding window, which its checkpoint declares, and nothing here needs it
+wider: the prompt logic keeps retaining just the final window, and a paired step's second chunk still has to lie
+wholly inside it (ingestPromptIn's BadPromptContext, kept as it is).
+
+The guard cannot simply be relaxed, because MAX_CTX sizes storage a forward pass writes into before the guard runs:
+the host context rows, cin, taps_prefill, c1, ctx, ckv, the position and ring arrays (dflash_load's acquire and the
+allocations after it) and gs, the 4-bit linear's input group sums. Raising the constant grows that scratch with it,
+which is the point; the drafter holds 0.57 GiB a rank at 4 bits, so its share of the cost is small beside the 1.58 GiB
+the wider chunk already costs the prompt buffers.
+
+Read by Codex (xhigh, read-only) against this tree before writing: it reached MAX_CTX = 4096 with WIN = 2048 as the
+smallest candidate independently, and supplied the point about the tap write preceding the guard.
+
+diff --git a/zig/src/families/glm/dflash.zig b/zig/src/families/glm/dflash.zig
+--- a/zig/src/families/glm/dflash.zig
++++ b/zig/src/families/glm/dflash.zig
+@@ -27,6 +27,6 @@
+ pub const CW: usize = 2 * TOPK; // a row's gathered ints: 16 ids, then 16 values' bits
+ pub const MAX_S: usize = 16; // streams one block pass drafts for
+ pub const MAX_M: usize = MAX_S * BLOCK; // block rows at most
+-pub const MAX_CTX: usize = 2048; // context rows one ingest takes (a prompt chunk's)
++pub const MAX_CTX: usize = 4096; // context rows one ingest takes (a prompt chunk's)
+ pub const STEP_ROWS: usize = 32; // a verify's tap rows (the shared windows' rows at most)
+ pub const TAP_ROW: usize = taps_mod.layers.len * D * 2; // bytes of one row's taps

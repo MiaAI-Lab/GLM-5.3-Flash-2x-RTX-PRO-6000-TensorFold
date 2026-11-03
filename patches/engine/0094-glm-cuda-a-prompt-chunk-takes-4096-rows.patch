@@ -1,0 +1,32 @@
+From: MiaAI_Lab <mia.ailab1@gmail.com>
+Subject: glm-cuda: a prompt chunk takes 4,096 rows, halving the trellis decode a row
+
+A call to the common EXL3 experts decodes every expert's weights, and a prompt pass makes one call a chunk, so that
+decode is a fixed cost amortised over the chunk's rows. cuda_exl3.zig's own note records the other direction of this
+trade: at 1,024 rows "every trellis tile was decoded twice a pass", and it names 4,096 as where upstream's PR #1576
+puts it. With 288 routed experts over 45 layers this is the largest fixed cost in a prompt pass on GLM-5.3-Flash.
+
+Exact, not a numerics change: the same note states that a pair's sums do not depend on which item holds it, so the
+bits are the same. The ship check is therefore identical greedy replies, not an NLL comparison.
+
+What else follows prefill_rows: the prompt buffers and the int8 A8 prompt scratch are sized from it at load, and
+index_ring is 2x it, so the chunk's device scratch roughly doubles; a chunk's rows also remain the step at which kept
+prompt states are cut (cuda_lanes' SnapshotOutOfStep, prefillFrom's BadResume, prefillChunk's BadChunk), so a server
+on this patch cannot resume a state cut by one without it. Both ranks must run the same value, which one image gives.
+
+The prompt profiling buckets (cuda_engine's prompt_profs) are unchanged: their selector sends anything over 1,024
+rows to the last bucket, so a 4,096-row chunk lands there safely, but that bucket's label still reads "to 2048 rows".
+It is only visible under TF_GLM_PROF.
+
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -16,7 +16,7 @@
+ const kda_block = @import("cuda_kda_block.zig");
+ 
+ /// A prompt chunk's rows (decode.PREFILL_ROWS).
+-pub const prefill_rows = 2048;
++pub const prefill_rows = 4096;
+ /// A decode window's rows (Engine's max_rows).
+ pub const window_rows = 16;
+ /// Prompts one prompt pass takes together (cuda_prompts): a prompt buffer's logits rows, one a prompt.

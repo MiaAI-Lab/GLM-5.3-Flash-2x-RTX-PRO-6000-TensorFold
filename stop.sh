@@ -46,7 +46,14 @@ fi
   || fail E_STOP "$CONTAINER_NAME was not started by this recipe (no tf.recipe=glm53-zig label); not touching it."
 [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME")" != true ]] || warn_open_requests
 log "Stopping $CONTAINER_NAME (up to $STOP_TIMEOUT s; requests in progress get TF_DRAIN_S to finish)."
-docker stop -t "$STOP_TIMEOUT" "$CONTAINER_NAME" >/dev/null || fail E_STOP 'Docker could not stop the container. Inspect docker ps and retry.'
+docker stop -t "$STOP_TIMEOUT" "$CONTAINER_NAME" >/dev/null 2>&1 || true
+if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)" == true ]]; then
+  warn W_STOP "Container still runs after the ${STOP_TIMEOUT}s stop; docker kill."
+  docker kill "$CONTAINER_NAME" >/dev/null 2>&1 || true
+fi
+if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)" == true ]]; then
+  fail E_STOP "Container still runs after stop and kill. A human must clean it up: docker ps; docker rm -f $CONTAINER_NAME."
+fi
 run_logs=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/logs"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME")
 if [[ -z "$run_logs" || ! -d "$run_logs" ]]; then
   fail E_LOG 'Cannot locate the rank log directory. The stopped container was retained; inspect its mounts before removing it.'
