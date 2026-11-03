@@ -1,0 +1,33 @@
+diff --git a/docs/safestart.sh b/docs/safestart.sh
+index 757e38f..1f46aa8 100755
+--- a/docs/safestart.sh
++++ b/docs/safestart.sh
+@@ -6,7 +6,8 @@
+ # existed at once on a 128 GB machine. No OOM kill and no panic: the host simply stopped being able
+ # to fork, ping and TCP/22 kept answering, and it needed a power cycle. See docs/speed/RESULTS.md.
+ #
+-# This refuses to start until BOTH ranks' containers are provably absent, and refuses to return
++# This stops through ./stop.sh -- drain, log archive, the stop->kill->verified ladder -- then refuses
++# to start until BOTH ranks' containers are provably absent, and refuses to return
+ # success until /health answers. Every ssh has a timeout, so a wedged worker fails fast and loudly
+ # instead of hanging a programme for hours.
+ set -uo pipefail
+@@ -20,8 +21,16 @@ gone_local()  { ! docker inspect "$NAME" >/dev/null 2>&1; }
+ gone_worker() { ! sshw 25 "docker inspect $NAME >/dev/null 2>&1" >/dev/null 2>&1; }
+ 
+ echo "[safestart] $(date -u +%H:%M:%SZ) verifying both ranks are stopped (worker=$WORKER)"
+-docker rm -f "$NAME" >/dev/null 2>&1
+-sshw 60 "docker rm -f $NAME >/dev/null 2>&1; true" >/dev/null 2>&1
++echo "[safestart] $(date -u +%H:%M:%SZ) ./stop.sh (drain, archive, kill on timeout, verified absent)"
++stop_out=$(./stop.sh 2>&1); stop_rc=$?
++if (( stop_rc == 0 )); then
++  [[ "$stop_out" == *Nothing\ to\ stop* ]] || echo "[safestart] $(echo "$stop_out" | tail -1)"
++else
++  echo "[safestart] stop.sh failed rc=$stop_rc - falling back to a forced remove; its last lines:"
++  echo "$stop_out" | tail -3 | sed 's/^/[safestart]   /'
++  docker rm -f "$NAME" >/dev/null 2>&1
++  sshw 60 "docker rm -f $NAME >/dev/null 2>&1; true" >/dev/null 2>&1
++fi
+ 
+ for i in $(seq 1 24); do          # up to 2 min for the task to actually die
+   l=no; w=no

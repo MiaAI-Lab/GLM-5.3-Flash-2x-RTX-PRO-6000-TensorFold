@@ -1,0 +1,60 @@
+diff --git a/start.sh b/start.sh
+index 705d970..69356f0 100755
+--- a/start.sh
++++ b/start.sh
+@@ -335,7 +335,11 @@ launch() {
+ 
+ # Both containers down, rank 0 first so it ends the follower's steps; used between fit attempts and on failure.
+ stop_both() {
+-  GLM_STOP_LOCK_HELD=1 MEMGUARD=0 "$REPO_ROOT/stop.sh" >/dev/null 2>&1 || true
++  # A failed stop aborts the restart: layering a fresh rank onto a container that would not die is how
++  # spark4 wedged on 2026-11-03. stop.sh escalates stop -> kill and verifies both ranks are gone;
++  # a nonzero status here means a rank is still there and a human must look before anything starts.
++  GLM_STOP_LOCK_HELD=1 MEMGUARD=0 "$REPO_ROOT/stop.sh" >/dev/null 2>&1 \
++    || fail E_STOP 'The ranks would not stop (stop, then kill, both verified absent). Clean up by hand: docker ps on both Sparks.'
+ }
+ 
+ stop_follower() { kill "${log_follower:-}" 2>/dev/null || true; wait "${log_follower:-}" 2>/dev/null || true; trap - EXIT; }
+diff --git a/stop.sh b/stop.sh
+index da77da5..30edd8d 100755
+--- a/stop.sh
++++ b/stop.sh
+@@ -1,6 +1,9 @@
+ #!/usr/bin/env bash
+ # Stop both ranks, save one gzipped archive with their logs and keep the newest LOG_KEEP (10).
+ # Rank 0 goes first: it drains its requests and ends the follower's steps; then rank 1 on the worker.
++# A rank that still runs after the STOP_TIMEOUT stop gets docker kill; one still running after the kill
++# fails the stop, so a start aborts for a human instead of layering a second container onto a wedged
++# one (two ~100 GiB workloads on a 128 GB host wedged spark4 on 2026-11-03).
+ # Usage: ./stop.sh; DRY_RUN=1 ./stop.sh prints the plan and changes nothing.
+ # Only this recipe's containers (label tf.recipe=glm53-spark) are stopped; any other container is left alone.
+ set -euo pipefail
+@@ -67,12 +70,25 @@ RUN_LOG_DIR=$(readlink -f "$LOG_DIR/current" 2>/dev/null || true)
+ if (( here )) && [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME")" == true ]]; then
+   warn_open_requests
+   log "Stopping rank 0 here (up to $STOP_TIMEOUT s; requests in progress get TF_DRAIN_S to finish)."
+-  docker stop -t "$STOP_TIMEOUT" "$CONTAINER_NAME" >/dev/null || fail E_STOP 'Docker could not stop rank 0. Inspect docker ps and retry.'
++  docker stop -t "$STOP_TIMEOUT" "$CONTAINER_NAME" >/dev/null 2>&1 || true
++  if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)" == true ]]; then
++    warn W_STOP "Rank 0 still runs after the ${STOP_TIMEOUT}s stop; docker kill."
++    docker kill "$CONTAINER_NAME" >/dev/null 2>&1 || true
++  fi
++  if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)" == true ]]; then
++    fail E_STOP "Rank 0 still runs after stop and kill. A human must clean it up (docker ps; docker rm -f $CONTAINER_NAME) before a start can be trusted."
++  fi
+ fi
+ if (( there )); then
+   log "Stopping rank 1 on $(worker_host)."
+-  wssh docker stop -t "$STOP_TIMEOUT" "$CONTAINER_NAME" >/dev/null 2>&1 \
+-    || warn W_STOP "Could not stop rank 1 on $(worker_host); stop it there with: docker stop $CONTAINER_NAME"
++  wssh docker stop -t "$STOP_TIMEOUT" "$CONTAINER_NAME" >/dev/null 2>&1 || true
++  if [[ "$(wssh docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)" == true ]]; then
++    warn W_STOP "Rank 1 still runs on $(worker_host) after the ${STOP_TIMEOUT}s stop; docker kill."
++    wssh docker kill "$CONTAINER_NAME" >/dev/null 2>&1 || true
++  fi
++  if [[ "$(wssh docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)" == true ]]; then
++    fail E_STOP "Rank 1 on $(worker_host) still runs after stop and kill. A human must clean it up there (docker ps; docker rm -f $CONTAINER_NAME)."
++  fi
+ fi
+ 
+ # Both ranks' output, saved before the containers go.
