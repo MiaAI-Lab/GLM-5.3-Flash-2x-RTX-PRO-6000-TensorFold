@@ -302,6 +302,8 @@ downstream of it, so the drafter accepts a little less than on the published che
 | 0091 | Decode DSA index scores for 4–16-row windows |
 | 0092 | A JSON answer stays JSON beside offered tools: `response_format`, `guided_json` and `structured_outputs` replies are never parsed as tool calls, on chat, Responses and Messages |
 | 0093 | A reply grammar is freed when its stream cannot start |
+| 0096 | A tool call after prose that quotes its opener (`Qwen's <tool_call>{}`) is parsed as the call; before, the quoted opener began the envelope and the whole reply came back as content with no `tool_calls` |
+| 0097 | Warm turns for GLM: after a reply the server prefills the next turn's prompt in the background, so a user message after an agent loop resumes past the loop instead of re-reading it (GLM's template drops the loop's reasoning once the next message comes); the pass yields to real work at its next chunk gate, and (every family) to a request admitted ahead of it into the fill queue; each pass's outcome is logged (`next turn: background prefill of N tokens done` / `stepped aside` / `failed: ...`) |
 | 0076, 0079, 0085, 0087 | Test and contract-record changes |
 
 Every default-on patch was A/B tested against the image before it: greedy (T=0) replies identical, plus a measured

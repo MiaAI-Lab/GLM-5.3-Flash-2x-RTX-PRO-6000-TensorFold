@@ -1,0 +1,298 @@
+From: MiaAI_Lab <mia.ailab1@gmail.com>
+Subject: glm: warm turns, so the next user message resumes past the agent loop
+
+GLM's template renders an assistant turn's reasoning only after the last user message (clear_thinking). During an
+agent loop the loop's turns carry their reasoning; once the next user message comes they render with an empty think
+block, so the prompt changes at the first turn after the previous user message and the prefix cache resumes there:
+the whole previous turn (tool calls and results, 50-100K tokens on this pair) is prefilled again, 10-30 s before the
+first token. Measured 2026-11-04 on the serving pair: a user message after a small tool loop resumed at 4,096 of
+9,335 tokens; with the loop's turns rendered the same way it resumed at 8,192.
+
+The server already has the mechanism: warm.zig prefills, after a reply, the conversation plus the reply plus the next
+turn's opening as a background prompt-only pass (max_tokens 0), on engines that report warm_turns. That rendering
+places the reply before a next user message, so it is the cleared one the next message sends. The GLM family did not
+report warm_turns: native/cuda.zig enables them for a family that declares warm_quiet, and GLM declared none.
+
+Each pass's outcome is logged ("next turn: background prefill of N tokens done", "stepped aside: other work came
+first" when it never started, "stepped aside" when it yielded mid-pass, "failed: ..."): a pass that keeps nothing
+was invisible before.
+
+- families/glm/cuda_native.zig declares warm_quiet (150 ms, Nemotron's): the pass waits that long for other work
+  before its first chunk.
+- families/glm/cuda_lanes.zig: the chunk gate's cancel check also reads the stream's yield check, so a warm pass steps
+  aside at its next chunk gate once a request waits or a stream decodes (lane_host.yieldsTo). The engine already keeps
+  the states the pass reached on a cancelled chunk (snapshots.interrupted through the marks), on every rank, by rank
+  0's word (engine.gate's shared cancel). A foreground request's cancel check is unchanged: it never yields.
+- native/cuda.zig: the host takes the family's warm_quiet. Before, a family with warm turns got Nemotron's constant.
+- server/warm.zig: after a reply with tool calls the next message is a tool result, not a user message, so the dummy
+  next turn is a tool message; a template that clears earlier turns' reasoning renders the loop differently before
+  each, and a user-turn rendering after a call would prefill the cleared loop on every tool call. After an answer the
+  dummy turn stays a user message.
+- server/openai.zig: the warm message carries the reply's reasoning_content, as the client sends it back, so a tool
+  turn's rendering (reasoning kept) and a clear_thinking=false client's match the next request.
+- core/lane_host.zig (every family): a warm pass's quiet wait and its yield check saw a foreground request only once
+  queued or decoding. One admitted ahead of the pass into the fill queue (a chunk a round, how this family reads
+  prompts beside decoders) was neither, so a whole-prompt warm pass could hold up that prefill for its length. Both
+  checks now also read the admitted list; lane_host_warm_test.zig has the case (it failed before the change: the
+  pass ran to its end ahead of the request).
+
+Tests: late_system_test.zig (a tool-call reply warms the tool turn's opening, a plain reply the user turn's; the
+existing warm-prompt tests pass unchanged), lane_host_warm_test.zig (the admitted-ahead case; 404 lane host tests
+pass), check-native-cuda-host compiles the family. The pass's behaviour on the pair (a user message after a loop resuming
+past the loop, the pass yielding to a request) is verified live after the restart: rank0.log's "resumed at" for the
+next user message, and the reply's cached_tokens.
+
+Found and fixed by Mia's AI Lab with a council of three: Claude, GLM-5.3-Flash on this pair (it checked the TP2, snapshot
+and page paths) and Codex (it found the fill-queue hole). Their records: docs/council-2026-11-04/ in the recipe.
+
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index e2bd3fea..4bf0a60e 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -213,7 +213,16 @@ pub const LaneHost = struct {
+         const job: *Job = @ptrCast(@alignCast(ctx));
+         job.host.lock();
+         defer job.host.unlock();
+-        return job.host.foregroundWaiting() or job.host.core.activeCount() > 0;
++        return job.host.warmBlocked(job);
++    }
++
++    /// Work a warm pass steps aside for, the caller holding the lock: a foreground request queued, or admitted and
++    /// not yet decoding (its prompt in the fill queue, a chunk a round, which a whole pass would hold up), or any
++    /// stream decoding.
++    fn warmBlocked(h: *const LaneHost, warm: *const Job) bool {
++        if (h.foregroundWaiting() or h.core.activeCount() > 0) return true;
++        for (h.admitted.items) |other| if (other != warm and !other.request.background) return true;
++        return false;
+     }
+ 
+     /// A foreground request is queued (they queue ahead of every background one); the caller holds the lock.
+@@ -226,7 +235,7 @@ pub const LaneHost = struct {
+         const until: std.Io.Timeout = .{ .deadline = .fromNow(h.io, .{ .raw = .fromNanoseconds(h.warm_quiet), .clock = .awake }) };
+         h.lock();
+         defer h.unlock();
+-        while (!h.closing and !h.foregroundWaiting() and h.core.activeCount() == 0 and std.mem.indexOfScalar(Id, h.cancels.items, job.id) == null) {
++        while (!h.closing and !h.warmBlocked(job) and std.mem.indexOfScalar(Id, h.cancels.items, job.id) == null) {
+             h.wake.waitTimeout(h.io, &h.mutex, until) catch |e| return e == error.Timeout;
+         }
+         return false;
+@@ -323,15 +332,15 @@ pub const LaneHost = struct {
+     /// A taken job's stream, set up to start; null when the job ended instead (dropped or cancelled).
+     pub fn setup(h: *LaneHost, job: *Job) ?i96 {
+         const r = job.request;
+-        if (r.background and r.max_tokens == 0 and h.warm_quiet > 0 and !h.quiet(job)) return h.ended(h.cancel(job)); // other work came first
++        if (r.background and r.max_tokens == 0 and h.warm_quiet > 0 and !h.quiet(job)) { // other work came first: it ends before its stream opens
++            h.remove(job);
++            h.finish(job, .cancelled, "other work came first");
++            return null;
++        }
+         if (!lane_stream.open(h, job)) return null; // the job was finished instead
+         return job.began;
+     }
+ 
+-    fn ended(_: *LaneHost, _: bool) ?i96 {
+-        return null;
+-    }
+-
+     /// Whether a set-up job starts outside a shared prompt pass: a warm pass, or the lone driver's.
+     pub fn startsAlone(h: *LaneHost, job: *Job) bool {
+         if (job.request.embedding != null) return false;
+diff --git a/zig/src/core/lane_host_warm_test.zig b/zig/src/core/lane_host_warm_test.zig
+index c32b62a0..01a3eb1f 100644
+--- a/zig/src/core/lane_host_warm_test.zig
++++ b/zig/src/core/lane_host_warm_test.zig
+@@ -322,3 +322,34 @@ test "a finished warm pass keeps its states with its request's length: the histo
+         try std.testing.expect(got.same);
+     }
+ }
++
++test "a warm pass steps aside for a request admitted ahead of it whose prompt is still filling, and runs no chunk" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 3 };
++    defer target.deinit();
++    var chunks: WarmChunks = .{};
++    target.prefill_hook = WarmChunks.hook;
++    target.prefill_hook_ctx = &chunks;
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.stepped(), clock.clock()); // prompts fill a chunk a round
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2, .warm_turns = true });
++    host.warm_quiet = 20 * std.time.ns_per_ms;
++    const prompt = [_]u32{ 2, 7, 1, 8 };
++    var warm: Box = .{};
++    var real: Box = .{};
++    const request: Request = .{ .prompt = &prompt, .max_tokens = 48 };
++    const warm_request: Request = .{ .prompt = &prompt, .max_tokens = 0, .background = true };
++    // both queued before the thread starts: the request is admitted into the fill queue, not decoding yet, and the
++    // pass is admitted beside it on the spare lane before the request's first chunk ran
++    try host.engine().submit(1, &request, .{ .ctx = &real, .event = Box.event });
++    try host.engine().submit(2, &warm_request, .{ .ctx = &warm, .event = Box.event });
++    try host.start();
++    defer host.stop();
++    try std.testing.expectEqual(Reason.cancelled, warm.wait());
++    try std.testing.expectEqual(@as(usize, 0), chunks.n.load(.monotonic)); // the request's prompt was not held up
++    try std.testing.expectEqual(Reason.length, real.wait());
++    try std.testing.expectEqual(@as(usize, 48), real.tokens);
++}
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index 6046c944..e1ad9ae0 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -206,8 +206,11 @@ pub const Lanes = struct {
+         return false;
+     }
+ 
++    /// Read at every chunk gate (on every rank, rank 0's word): the stream was cancelled, or it is a background
++    /// prompt pass (a warm turn, server/warm.zig) and real work waits; the states kept so far stay kept either way.
+     fn cancelled(ptr: ?*anyopaque) bool {
+-        return @as(*lanes.Stream, @ptrCast(@alignCast(ptr.?))).isCancelled();
++        const s: *lanes.Stream = @ptrCast(@alignCast(ptr.?));
++        return s.isCancelled() or s.yields();
+     }
+ 
+     // -- the vtable ---------------------------------------------------------------------------------------------
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index bc346026..dbdbf4f7 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -24,6 +24,11 @@ pub const max_segments: u32 = 1;
+ pub const prompt_rows: u32 = fw.prefill_rows;
+ /// Prompt kernels change arithmetic with a chunk's rows: states keep and resume only on chunk starts.
+ pub const snap_grid: u32 = prompt_rows;
++/// Warm turns (server/warm.zig): after a reply, the next turn's prompt is prefilled in the background, so a user
++/// message after an agent loop resumes past the loop's turns, which GLM's template renders without their reasoning
++/// once that message comes. The pass waits this long for other work before its first chunk, and steps aside at any
++/// chunk gate once real work waits (cuda_lanes.zig `cancelled`), keeping the states it reached.
++pub const warm_quiet: u64 = 150 * std.time.ns_per_ms;
+ /// `explain` words this family's open refusals too (where to set the rank and the id).
+ pub const explains_open = true;
+ 
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 068c4e60..1ad046c0 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -75,6 +75,7 @@ pub const Host = struct {
+     startup: []u8 = &.{},
+     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
+     store: ?*api.prompt_cache.Store = null, // kept Nemotron states; null when the budget is 0
++    warm_quiet: u64 = 0, // ns a warm pass waits for other work before its first chunk: the family's `warm_quiet`
+     learn: ?api.Learner = null, // the family's Sliding Weights learner (--slide), called with the context current
+     slide: ?*anyopaque = null, // that learner's adapter, freed by slide_free before the family
+     slide_free: ?*const fn (Allocator, *anyopaque) void = null,
+@@ -130,7 +131,7 @@ pub const Host = struct {
+         h.host.explain = explain;
+         h.host.health = @import("cuda_readiness.zig").source(h);
+         h.host.cache = h.store;
+-        h.host.warm_quiet = if (info.warm_turns) nemotron.native.warm_quiet else 0;
++        h.host.warm_quiet = if (info.warm_turns) h.warm_quiet else 0;
+         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true, .logprobs = h.inner.vtable.first_row != null, .structures = h.inner.vtable.first_masked != null, .min_budget = nemotron.native.lone_min_budget, .resumes = true };
+         if (h.learn != null) h.host.learner = h.learner();
+         try h.host.start();
+@@ -435,6 +436,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         }
+         try kv_pages.store(F, store, loaded.target, kept); // its snapshot slots, before a disk probe takes one
+         h.store = store;
++        if (@hasDecl(F, "warm_quiet")) h.warm_quiet = F.warm_quiet;
+         if (o.learn_conversations) if (o.learn) |root| {
+             if (F == nemotron.native) try cuda_disk.attach(a, io, &g.ctx, o, root, kernels, loaded, store);
+             if (comptime cuda_disk.keptDisk(F)) |K| try cuda_disk.attachKept(K, F.model_type, a, io, &g.ctx, o, root, kernels, loaded, store);
+diff --git a/zig/src/server/late_system_test.zig b/zig/src/server/late_system_test.zig
+index 73680b93..3798da4c 100644
+--- a/zig/src/server/late_system_test.zig
++++ b/zig/src/server/late_system_test.zig
+@@ -549,3 +549,33 @@ test "tool visibility HTTP: whole replies retain an unoffered call" {
+ test "tool visibility HTTP: streamed replies retain an unoffered call" {
+     try unofferedVisible(true);
+ }
++
++test "a tool-call reply warms the tool turn's opening and a plain reply the user turn's" {
++    var text: DropLate = .{};
++    var backend: Capture = .{ .reply = prose_reply, .warm_turns = true };
++    defer std.testing.allocator.free(backend.prompt);
++    defer std.testing.allocator.free(backend.background_prompt);
++    const srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
++        .served_name = "m",
++        .model_ids = &.{"m"},
++        .enable_thinking = false,
++        .use_drafts = false,
++    }, null);
++    defer srv.deinit();
++    const called = try exchange(srv, "/v1/chat/completions", prose_chat ++ "}");
++    defer std.testing.allocator.free(called.body);
++    try std.testing.expectEqual(@as(u16, 200), called.status);
++    const after_call = try promptText(backend.background_prompt);
++    defer std.testing.allocator.free(after_call);
++    // the next message is a tool result: the pass ends at its opening, with the call in place
++    try std.testing.expect(std.mem.endsWith(u8, after_call, "[tool]"));
++    try std.testing.expect(std.mem.indexOf(u8, after_call, "[user]A") == null);
++    try std.testing.expect(std.mem.indexOf(u8, after_call, "\"name\":\"lookup\"") != null);
++    backend.reply = "plain words";
++    const answered = try exchange(srv, "/v1/chat/completions", prose_chat ++ "}");
++    defer std.testing.allocator.free(answered.body);
++    try std.testing.expectEqual(@as(u16, 200), answered.status);
++    const after_answer = try promptText(backend.background_prompt);
++    defer std.testing.allocator.free(after_answer);
++    try std.testing.expect(std.mem.endsWith(u8, after_answer, "[assistant]plain words\n[user]"));
++}
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index 74e6c22d..b45a822f 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -400,6 +400,7 @@ const Run = struct {
+         const message = json.newObject(r.a) catch return;
+         message.put(r.a, "role", .{ .string = "assistant" }) catch return;
+         message.put(r.a, "content", if (calls != null and reply.content.len == 0) .null else .{ .string = reply.content }) catch return;
++        if (reply.reasoning) |t| if (t.len > 0) message.put(r.a, "reasoning_content", .{ .string = t }) catch return; // rendered where the template keeps it
+         if (calls) |c| message.put(r.a, "tool_calls", .{ .array = c }) catch return;
+         if (r.turn) |t| t.remember(r.a, r.plan.input, .{ .object = message });
+         warm.reply(r.srv, r.plan.input, .{ .object = message }, reply.thinking, reply.effort, reply.prompt_tokens);
+diff --git a/zig/src/server/warm.zig b/zig/src/server/warm.zig
+index fdd7a543..c9f88412 100644
+--- a/zig/src/server/warm.zig
++++ b/zig/src/server/warm.zig
+@@ -19,6 +19,13 @@ const Pass = struct {
+     fn event(ptr: *anyopaque, _: api.Id, e: *const api.Event) void {
+         if (e.* != .finished) return;
+         const p: *Pass = @ptrCast(@alignCast(ptr));
++        const f = e.finished;
++        log.line("next turn: background prefill of {d} tokens {s}{s}{s} (queued {d:.2}s)", .{ p.request.prompt.len, switch (f.reason) {
++            .length => "done",
++            .cancelled => "stepped aside",
++            .failed => "failed",
++            else => "ended",
++        }, if (f.message.len > 0) ": " else "", f.message, f.stats.queued_seconds });
+         var arena = p.arena;
+         p.gpa.destroy(p);
+         arena.deinit();
+@@ -59,19 +66,24 @@ fn start(srv: *Server, input: chat.Input, message: Value, thinking: bool, effort
+     handed = true;
+ }
+ 
+-/// The tokens every next user or tool turn shares: two renderings agree up to that turn's text.
++/// The tokens every next turn shares: two renderings agree up to that turn's text. After a call the next turn is a
++/// tool result, after an answer a user message: a template that clears earlier turns' reasoning (GLM's) renders the
++/// loop's turns differently before each, and only the turn that comes next is worth prefilling.
+ fn shared(srv: *Server, cx: *errors.Cx, input: chat.Input, message: Value, thinking: bool, effort: ?[]const u8) !struct { ids: []const u32, messages: []Value } {
+     const before = input.messages.array;
++    const calls = message.get("tool_calls");
++    const called = calls != null and calls.? == .array and calls.?.array.len > 0;
+     var ids: [2][]const u32 = undefined;
+     var first: []Value = undefined;
+     for ([_][]const u8{ "A", "B" }, &ids, 0..) |text, *out, i| {
+         const list = try cx.a.alloc(Value, before.len + 2);
+         @memcpy(list[0..before.len], before);
+         list[before.len] = message;
+-        const user = try json.newObject(cx.a);
+-        try user.put(cx.a, "role", .{ .string = "user" });
+-        try user.put(cx.a, "content", .{ .string = text });
+-        list[before.len + 1] = .{ .object = user };
++        const next = try json.newObject(cx.a);
++        try next.put(cx.a, "role", .{ .string = if (called) "tool" else "user" });
++        if (called) if (calls.?.array[0].get("id")) |id| if (id == .string) try next.put(cx.a, "tool_call_id", id);
++        try next.put(cx.a, "content", .{ .string = text });
++        list[before.len + 1] = .{ .object = next };
+         if (i == 0) first = list;
+         out.* = try prompt_mod.renderIds(srv, cx, .{ .array = list }, input.tools, thinking, effort, true);
+     }
