@@ -1,5 +1,13 @@
 # Changelog
 
+- **2026-11-04** -- CREDITS and NOTICE, the Aevonix entry corrected. The four serving scripts are that recipe's rework, which
+  stands - but the entry now records where Aevonix's own scripts came from: their NOTICE takes `scripts/config.sh` and
+  `start-tp4.sh` of this lab's GLM-5.3-Flash-EXL3-4x-DGX-Sparks-TensorFold (created 2026-10-01, the day before Aevonix's
+  repository) as "the basis" of their `start.sh` and `scripts/config.sh`, and their `stop.sh` and `scripts/prepare.sh` as
+  "adapted from Mia's scripts". `scripts/banner.sh` was never theirs: the two-Spark and four-Spark recipes carry the same
+  MIA AI LAB banner file and this recipe recolours it, while Aevonix's banner is their own artwork. And patch 0073, whose K12
+  loop patch 0078 follows, is `patches/aevonix/0073` in Aevonix's repository - the old cite to "MiaAI-Lab/Aevonix" names a
+  repository that does not exist.
 - **2026-11-04** -- Engine patch `0098`: a tool parameter whose schema names no type (`{}`, a description alone, a `$ref`
   that resolves nowhere) takes the JSON object or array the model wrote instead of coming back as a JSON string of it;
   scalars, plain words and quoted strings stay text, and a tool declared without a parameter schema keeps streaming its

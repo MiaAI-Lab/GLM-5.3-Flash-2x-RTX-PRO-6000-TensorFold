@@ -29,8 +29,10 @@ Patches 0057-0063 are Mia's AI Lab's extension of #1423 to DFlash2.
 ## Work this recipe adapts
 
 - **[Aevonix Research](https://aevonix.com)** (GLM-5.3-Flash EXL3 on 4x RTX PRO 6000, by Kurcide, Apache-2.0): `start.sh`, `stop.sh`,
-  `scripts/config.sh`, `scripts/prepare.sh` and `scripts/banner.sh` are adapted from that recipe. Patch 0078's main loop follows the
-  K12 loop in its Python patch series (patch 0073, MiaAI-Lab/Aevonix).
+  `scripts/config.sh` and `scripts/prepare.sh` are adapted from that recipe - whose own scripts rework this lab's `scripts/config.sh`
+  and `start-tp4.sh` from GLM-5.3-Flash-EXL3-4x-DGX-Sparks-TensorFold, as Aevonix's NOTICE records. `scripts/banner.sh` is this
+  lab's own art (the two-Spark and four-Spark recipes share it; this one recolours it) - Aevonix drew their own. Patch 0078's main
+  loop follows the K12 loop of Aevonix's patch 0073 (`patches/aevonix/0073` in that repository, TensorFold v0.6.6).
 - **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)** by Z.ai (MIT): `templates/glm-5.3-flash-vision.jinja` is the
   checkpoint's own chat template with its media branch changed.
 - **[DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold)**
