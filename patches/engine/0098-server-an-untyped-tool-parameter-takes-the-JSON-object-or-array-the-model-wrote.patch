@@ -1,0 +1,226 @@
+From 3a029360e758e78b4213de9701454b865e5bec9b Mon Sep 17 00:00:00 2001
+From: MiaAI_Lab <mia.ailab1@gmail.com>
+Date: Wed, 4 Nov 2026 14:46:28 +0200
+Subject: [PATCH] server: an untyped tool parameter takes the JSON object or
+ array the model wrote (2x DGX Sparks recipe issue #180)
+
+A tool parameter whose schema names no type - `{}`, a description alone, or a reference that resolves nowhere (a
+missing definition, a cycle, a bad pointer) - came back to the client as a JSON string holding the object the model
+wrote: `"payload":"{\"id\": 7, \"tags\": [\"alpha\", \"beta\"]}"`. Reproduced on this pair 2026-11-04 with an
+agent-style tool whose `payload` carried only a description. Upstream keeps an untyped value as text (v1.1.2's rule);
+this recipe follows the maintainer's decision on MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#180 (reported
+by jsfs11, traced by SvangenStudios): decode when the schema admits an object or array or is untyped and the text
+parses as a JSON object or array; scalars, plain words and JSON-quoted strings stay the text the model wrote. A union
+that admits an object already decoded one here.
+
+- tool_params.decode: an untyped schema goes through `untyped`, which parses the text (whole, or left open and closed
+  as a typed object is) and keeps an object or array; `schemaUntyped` names the condition. Tests: `{}` and a
+  description-only schema with an object, an array, an open object, and seven texts that stay text.
+- tool_stream: an untyped parameter's key is held until its value's first non-blank byte: `{` or `[` buffers the
+  value and decodes it at the close, as a typed value is; anything else streams as text exactly as before (a tool
+  declared without a parameter schema keeps streaming its arguments). A value closed before any byte is the empty
+  string; a value the reply's end cut short is sent whole as a string.
+- tool_union_witness: the six cases where a kind-less reference carried an object (cycle, missing definition, bad
+  pointer, type-free definition) now expect the object, with the divergence from upstream noted at the gate.
+
+Host tests: test-tool-parse-host (43), test-tool-visibility-http-host, test-json-answer-host, check-native-cuda-host
+pass; the cold host suites give the base tree's failure set (tool_stream_test's cut and witness cases included).
+
+---
+ zig/src/server/tool_params.zig        | 48 ++++++++++++++++++++++++++-
+ zig/src/server/tool_stream.zig        | 29 +++++++++++++++-
+ zig/src/server/tool_union_witness.zig | 18 +++++-----
+ 3 files changed, 85 insertions(+), 10 deletions(-)
+
+diff --git a/zig/src/server/tool_params.zig b/zig/src/server/tool_params.zig
+index 3fe12c490..8b9a87df9 100644
+--- a/zig/src/server/tool_params.zig
++++ b/zig/src/server/tool_params.zig
+@@ -77,6 +77,12 @@ pub fn schemaTakesJson(a: Allocator, schema: Schema) Allocator.Error!bool {
+     return tool_kinds.takesJson(kinds);
+ }
+ 
++/// The schema names no kinds at all (``{}``, a description alone, a reference that resolves nowhere): ``decode`` then
++/// takes a JSON object or array the model wrote and keeps anything else as text.
++pub fn schemaUntyped(a: Allocator, schema: Schema) Allocator.Error!bool {
++    return (try tool_kinds.schemaKinds(a, schema.value, schema.root)) == null;
++}
++
+ /// ``json.dumps(v, allow_nan=False)`` succeeds: no NaN or infinity anywhere.
+ pub fn finite(v: Value) bool {
+     return switch (v) {
+@@ -118,8 +124,12 @@ pub fn closedJson(a: Allocator, text: []const u8) Allocator.Error!?[]const u8 {
+ }
+ 
+ /// ``decode_parameter``: the schema's type when the text spells one, else the text; ``python`` also reads Python's spelling.
++/// A parameter whose schema names no type (``{}``, or a description alone) takes the text as a JSON object or array when
++/// it parses as one, else as text: scalars, plain words and JSON-quoted strings stay the text the model wrote. Upstream
++/// keeps an untyped value as text; this follows MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#180 (agents' untyped
++/// object arguments came back as JSON strings).
+ pub fn decode(a: Allocator, value: []const u8, schema: Schema, python: bool) Allocator.Error!Value {
+-    const kinds = (try tool_kinds.schemaKinds(a, schema.value, schema.root)) orelse return .{ .string = value };
++    const kinds = (try tool_kinds.schemaKinds(a, schema.value, schema.root)) orelse return untyped(a, value);
+     if (!tool_kinds.takesJson(kinds)) return .{ .string = value };
+     const closed: ?[]const u8 = if (kinds.contains(.array) or kinds.contains(.object)) try closedJson(a, value) else null;
+     for ([_]?[]const u8{ value, closed }) |candidate| {
+@@ -137,6 +147,19 @@ pub fn decode(a: Allocator, value: []const u8, schema: Schema, python: bool) All
+     return if (tool_kinds.accepts(kinds, parsed)) parsed else .{ .string = value };
+ }
+ 
++/// An untyped parameter's value: a JSON object or array when the text is one (whole, or left open and closed), else the text.
++fn untyped(a: Allocator, value: []const u8) Allocator.Error!Value {
++    for ([_]?[]const u8{ value, try closedJson(a, value) }) |candidate| {
++        const text = candidate orelse continue;
++        const parsed = switch (try json.parseText(a, text)) {
++            .ok => |v| v,
++            .err => continue,
++        };
++        if ((parsed == .object or parsed == .array) and finite(parsed)) return parsed;
++    }
++    return .{ .string = value };
++}
++
+ /// ``_python_literal``: True, None, quoted strings, numbers, lists, tuples and dicts; null if ``text`` is not one.
+ pub fn pythonLiteral(a: Allocator, text: []const u8) Allocator.Error!?Value {
+     const stripped = reply_text.pyStrip(text);
+@@ -401,3 +424,26 @@ test "decode parameters" {
+     try std.testing.expectEqualStrings("[\"a\", null, true]", try json.stringify(a, py, .{}));
+     try std.testing.expectEqual(Value.null, (try decode(a, " None ", try parseSchema(a, "{\"type\": \"null\"}"), true)));
+ }
++
++test "an untyped parameter takes a JSON object or array, and keeps everything else as text (#180)" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    for ([_][]const u8{ "{}", "{\"description\": \"the record\"}" }) |text| {
++        const untyped_schema = try parseSchema(a, text);
++        const obj = try decode(a, "{\"id\": 7, \"tags\": [\"alpha\", \"beta\"]}", untyped_schema, false);
++        try std.testing.expectEqualStrings("7", obj.object.get("id").?.int);
++        try std.testing.expectEqual(@as(usize, 2), obj.object.get("tags").?.array.len);
++        const arr = try decode(a, "[1, 2]", untyped_schema, false);
++        try std.testing.expectEqual(@as(usize, 2), arr.array.len);
++        const open = try decode(a, "{\"id\": 7", untyped_schema, false); // left open by the end token: closed, as a typed object is
++        try std.testing.expectEqualStrings("7", open.object.get("id").?.int);
++        for ([_][]const u8{ "hello world", "42", "true", "null", "\"quoted\"", "{not json}", "" }) |plain| {
++            try std.testing.expectEqualStrings(plain, (try decode(a, plain, untyped_schema, false)).string);
++        }
++    }
++    // a union that admits an object already decoded one (upstream); a string-only schema never does
++    const uni = try parseSchema(a, "{\"type\": [\"object\", \"string\"]}");
++    try std.testing.expectEqualStrings("7", (try decode(a, "{\"id\": 7}", uni, false)).object.get("id").?.int);
++    try std.testing.expectEqualStrings("{\"id\": 7}", (try decode(a, "{\"id\": 7}", try parseSchema(a, "{\"type\": \"string\"}"), false)).string);
++}
+diff --git a/zig/src/server/tool_stream.zig b/zig/src/server/tool_stream.zig
+index 403e38f5d..eaca9d5a3 100644
+--- a/zig/src/server/tool_stream.zig
++++ b/zig/src/server/tool_stream.zig
+@@ -43,6 +43,8 @@ pub const Streamer = struct {
+     current: []const u8 = "",
+     value_schema: tool_params.Schema = .{ .value = .null, .root = .null },
+     typed: bool = false,
++    untyped: bool = false, // the schema names no kinds (tool_params.decode's untyped rule): the value's first byte decides
++    pending_open: ?[]const u8 = null, // an untyped parameter's key, held until its value's first non-blank byte says JSON or text
+     buffer: std.ArrayList(u8) = .empty,
+     pos: usize = 0,
+     state: enum { outside, call, buffered, function, value, closing, abort } = .outside,
+@@ -241,10 +243,14 @@ pub const Streamer = struct {
+                     if (opening(rest, "<parameter=")) |m| {
+                         const key = reply_text.pyStrip(m.name);
+                         s.value_schema = try tool_params.schemaOf(&s.schemas, s.current, key, s.a);
++                        s.untyped = try tool_params.schemaUntyped(s.a, s.value_schema);
+                         s.typed = try typedSchema(s.a, s.value_schema);
+                         s.buffer.clearRetainingCapacity();
+                         const quoted = try json.quote(s.a, key, .{ .ascii = false });
+-                        try out.append(s.a, try s.args(try std.mem.concat(s.a, u8, &.{ if (s.args_open) "," else "{", quoted, if (s.typed) ":" else ":\"" })));
++                        const prefix = try std.mem.concat(s.a, u8, &.{ if (s.args_open) "," else "{", quoted });
++                        // an untyped value streams as text unless it begins as a JSON object or array, which is then
++                        // buffered and decoded at its close (tool_params.decode): the key waits for the first byte
++                        if (s.untyped) s.pending_open = prefix else try out.append(s.a, try s.args(try std.mem.concat(s.a, u8, &.{ prefix, if (s.typed) ":" else ":\"" })));
+                         s.args_open = true;
+                         s.pos += m.len;
+                         s.state = .value;
+@@ -278,6 +284,22 @@ pub const Streamer = struct {
+                         keep = reply_text.pyRstrip(piece); // its last newline may be the framing one
+                         s.held = piece[keep.len..];
+                     }
++                    if (s.pending_open) |prefix| {
++                        const first: ?u8 = for (keep) |ch| {
++                            if (ch != ' ' and ch != '\n' and ch != '\t' and ch != '\r') break ch;
++                        } else null;
++                        if (first) |ch| {
++                            s.typed = ch == '{' or ch == '[';
++                            try out.append(s.a, try s.args(try std.mem.concat(s.a, u8, &.{ prefix, if (s.typed) ":" else ":\"" })));
++                            s.pending_open = null;
++                        } else if (end != null) { // closed before any byte: an empty string
++                            try out.append(s.a, try s.args(try std.mem.concat(s.a, u8, &.{ prefix, ":\"\"" })));
++                            s.pending_open = null;
++                            s.pos += tail.len;
++                            s.state = .function;
++                            continue;
++                        } else return;
++                    }
+                     if (s.typed) {
+                         try s.buffer.appendSlice(s.a, keep);
+                     } else if (keep.len > 0) try out.append(s.a, try s.args(try s.esc(keep)));
+@@ -314,6 +336,11 @@ pub const Streamer = struct {
+         s.pos = text.len;
+         s.held = "";
+         s.buffer.clearRetainingCapacity();
++        if (s.pending_open) |prefix| { // an untyped value whose first byte never came through feed: text, whole
++            s.pending_open = null;
++            if (cut.len > 0) try out.append(s.a, try s.args(try std.mem.concat(s.a, u8, &.{ prefix, ":", try json.quote(s.a, cut, .{ .ascii = false }) })));
++            return;
++        }
+         if (cut.len > 0) try out.append(s.a, try s.args(if (s.typed) cut else try s.esc(cut)));
+     }
+ };
+diff --git a/zig/src/server/tool_union_witness.zig b/zig/src/server/tool_union_witness.zig
+index 0d3f57ba4..942d5c349 100644
+--- a/zig/src/server/tool_union_witness.zig
++++ b/zig/src/server/tool_union_witness.zig
+@@ -140,16 +140,16 @@ pub const ref_cases = [_]Case{
+         .value = "{\"id\": 7}",
+         .expected = "{\"request\":{\"id\":7}}",
+     },
+-    .{
++    .{ // a reference cycle names no kinds: an untyped parameter, so the object the model wrote comes back as one (#180)
+         .schema = cycle_schema,
+         .defs = cycle_defs,
+         .value = "{\"id\": 7}",
+-        .expected = "{\"request\":\"{\\\"id\\\": 7}\"}",
++        .expected = "{\"request\":{\"id\":7}}",
+     },
+-    .{
++    .{ // a definition that is not there names no kinds: untyped, the object stands (#180)
+         .schema = missing_schema,
+         .value = "{\"id\": 7}",
+-        .expected = "{\"request\":\"{\\\"id\\\": 7}\"}",
++        .expected = "{\"request\":{\"id\":7}}",
+     },
+ };
+ 
+@@ -199,7 +199,7 @@ pub const pointer_defs = "\"$defs\":{\"a~b\":{\"type\":\"object\",\"properties\"
+ 
+ /// The schemas whose references are pointers.
+ pub const pointer_cases = [_]Case{
+-    .{ .schema = bad_escape_schema, .defs = pointer_defs, .value = "{\"x\": 1}", .expected = "{\"request\":\"{\\\"x\\\": 1}\"}" },
++    .{ .schema = bad_escape_schema, .defs = pointer_defs, .value = "{\"x\": 1}", .expected = "{\"request\":{\"x\":1}}" }, // points nowhere: untyped, the object stands (#180)
+     .{ .schema = percent_escape_schema, .defs = pointer_defs, .value = "{\"y\": 2}", .expected = "{\"request\":{\"y\":2}}" },
+ };
+ 
+@@ -215,7 +215,9 @@ pub const free_defs = "\"$defs\":{\"Free\":{\"description\":\"anything\"}}";
+ /// The schemas whose reference names no kinds, and the ones that name nothing at all.
+ pub const unconstrained_cases = [_]Case{
+     .{ .schema = typed_free_schema, .defs = free_defs, .value = "{\"a\": 1}", .expected = "{\"request\":{\"a\":1}}" },
+-    .{ .schema = free_schema, .defs = free_defs, .value = "{\"a\": 1}", .expected = "{\"request\":\"{\\\"a\\\": 1}\"}" },
+-    .{ .schema = cycle_schema, .defs = cycle_defs, .value = "{\"id\": 7}", .expected = "{\"request\":\"{\\\"id\\\": 7}\"}" },
+-    .{ .schema = missing_schema, .value = "{\"id\": 7}", .expected = "{\"request\":\"{\\\"id\\\": 7}\"}" },
++    // A schema that names no kinds admits a JSON object or array the model wrote (this recipe's rule, issue #180 of the
++    // 2x DGX Sparks recipe; upstream keeps the text). Scalars and plain text stay text: tool_params' own test.
++    .{ .schema = free_schema, .defs = free_defs, .value = "{\"a\": 1}", .expected = "{\"request\":{\"a\":1}}" },
++    .{ .schema = cycle_schema, .defs = cycle_defs, .value = "{\"id\": 7}", .expected = "{\"request\":{\"id\":7}}" },
++    .{ .schema = missing_schema, .value = "{\"id\": 7}", .expected = "{\"request\":{\"id\":7}}" },
+ };
+-- 
+2.43.0
+
