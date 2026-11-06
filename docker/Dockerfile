@@ -142,7 +142,8 @@ RUN shopt -s nullglob \
 # Video input (WITH_VIDEO=1, off by default): libtfvideo.so, upstream's `zig build video` over the static FFmpeg 9.0.2
 # that tools/zig/build_ffmpeg.sh makes (LGPL build: h264/hevc/vp8/vp9/mpeg4 decoders, mov/matroska demuxers), installed
 # in lib/ beside the server, where --vision finds it on the first video_url request. Off, this stage is an empty
-# directory and the image is the same as without it.
+# directory and the image is the same as without it. On x86_64 FFmpeg is built without assembly (x86asm and inline), whose
+# relocations a shared library cannot take (decoding a clip costs a little more CPU).
 FROM build AS video
 ARG WITH_VIDEO=0
 ARG ZIG_CPU=native
@@ -150,6 +151,10 @@ RUN --mount=type=cache,id=tensorfold-zig-global,target=/root/.cache/zig \
     mkdir -p /video \
  && if [[ "${WITH_VIDEO}" == 1 ]]; then \
       apt-get update && apt-get install -y --no-install-recommends make perl && rm -rf /var/lib/apt/lists/* \
+      && if [[ "$(uname -m)" == x86_64 ]]; then \
+           sed -i 's/--enable-pic /--enable-pic --disable-asm /' tools/zig/build_ffmpeg.sh; fi \
+      && mkdir -p /ffmpeg/src && curl -fsSL --retry 5 --retry-all-errors -o /ffmpeg/src/ffmpeg-9.0.2.tar.xz \
+           https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz \
       && bash tools/zig/build_ffmpeg.sh /ffmpeg \
       && zig build video -Dffmpeg=/ffmpeg --prefix /video -Doptimize=fast -Dcpu="${ZIG_CPU}" --summary failures \
       && test -f /video/native/lib/libtfvideo.so \
