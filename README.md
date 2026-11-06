@@ -283,7 +283,7 @@ or numbers exactly, serve `ABLIT=0` or turn thinking on for those requests.
 
 ## Engine patches
 
-`patches/engine/` holds 93 patches on TensorFold `f350cd3e`, applied in order at image build. Grouped by purpose:
+`patches/engine/` holds 100 patches on TensorFold `f350cd3e`, applied in order at image build. Grouped by purpose:
 
 | Patches | What they do |
 | --- | --- |
@@ -309,6 +309,7 @@ or numbers exactly, serve `ABLIT=0` or turn thinking on for those requests.
 | 0092 | A JSON answer stays JSON beside offered tools: `response_format`, `guided_json` and `structured_outputs` replies are never parsed as tool calls, on chat, Responses and Messages |
 | 0093 | A reply grammar is freed when its stream cannot start |
 | 0096 | A tool call after prose that quotes its opener (`Qwen's <tool_call>{}`) is parsed as the call; before, the quoted opener began the envelope and the whole reply came back as content with no `tool_calls` |
+| 0102 | A request may hold up to 100 images: the `--vision-max-images` bound rises from 64 (Qwen-VL's M-RoPE span table, sized by the same bound, follows) |
 | 0097 | Warm turns for GLM: after a reply the server prefills the next turn's prompt in the background, so a user message after an agent loop resumes past the loop instead of re-reading it (GLM's template drops the loop's reasoning once the next message comes); the pass yields to real work at its next chunk gate, and (every family) to a request admitted ahead of it into the fill queue; each pass's outcome is logged (`next turn: background prefill of N tokens done` / `stepped aside` / `failed: ...`) |
 | 0076, 0079, 0085, 0087 | Test and contract-record changes |
 

@@ -117,7 +117,7 @@ HEAD="${HEAD:-bf16}"                             # TF_GLM_HEAD_BITS for the LM h
 MEMORY_RESERVE_GIB="${MEMORY_RESERVE_GIB:-4}"    # TENSORFOLD_MEMORY_RESERVE_GIB per GPU (engine default on 96 GB: 3)
 PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-}"         # --prompt-cache-gib (empty: engine default, 16 GiB at most of what is left)
 VISION="${VISION:-1}"                            # --vision: images (rank 0's tower)
-VISION_MAX_IMAGES="${VISION_MAX_IMAGES:-50}"     # --vision-max-images: images per request (engine default 4, at most 64)
+VISION_MAX_IMAGES="${VISION_MAX_IMAGES:-100}"    # --vision-max-images: images per request (engine default 4, at most 100 with patch 0102)
 # --chat-template: auto = with VISION=1, templates/glm-5.3-flash-vision.jinja (the checkpoint's own template, whose media
 # branch writes GLM's image and video markers instead of a "cannot see" note); none = the checkpoint's; or a file path
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-auto}"
