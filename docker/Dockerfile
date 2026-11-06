@@ -139,6 +139,26 @@ RUN shopt -s nullglob \
  && cat "${PREFIX}/BUILD-INFO"
 
 # ---------------------------------------------------------------------------------------------------------------------
+# Video input (WITH_VIDEO=1, off by default): libtfvideo.so, upstream's `zig build video` over the static FFmpeg 9.0.2
+# that tools/zig/build_ffmpeg.sh makes (LGPL build: h264/hevc/vp8/vp9/mpeg4 decoders, mov/matroska demuxers), installed
+# in lib/ beside the server, where --vision finds it on the first video_url request. Off, this stage is an empty
+# directory and the image is the same as without it.
+FROM build AS video
+ARG WITH_VIDEO=0
+ARG ZIG_CPU=native
+RUN --mount=type=cache,id=tensorfold-zig-global,target=/root/.cache/zig \
+    mkdir -p /video \
+ && if [[ "${WITH_VIDEO}" == 1 ]]; then \
+      apt-get update && apt-get install -y --no-install-recommends make perl && rm -rf /var/lib/apt/lists/* \
+      && bash tools/zig/build_ffmpeg.sh /ffmpeg \
+      && zig build video -Dffmpeg=/ffmpeg --prefix /video -Doptimize=fast -Dcpu="${ZIG_CPU}" --summary failures \
+      && test -f /video/native/lib/libtfvideo.so \
+      && mkdir -p /video/LICENSES \
+      && cp /ffmpeg/src/ffmpeg-*/COPYING.LGPLv2.1 /video/LICENSES/ffmpeg-COPYING.LGPLv2.1 \
+      && ls -l /video/native/lib; \
+    fi
+
+# ---------------------------------------------------------------------------------------------------------------------
 # Runtime: the CUDA runtime image already carries everything the server dlopens besides the driver:
 # libcublasLt.so.13 / libcublas.so.13 (cuBLAS 13.6) and libnccl.so.2 (NCCL 2.30.7 >= the engine's 2.30.0 minimum).
 # libcuda.so.1 and libnvidia-ml.so.1 come from the host driver through the NVIDIA container runtime (--gpus).
@@ -152,6 +172,7 @@ ARG SM=120
 ARG ZIG_VERSION=0.17.0
 ARG PATCHES_HASH=dev
 COPY --from=build ${PREFIX}/ ${PREFIX}/
+COPY --from=video /video/ ${PREFIX}/
 # `tensorfold` is the server too, as upstream's packaging links it (its docs run `tensorfold serve`); the CUDA dev CLI
 # that a source install names bin/tensorfold is linked as `tensorfold-cuda`.
 RUN shopt -s nullglob \

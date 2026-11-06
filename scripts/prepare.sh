@@ -55,6 +55,7 @@ validate_config() {
   is_number "$MEMORY_RESERVE_GIB" && python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) >= 0.5 else 1)' "$MEMORY_RESERVE_GIB" \
     || fail E_CONFIG 'MEMORY_RESERVE_GIB must be a number of GiB, at least 0.5 (the engine floor on discrete GPUs).'
   [[ -z "$PROMPT_CACHE_GIB" ]] || is_number "$PROMPT_CACHE_GIB" || fail E_CONFIG 'PROMPT_CACHE_GIB must be empty or a number of GiB (0: none).'
+  [[ "$WITH_VIDEO" =~ ^[01]$ ]] || fail E_CONFIG 'WITH_VIDEO must be 0 or 1.'
   [[ "$CONFIG_OVERLAY" =~ ^(auto|0)$ ]] || fail E_CONFIG 'CONFIG_OVERLAY must be auto or 0.'
   [[ "$GPUS" =~ ^[0-9]+(,[0-9]+){1,3}$ ]] || fail E_CONFIG 'GPUS must list two to four GPU indices in rank order, such as 1,0.'
   IFS=, read -r -a GPU_IDS <<< "$GPUS"
@@ -101,6 +102,7 @@ set_image() {
   PATCHES_HASH=$({
     printf 'TF_REPO=%s\nTF_REF=%s\nZIG_VERSION=%s\nZIG_SHA256=%s\nSM=%s\n' "$TF_REPO" "$TF_REF" "$ZIG_VERSION" "$ZIG_SHA256" "$SM"
     for f in "${IMAGE_FILES[@]}"; do [[ -n "$f" ]] || continue; printf '\0%s\0' "$f"; cat -- "$REPO_ROOT/$f"; done
+    [[ "$WITH_VIDEO" != 1 ]] || printf '\0WITH_VIDEO=1\0'  # its own tag; the default's hash is as it was
   } | sha256sum | cut -c1-12)
   IMAGE=${IMAGE:-$IMAGE_REPO:$PATCHES_HASH}
 }
@@ -204,7 +206,7 @@ prepare_image() {
   run docker build -f "$REPO_ROOT/docker/Dockerfile" -t "$IMAGE" --label "tf.patches=$PATCHES_HASH" \
     --build-arg "TF_REPO=$TF_REPO" --build-arg "TF_REF=$TF_REF" --build-arg "ZIG_VERSION=$ZIG_VERSION" \
     --build-arg "ZIG_SHA256=$ZIG_SHA256" --build-arg "SM=$SM" --build-arg "PATCHES_HASH=$PATCHES_HASH" \
-    "${build_flags[@]}" "$REPO_ROOT" || fail E_IMAGE 'Image build failed. Check disk space, network access and the first build error.'
+    --build-arg "WITH_VIDEO=$WITH_VIDEO" "${build_flags[@]}" "$REPO_ROOT" || fail E_IMAGE 'Image build failed. Check disk space, network access and the first build error.'
   run docker run --rm --network none --entrypoint "$TF_BIN" "$IMAGE" --version \
     || fail E_IMAGE "The built image has no working $TF_BIN."
 }

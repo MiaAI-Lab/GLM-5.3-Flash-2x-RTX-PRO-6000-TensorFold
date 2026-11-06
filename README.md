@@ -162,7 +162,8 @@ Settings are layered: `scripts/config.sh` defaults, then `.env` (literal `KEY=va
 | `HEAD` | `bf16` | The LM head, same choices (`TF_GLM_HEAD_BITS`) |
 | `MEMORY_RESERVE_GIB` | `4` | `TENSORFOLD_MEMORY_RESERVE_GIB`: memory per GPU left out of the engine's budget (fractions allowed; 3.5 fits 4 streams on pages with the 4 bpw checkpoint) |
 | `PROMPT_CACHE_GIB` | empty | `--prompt-cache-gib` for kept prompt states. Empty: up to 16 GiB of what the streams leave. `0`: none |
-| `VISION` | `1` | `--vision`: image input (rank 0's tower) |
+| `VISION` | `1` | `--vision`: image input (rank 0's tower); `video_url` parts too with `WITH_VIDEO=1` (otherwise HTTP 500); audio parts are unsupported |
+| `WITH_VIDEO` | `0` | `1` builds `libtfvideo.so` (FFmpeg 9.0.2, static, LGPL; h264/hevc/vp8/vp9/mpeg4 in mp4/mkv) into its own image tag, so `VISION=1` serves `video_url` parts; a few minutes more at build |
 | `THINKING` | `0` | `--thinking` or `--no-thinking` as the default. A request can override it with `chat_template_kwargs.enable_thinking` |
 | `REASONING_EFFORT` | `high` | `--reasoning-effort`: `low`, `medium`, `high` or `xhigh`. Empty omits the flag |
 | `MAX_TOKENS` | `32768` | `--max-tokens`, the default reply limit |
@@ -252,6 +253,11 @@ Thinking is off by default in this recipe (`THINKING=0`), which is also how the 
 keep the stock DFlash2 drafter. The edit changes `o_proj` in layers 15-46, and three of the drafter's five taps read
 downstream of it, so the drafter accepts a little less than on the published checkpoint.
 
+One measured exception, on the 2x DGX Spark recipe's issue 9: asked to return a record id `LANTERN-ca6241dd2684` in
+schema-constrained JSON, the Ablit weights drop a digit, with drafting on or off; the published weights copy it exactly
+on the same engine and request, and the Ablit weights do too with thinking on. For replies that must copy ids, hashes
+or numbers exactly, serve `ABLIT=0` or turn thinking on for those requests.
+
 ## Memory on 96 GB discrete cards with a desktop on GPU 1
 
 - VRAM and system RAM are separate pools: this is not a GB10 with unified memory. Every weight must fit on the GPUs,
@@ -330,6 +336,8 @@ diagnosis (export it in `scripts/local.sh`): `TF_GLM_DSEL=0`, `TF_GLM_PDL_CHAIN=
 | `[E_PORT]` | Port 8020 or 29583-29584 is in use, for example by the Python server. Stop it, or set `PORT` / `NCCL_PORT` |
 | `EXL3 at null bits: the CUDA family reads 4-bit EXL3 experts` | The config overlay is off: set `CONFIG_OVERLAY=auto` |
 | `NotExl3Mcg4` in a rank log | The engine found experts that are not 4-bit `mcg`, as in a mixed-width quant's 3-bit gate/up. This needs the mixed-width engine patches in `patches/engine/`, or use the default 4 bpw checkpoint |
+| `libtfvideo.so is required for video inputs` (HTTP 500 on a `video_url` part) | The default image builds no video runtime. Set `WITH_VIDEO=1` and restart (it builds its own image tag); a server that already refused one video request keeps refusing until restarted |
+| An exact value (an id, a hash) copied wrong in a JSON reply on `ABLIT=1` | The Ablit weights' own error: see [Ablit weights](#ablit-weights) |
 | `[E_HF_TOKEN]` | `ABLIT=1` and the gated weights can't be fetched: see [Ablit weights](#ablit-weights), or set `ABLIT=0` |
 | `[E_DOWNLOAD]` | The download failed: check free space and your connection, and run `./start.sh` again to resume |
 | `--parallel N needs ... GiB` / `fits no stream` | The window or stream count does not fit. `CONTEXT=auto` retries once by itself. Otherwise lower `CONTEXT` or `PARALLEL` (see Memory) |

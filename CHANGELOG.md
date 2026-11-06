@@ -1,5 +1,10 @@
 # Changelog
 
+- **2026-11-06** -- `WITH_VIDEO=1`, opt-in, ported from the 2x DGX Spark recipe (its issue 8): `docker/Dockerfile`
+  builds `libtfvideo.so` over upstream's static FFmpeg 9.0.2 into its own image tag (the default image and its tag are
+  unchanged), so `VISION=1` serves `video_url` parts instead of HTTP 500. README: the Ablit weights drop a digit when
+  copying an id into schema-constrained JSON where the published weights do not (that recipe's issue 9), with the
+  workaround (`ABLIT=0`, or thinking on for those requests).
 - **2026-11-04** -- CREDITS and NOTICE, the Aevonix entry corrected. The four serving scripts are that recipe's rework, which
   stands - but the entry now records where Aevonix's own scripts came from: their NOTICE takes `scripts/config.sh` and
   `start-tp4.sh` of this lab's GLM-5.3-Flash-EXL3-4x-DGX-Sparks-TensorFold (created 2026-10-01, the day before Aevonix's

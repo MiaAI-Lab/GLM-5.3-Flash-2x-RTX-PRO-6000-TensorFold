@@ -34,6 +34,9 @@ ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 ZIG_SHA256="${ZIG_SHA256:-1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026}"
 SM="${SM:-120}"                                  # RTX PRO 6000 Blackwell: sm_120
 IMAGE="${IMAGE:-}"                               # empty: tensorfold-glm53-zig:<PATCHES_HASH>
+# WITH_VIDEO=1 builds libtfvideo.so (FFmpeg 9.0.2, static) into the image, so VISION=1 serves video_url parts too.
+# It adds a few minutes to a build and has its own image tag. 0 (default): video_url parts return HTTP 500.
+WITH_VIDEO="${WITH_VIDEO:-0}"
 IMAGE_REPO="${IMAGE_REPO:-tensorfold-glm53-zig}"
 DOCKER_BUILD_FLAGS="${DOCKER_BUILD_FLAGS:-}"     # extra docker build flags, word-split (e.g. --progress=plain)
 TF_BIN="${TF_BIN:-/usr/local/bin/tensorfold-native}"
