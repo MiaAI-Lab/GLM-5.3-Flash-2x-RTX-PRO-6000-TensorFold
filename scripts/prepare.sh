@@ -48,6 +48,7 @@ validate_config() {
   [[ "$VISION_MAX_IMAGES" =~ ^[1-9][0-9]*$ && VISION_MAX_IMAGES -le 100 ]] || fail E_CONFIG 'VISION_MAX_IMAGES must be 1-100.'
   for key in THINKING VISION CLEAR_THINKING; do [[ "${!key}" =~ ^[01]$ ]] || fail E_CONFIG "$key must be 0 or 1."; done
   [[ -z "$REASONING_EFFORT" || "$REASONING_EFFORT" =~ ^(low|medium|high|xhigh)$ ]] || fail E_CONFIG 'REASONING_EFFORT must be low, medium, high, xhigh or empty.'
+  [[ "$EFFORT_LINE" =~ ^(thinking|always)$ ]] || fail E_CONFIG 'EFFORT_LINE must be thinking or always.'
   [[ "$DRAFTER_BITS" =~ ^[04]$ ]] || fail E_CONFIG 'DRAFTER_BITS must be 4 or 0 (bf16).'
   [[ -z "$MTP_DRAFTS" || ( "$MTP_DRAFTS" =~ ^[0-9]+$ && MTP_DRAFTS -le 64 ) ]] || fail E_CONFIG 'MTP_DRAFTS must be empty or 0-64.'
   [[ -z "$MTP_CONFIDENCE" ]] || { is_number "$MTP_CONFIDENCE" && python3 -c 'import sys; sys.exit(0 if 0 <= float(sys.argv[1]) <= 1 else 1)' "$MTP_CONFIDENCE"; } \
@@ -55,8 +56,21 @@ validate_config() {
   is_number "$MEMORY_RESERVE_GIB" && python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) >= 0.5 else 1)' "$MEMORY_RESERVE_GIB" \
     || fail E_CONFIG 'MEMORY_RESERVE_GIB must be a number of GiB, at least 0.5 (the engine floor on discrete GPUs).'
   [[ -z "$PROMPT_CACHE_GIB" ]] || is_number "$PROMPT_CACHE_GIB" || fail E_CONFIG 'PROMPT_CACHE_GIB must be empty or a number of GiB (0: none).'
+  [[ -z "$PROMPT_CACHE_MIN_GIB" ]] || is_number "$PROMPT_CACHE_MIN_GIB" \
+    || fail E_CONFIG 'PROMPT_CACHE_MIN_GIB must be empty (no check) or a number of GiB.'
+  is_number "$LEARN_GIB" || fail E_CONFIG 'LEARN_GIB must be a number of GiB (0: off).'
+  is_number "$LEARN_MIN_FREE_GIB" || fail E_CONFIG 'LEARN_MIN_FREE_GIB must be a number of GiB.'
+  [[ "$KV_SHARD" =~ ^[01]$ ]] || fail E_CONFIG 'KV_SHARD must be 0 or 1 (TF_GLM_KV_SHARD).'
+  [[ "$KV_SHARD" == 0 || ( "$KV" == fp8 && "$KV_PAGES" == on && "$DRAFTER" != mtp && "$GPUS" =~ ^[0-9]+,[0-9]+$ ) ]] \
+    || fail E_CONFIG 'KV_SHARD=1 needs two GPUs in GPUS, KV=fp8, KV_PAGES=on and DRAFTER=dflash2 or none.'
   [[ "$WITH_VIDEO" =~ ^[01]$ ]] || fail E_CONFIG 'WITH_VIDEO must be 0 or 1.'
   [[ "$CONFIG_OVERLAY" =~ ^(auto|0)$ ]] || fail E_CONFIG 'CONFIG_OVERLAY must be auto or 0.'
+  # An NCCL exclusion list (^lo,docker,...), often exported for the whole box from /etc/profile.d, outranks
+  # scripts/local.sh and would keep NCCL off loopback, the ranks' link here: lo is used instead, with a warning.
+  if [[ "$NCCL_SOCKET_IFNAME" == ^* ]]; then
+    warn W_CONFIG "NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME is an NCCL exclusion list, not the ranks' netdev: using lo, their loopback link (set NCCL_SOCKET_IFNAME=<netdev> to choose one)."
+    NCCL_SOCKET_IFNAME=lo
+  fi
   [[ "$GPUS" =~ ^[0-9]+(,[0-9]+){1,3}$ ]] || fail E_CONFIG 'GPUS must list two to four GPU indices in rank order, such as 1,0.'
   IFS=, read -r -a GPU_IDS <<< "$GPUS"
   [[ "$(printf '%s\n' "${GPU_IDS[@]}" | sort -u | wc -l)" == "$NUM_GPUS" ]] || fail E_CONFIG 'GPUS contains duplicate GPU indices.'

@@ -116,11 +116,35 @@ DENSE="${DENSE:-q8}"                             # TF_GLM_DENSE_BITS: bf16 (16) 
 HEAD="${HEAD:-bf16}"                             # TF_GLM_HEAD_BITS for the LM head, same choices
 MEMORY_RESERVE_GIB="${MEMORY_RESERVE_GIB:-4}"    # TENSORFOLD_MEMORY_RESERVE_GIB per GPU (engine default on 96 GB: 3)
 PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-}"         # --prompt-cache-gib (empty: engine default, 16 GiB at most of what is left)
+# PROMPT_CACHE_MIN_GIB: the smallest prompt cache a start may serve with, in GiB a rank (device pages plus the pinned
+# host tier, as rank 0's "prompt cache: ... a rank" line counts them). Both tiers are what that start's room leaves: the
+# device pages what the KV pool and the streams leave, the host tier a quarter of the host's available memory (the
+# desktop's share varies), and PROMPT_CACHE_GIB only caps them. With a value here, start.sh reads that line and stops
+# the server (E_CACHE) before it is called LIVE when it funds less. Empty (default): no check.
+PROMPT_CACHE_MIN_GIB="${PROMPT_CACHE_MIN_GIB:-}"
+# LEARN_GIB (engine patch 0103, --learn-conversations): kept prompt states also go to disk under CACHE_DIR/learn, every
+# rank's part in one store, so a conversation resumes after its memory copy is evicted or the server restarts. The GiB
+# of disk the states may take; 0 (default): off, as before. LEARN_MIN_FREE_GIB: no state is written while the disk has
+# less free.
+LEARN_GIB="${LEARN_GIB:-0}"
+LEARN_MIN_FREE_GIB="${LEARN_MIN_FREE_GIB:-15}"
+# KV_SHARD=1 (engine patch 0104, TF_GLM_KV_SHARD): each stream's FP8 latent rows live on one GPU (its owner) instead of
+# both, so the same memory holds about 1.8x the tokens; the other GPU's queries go to the owner for attention. Needs
+# GPUS with two GPUs, KV=fp8, KV_PAGES=on, DRAFTER=dflash2 or none, PARALLEL above 1. 0 (default): off, as before.
+KV_SHARD="${KV_SHARD:-0}"
 VISION="${VISION:-1}"                            # --vision: images (rank 0's tower)
 VISION_MAX_IMAGES="${VISION_MAX_IMAGES:-100}"    # --vision-max-images: images per request (engine default 4, at most 100 with patch 0102)
 # --chat-template: auto = with VISION=1, templates/glm-5.3-flash-vision.jinja (the checkpoint's own template, whose media
 # branch writes GLM's image and video markers instead of a "cannot see" note); none = the checkpoint's; or a file path
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-auto}"
+# The template's "Reasoning Effort" line. The checkpoint's template (and the vision copy) sets it to Max unless a
+# request's effort is low or high, so every prompt carries `<|system|>Reasoning Effort: Max`, thinking off included,
+# and a thinking-off reply then reasons in its answer (a 64-token "digits only" question runs out of tokens mid-sum).
+# TensorFold v0.6.0's recipe wrote the line with thinking on only. thinking (default): the same here -- the served
+# template is written to STATE_DIR/chat_template.jinja from the chosen one, its line taken from reasoning_effort,
+# which the engine passes with thinking on only; always: the template as it is. CHAT_TEMPLATE=auto only; a template
+# of your own decides for itself.
+EFFORT_LINE="${EFFORT_LINE:-thinking}"
 THINKING="${THINKING:-0}"                        # --thinking / --no-thinking default; requests override
 REASONING_EFFORT="${REASONING_EFFORT:-high}"     # --reasoning-effort low|medium|high|xhigh (empty: omit)
 MAX_TOKENS="${MAX_TOKENS:-32768}"                # --max-tokens default reply limit

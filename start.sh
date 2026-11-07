@@ -37,7 +37,7 @@ RANK_DEVICES=$(for gpu in "${GPU_IDS[@]}"; do printf '%s\n' "${GPU_IDS[@]}" | so
 FIT_FILE="$STATE_DIR/context-fit.tsv"
 fit_key() {
   printf '%s|' "$PATCHES_HASH" "$MODEL_DIR" "$GPUS" "$PARALLEL" "$KV" "$KV_PAGES" "$DENSE" "$HEAD" "$VISION" "$VISION_MAX_IMAGES" "$DRAFTER" "$DRAFTER_BITS" \
-    "$MEMORY_RESERVE_GIB" "$PROMPT_CACHE_GIB" "$CONTEXT_MAX" "$SERVE_EXTRA_ARGS" | sha256sum | cut -c1-16
+    "$MEMORY_RESERVE_GIB" "$PROMPT_CACHE_GIB" "$LEARN_GIB" "$KV_SHARD" "$CONTEXT_MAX" "$SERVE_EXTRA_ARGS" | sha256sum | cut -c1-16
 }
 remembered_context() {
   [[ -f "$FIT_FILE" ]] || return 0
@@ -114,6 +114,26 @@ case "$CHAT_TEMPLATE" in
   *) fail E_CONFIG 'CHAT_TEMPLATE must be auto, none or an absolute file path.' ;;
 esac
 [[ -z "$TEMPLATE_FILE" || -f "$TEMPLATE_FILE" ]] || fail E_CONFIG "Chat template not found: $TEMPLATE_FILE"
+# EFFORT_LINE=thinking: the served template is the chosen one (the checkpoint's own with VISION=0) with its effort line
+# set from reasoning_effort, which the engine passes with thinking on only (null with thinking off: prompt.zig), so a
+# thinking-off prompt no longer carries `<|system|>Reasoning Effort: Max`. Written to STATE_DIR every start; the base
+# line must be the one the checkpoint ships, else the start stops rather than serve a template it did not understand.
+if [[ "$CHAT_TEMPLATE" == auto && "$EFFORT_LINE" == thinking ]]; then
+  EFFORT_BASE=${TEMPLATE_FILE:-$MODEL_DIR/chat_template.jinja}
+  [[ -f "$EFFORT_BASE" ]] || fail E_CONFIG "Chat template not found: $EFFORT_BASE (EFFORT_LINE=thinking rewrites its effort line)."
+  [[ "$DRY_RUN" == 1 ]] || mkdir -p "$STATE_DIR"
+  python3 - "$EFFORT_BASE" "$STATE_DIR/chat_template.jinja" "$DRY_RUN" <<'PY' || fail E_CONFIG "EFFORT_LINE=thinking: $EFFORT_BASE has no effort line this recipe knows; set EFFORT_LINE=always or CHAT_TEMPLATE to a file."
+import sys
+base = "{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else 'max' -%}"
+line = "{%- set effective_reasoning_effort = (reasoning_effort if reasoning_effort in ['low', 'high'] else 'max') if (reasoning_effort is defined and reasoning_effort is not none) else none -%}"
+src = open(sys.argv[1], encoding="utf-8").read()
+if src.count(base) != 1:
+    sys.exit(1)
+if sys.argv[3] != "1":  # DRY_RUN=1 checks the base and writes nothing
+    open(sys.argv[2], "w", encoding="utf-8").write(src.replace(base, line))
+PY
+  TEMPLATE_FILE="$STATE_DIR/chat_template.jinja"
+fi
 
 build_serve_args() {
   local -a extra=()
@@ -132,6 +152,9 @@ build_serve_args() {
     [[ -z "$MTP_CONFIDENCE" ]] || SERVE_ARGS+=(--mtp-confidence "$MTP_CONFIDENCE")
   fi
   [[ -z "$PROMPT_CACHE_GIB" ]] || SERVE_ARGS+=(--prompt-cache-gib "$PROMPT_CACHE_GIB")
+  # LEARN_GIB: engine patch 0103 keeps the prompt states on disk too (CACHE_DIR/learn holds every rank's part)
+  [[ "$LEARN_GIB" == 0 ]] || SERVE_ARGS+=(--learn-conversations --learn-dir /state/learn --learn-gib "$LEARN_GIB"
+    --learn-min-free-gib "$LEARN_MIN_FREE_GIB")
   read -r -a extra <<< "$SERVE_EXTRA_ARGS"
   SERVE_ARGS+=("${extra[@]}")
 }
@@ -140,7 +163,7 @@ build_serve_args() {
 # TENSORFOLD_API_KEY's included, are never printed). The per-rank ones are set by the runner.
 MANAGED_ENV=' HOME HF_HUB_OFFLINE CUDA_DEVICE_ORDER CUDA_VISIBLE_DEVICES TENSORFOLD_NO_UPDATE_CHECK TENSORFOLD_NO_LIVE
  TENSORFOLD_MEMORY_RESERVE_GIB TF_GLM_DENSE_BITS TF_GLM_HEAD_BITS TF_GLM_CLEAR_THINKING TF_GLM_RANK TF_GLM_WORLD TF_CUDA_DEVICE
- TF_KV_PAGES TF_GLM_CE_EXCHANGE TF_GLM_ABSORB_MMA TF_GLM_W8A8 TENSORFOLD_PREFILL_SHARE TENSORFOLD_PREFILL_BUDGET
+ TF_KV_PAGES TF_GLM_CE_EXCHANGE TF_GLM_ABSORB_MMA TF_GLM_W8A8 TENSORFOLD_PREFILL_SHARE TENSORFOLD_PREFILL_BUDGET TF_GLM_KV_SHARD
  TF_BIN TF_REPO TF_REF NCCL_COMM_ID NCCL_P2P_LEVEL NCCL_SOCKET_IFNAME NCCL_IB_DISABLE RANK_DEVICES '
 build_env_args() {
   local key
@@ -152,6 +175,8 @@ build_env_args() {
     -e "NCCL_IB_DISABLE=$NCCL_IB_DISABLE" -e "TF_BIN=$TF_BIN" -e "RANK_DEVICES=$RANK_DEVICES"
     -e "TENSORFOLD_PREFILL_SHARE=$PREFILL_SHARE")
   [[ -z "$PREFILL_BUDGET" ]] || ENV_ARGS+=(-e "TENSORFOLD_PREFILL_BUDGET=$PREFILL_BUDGET")
+  # KV_SHARD=1: engine patch 0104 keeps each stream's latent rows on its owner GPU (every rank reads the same value)
+  [[ "$KV_SHARD" != 1 ]] || ENV_ARGS+=(-e "TF_GLM_KV_SHARD=1")
   while IFS= read -r key; do
     [[ "$MANAGED_ENV" != *" $key "* ]] || continue
     case "$key" in TF_*|TENSORFOLD_*|NCCL_*) ENV_ARGS+=(-e "$key") ;; esac
@@ -241,7 +266,7 @@ launch() {
   log "Runner ($RUN_LOG_DIR/runner.sh) starts, inside the container:"
   show_ranks
   if [[ "$DRY_RUN" != 1 ]]; then
-    mkdir -p "$RUN_LOG_DIR" "$CACHE_DIR/home"
+    mkdir -p "$RUN_LOG_DIR" "$CACHE_DIR/home" "$CACHE_DIR/learn"
     write_runner
     ln -sfn -- "$RUN_LOG_DIR" "$LOG_DIR/current"
   fi
@@ -284,6 +309,37 @@ show_failure() {
     printf '\n--- %s (last 15 lines) ---\n' "$f" >&2
     tail -n 15 -- "$f" >&2
   done
+}
+
+# The prompt cache rank 0's "prompt cache: X GiB of device pages and Y GiB of pinned host memory a rank" line funds, in
+# GiB a rank (X + Y); without that line, the startup line's device cache ("..., a 1.2 GiB prompt cache; ...") or 0 for
+# "no prompt cache"; empty when the log has neither.
+funded_cache_gib() {
+  local line
+  line=$(grep -h 'prompt cache: .* GiB of device pages and .* GiB of pinned host memory a rank' "$1" 2>/dev/null | tail -1) || true
+  if [[ "$line" =~ prompt\ cache:\ ([0-9][0-9.]*)\ GiB\ of\ device\ pages\ and\ ([0-9][0-9.]*)\ GiB ]]; then
+    python3 -c 'import sys; print(round(float(sys.argv[1]) + float(sys.argv[2]), 1))' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    return 0
+  fi
+  line=$(grep -h 'streams at once' "$1" 2>/dev/null | tail -1) || true
+  [[ -n "$line" ]] || return 0
+  if [[ "$line" =~ ,\ a\ ([0-9][0-9.]*)\ GiB\ prompt\ cache ]]; then printf '%s\n' "${BASH_REMATCH[1]}"; else printf '0\n'; fi
+}
+# PROMPT_CACHE_MIN_GIB: the server is stopped before LIVE when rank 0 funds less (PROMPT_CACHE_GIB is a cap, not a
+# floor). Rank 0 alone prints these lines; the other ranks follow its plan.
+check_cache_min() {
+  [[ -n "$PROMPT_CACHE_MIN_GIB" ]] || return 0
+  local f="$RUN_LOG_DIR/rank0.log" got
+  got=$(funded_cache_gib "$f")
+  if [[ -z "$got" ]]; then
+    GLM_STOP_LOCK_HELD=1 "$REPO_ROOT/stop.sh"
+    fail E_CACHE "PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB: rank 0's log has no prompt cache line, so the start cannot be checked; the server is stopped. See $f."
+  fi
+  if ! python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) >= float(sys.argv[2]) else 1)' "$got" "$PROMPT_CACHE_MIN_GIB"; then
+    GLM_STOP_LOCK_HELD=1 "$REPO_ROOT/stop.sh"
+    fail E_CACHE "Rank 0 funds a $got GiB prompt cache a rank, under PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB; the server is stopped. The cache is what this start's room leaves (device pages after the KV pool, a host tier from the available memory), capped by PROMPT_CACHE_GIB: lower PARALLEL or CONTEXT, free host memory, or set TF_GLM_HOST_CACHE_GIB. See $f."
+  fi
+  log "Prompt cache: rank 0 funds $got GiB a rank (PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB)."
 }
 
 live_message() {
@@ -439,6 +495,7 @@ if [[ "$DRY_RUN" != 1 ]] && ! wait_ready; then
     wait_ready && break
   done
 fi
+[[ "$DRY_RUN" == 1 ]] || check_cache_min
 finish_start
 if [[ "$DRY_RUN" != 1 ]]; then
   if [[ "$CONTEXT" == auto ]]; then

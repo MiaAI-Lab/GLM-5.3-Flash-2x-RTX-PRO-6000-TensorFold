@@ -162,17 +162,22 @@ Settings are layered: `scripts/config.sh` defaults, then `.env` (literal `KEY=va
 | `HEAD` | `bf16` | The LM head, same choices (`TF_GLM_HEAD_BITS`) |
 | `MEMORY_RESERVE_GIB` | `4` | `TENSORFOLD_MEMORY_RESERVE_GIB`: memory per GPU left out of the engine's budget (fractions allowed; 3.5 fits 4 streams on pages with the 4 bpw checkpoint) |
 | `PROMPT_CACHE_GIB` | empty | `--prompt-cache-gib` for kept prompt states. Empty: up to 16 GiB of what the streams leave. `0`: none |
+| `PROMPT_CACHE_MIN_GIB` | empty | The smallest prompt cache a start may serve with, in GiB a rank (device pages plus the pinned host tier, as rank 0's `prompt cache: ... a rank` line counts them). `start.sh` stops the server before LIVE (`E_CACHE`) when that start funds less: the cache is what the room leaves, so `PROMPT_CACHE_GIB` caps it but does not guarantee it. Empty: no check |
+| `LEARN_GIB`, `LEARN_MIN_FREE_GIB` | `0`, `15` | `LEARN_GIB` > 0 keeps the prompt states on disk too, up to that many GiB (`--learn-conversations`, patch 0103); see [Memory](#memory-on-96-gb-discrete-cards-with-a-desktop-on-gpu-1) |
+| `KV_SHARD` | `0` | `1` keeps each stream's latent rows on one GPU (`TF_GLM_KV_SHARD`, patch 0104): about 1.8x the tokens in the same memory; see [Memory](#memory-on-96-gb-discrete-cards-with-a-desktop-on-gpu-1). Needs two GPUs, `KV=fp8`, `KV_PAGES=on`, DFlash2 or no drafter |
 | `VISION` | `1` | `--vision`: image input (rank 0's tower); `video_url` parts too with `WITH_VIDEO=1` (otherwise HTTP 500); audio parts are unsupported |
 | `WITH_VIDEO` | `0` | `1` builds `libtfvideo.so` (FFmpeg 9.0.2, static, LGPL; h264/hevc/vp8/vp9/mpeg4 in mp4/mkv) into its own image tag, so `VISION=1` serves `video_url` parts; a few minutes more at build |
 | `THINKING` | `0` | `--thinking` or `--no-thinking` as the default. A request can override it with `chat_template_kwargs.enable_thinking` |
 | `REASONING_EFFORT` | `high` | `--reasoning-effort`: `low`, `medium`, `high` or `xhigh`. Empty omits the flag |
+| `EFFORT_LINE` | `thinking` | The template's `<|system|>Reasoning Effort: Max` line with thinking on only, as TensorFold v0.6.0's recipe wrote it (the served template is written to `.state/chat_template.jinja`); `always` serves the template as it is, which writes the line into every prompt and makes a thinking-off reply reason in its answer. See [The effort line](#the-effort-line) |
 | `MAX_TOKENS` | `32768` | `--max-tokens`, the default reply limit |
 | `CLEAR_THINKING` | `1` | `TF_GLM_CLEAR_THINKING`: `1` drops earlier turns' reasoning from the prompt, `0` keeps it (upstream's default) |
-| `SERVE_EXTRA_ARGS` | empty | More `serve` flags for both ranks, word-split |
+| `SERVE_EXTRA_ARGS` | empty | More `serve` flags for both ranks, word-split. Requests that send no sampling fields get the checkpoint's `generation_config.json` (temperature 1.0, top_p 0.95) and no `top_k`; `SERVE_EXTRA_ARGS='--top-k 20'` sets the old deployment's default for them (greedy replies unchanged) |
 | `PORT`, `HOST` | `8020`, `0.0.0.0` | The API address |
 | `SERVED_NAME` | `GLM-5.3-Flash` | `--name`, the model ID clients send |
 | `NCCL_PORT` | `29583` | Rank 0's NCCL bootstrap port. The ranks' watch line also uses the next port |
 | `NCCL_P2P_LEVEL` | `SYS` | NCCL peer-to-peer across the CPU's host bridge |
+| `NCCL_SOCKET_IFNAME` | `lo` | The ranks' socket link, loopback. An exported exclusion list (`^lo,docker,...`) is replaced by `lo` with a warning |
 | `TENSORFOLD_API_KEY` | unset | If exported: every route except `/health` needs `Authorization: Bearer KEY`. Comma-separated for several keys |
 | `CONTAINER_NAME` | `glm53-zig` | Never `glm53-tf`, the Python recipe's container |
 | `CONTAINER_USER` | your UID:GID | The ranks' user. Empty runs them as root |
@@ -278,12 +283,30 @@ or numbers exactly, serve `ABLIT=0` or turn thinking on for those requests.
   128K prompt as the desktop grew, so this recipe uses 4.
 - To free memory: lower `PARALLEL`, use `DENSE=q8` (or `q6`, `q4`) or `HEAD=q8`, use `KV=fp8`, set `VISION=0` (rank 0
   only), or use `DRAFTER=mtp`. Raise `MEMORY_RESERVE_GIB` if requests fail with CUDA out-of-memory errors while serving.
+- **KV sharding: `KV_SHARD=1`** (engine patch 0104, off by default). At TP=2 both GPUs hold every stream's FP8 latent
+  rows; sharded, each stream's rows live on one GPU, its owner (the pooled index keys stay on both), so a token costs
+  3,542 bytes a GPU instead of 6,380. The other GPU's queries go to the owner for attention over P2P. Measured on this
+  host (2026-11-07, `PARALLEL=4`, `CONTEXT=auto`, DFlash2, `DENSE=q8 HEAD=q8`, a 2.8 GiB reserve, the published
+  weights): the full 1,048,576-token window fits beside four streams (2,052 pages), where the same image unsharded
+  fitted a 702,464-token window (1,396 pages; 486,400 and 954 pages at another start with 1 GiB less room). Greedy
+  replies identical; decode 169-170 tok/s at one stream against 171-172 unsharded, 293-295 summed at four against
+  294-296; `tf-cuda-test glm-kv-shard-check` passes on both GPUs. A store written sharded (`LEARN_GIB`) is not read
+  unsharded or the reverse, so turning it on or off starts an empty one.
+- **Conversations on disk: `LEARN_GIB=30`** (engine patch 0103, `--learn-conversations`, off by default). Kept prompt
+  states also go to disk in `CACHE_DIR/learn`, every rank's part, so a conversation whose memory copy was evicted, or
+  that outlived a restart, resumes from disk instead of prefilling again. No state is written while the disk has under
+  `LEARN_MIN_FREE_GIB` (15) free. Measured here with `KV_SHARD=1` (2026-11-07): after a restart an 18.5k-token
+  conversation resumed 16,384 tokens cached (first token 0.75 s; 0.49 s from memory) and a 101k-token one 98,304
+  (1.16 s; 0.79 s from memory), replies byte-identical; the two states took 1,477 MiB. A state read from disk restarts
+  DFlash2 at its mark. Off: replies byte-identical.
+- `PROMPT_CACHE_MIN_GIB` stops a start whose prompt cache came out smaller than you need: both tiers depend on that
+  start's room (the host tier is a quarter of the host's available memory, which the desktop changes).
 - Host RAM (89 GB) cannot cache the 164 GiB checkpoint. Each start reads it from disk, with eight reader threads per
   rank (`TF_GLM_LOAD_PREFETCH`).
 
 ## Engine patches
 
-`patches/engine/` holds 100 patches on TensorFold `f350cd3e`, applied in order at image build. Grouped by purpose:
+`patches/engine/` holds 101 patches on TensorFold `f350cd3e`, applied in order at image build. Grouped by purpose:
 
 | Patches | What they do |
 | --- | --- |
@@ -311,6 +334,8 @@ or numbers exactly, serve `ABLIT=0` or turn thinking on for those requests.
 | 0096 | A tool call after prose that quotes its opener (`Qwen's <tool_call>{}`) is parsed as the call; before, the quoted opener began the envelope and the whole reply came back as content with no `tool_calls` |
 | 0102 | A request may hold up to 100 images: the `--vision-max-images` bound rises from 64 (Qwen-VL's M-RoPE span table, sized by the same bound, follows) |
 | 0097 | Warm turns for GLM: after a reply the server prefills the next turn's prompt in the background, so a user message after an agent loop resumes past the loop instead of re-reading it (GLM's template drops the loop's reasoning once the next message comes); the pass yields to real work at its next chunk gate, and (every family) to a request admitted ahead of it into the fill queue; each pass's outcome is logged (`next turn: background prefill of N tokens done` / `stepped aside` / `failed: ...`) |
+| 0103 | `--learn-conversations` for GLM on CUDA (`LEARN_GIB`, off by default), a backport of upstream [#1411](https://github.com/ashhart/TensorFold/pull/1411) by its author (the 2x DGX Spark recipe's 0109): kept prompt states on disk, every rank's part, written behind the request and read back after an eviction or a restart. `--spill-gib` and `--checkpoint-slots` are refused for GLM. Off: replies byte-identical |
+| 0104 | KV sharding (`KV_SHARD=1`, `TF_GLM_KV_SHARD`, off by default) at TP=2, toward upstream [#1431](https://github.com/ashhart/TensorFold/issues/1431) (the Spark recipe's 0110, one hunk moved): each stream's FP8 latent rows on its owner GPU, owner-computed decode and verify, prompts on a borrowed twin, kept states carried between owners, and 0103's disk image under it. Refused by name with the MTP drafter, `--parallel 1`, other KV caches, or a part under 131k tokens. `tf-cuda-test glm-kv-shard-check` checks it against an unsharded twin byte for byte. Off: replies byte-identical |
 | 0076, 0079, 0085, 0087 | Test and contract-record changes |
 
 Every default-on patch was A/B tested against the image before it: greedy (T=0) replies identical, plus a measured
@@ -318,6 +343,20 @@ gain. Opt-in settings change rounding and are off unless set. Patches 0067–009
 diagnosis (export it in `scripts/local.sh`): `TF_GLM_DSEL=0`, `TF_GLM_PDL_CHAIN=0`, `TF_GLM_MM_TWO=0`,
 `TF_GLM_TOPK_SUM=0`, `TF_GLM_SHARED_SEGS=0`, `TF_EXL3_SHFL=0`, `TF_EXL3_PDL=0`, `TF_GLM_KDA_STEP_WARPS=8`,
 `TF_GLM_HC_SPLIT=0`, `TF_GLM_SHARED_WRITES=0`, `TF_GLM_HC_PART=0`, `TF_GLM_DSCORES=0`.
+
+## The effort line
+
+The checkpoint's chat template (and this recipe's vision copy of it) opens every prompt with
+`<|system|>Reasoning Effort: Max` unless a request's `reasoning_effort` is `low` or `high`: its second line maps
+anything else, an absent value included, to Max. The engine renders the template as written, so a thinking-off prompt
+carries the line too, and with thinking off the model then reasons in its answer: asked for the binary of 217, "digits
+only", at `max_tokens` 64, it works the division out and stops on `length` (measured on this host). TensorFold
+v0.6.0's recipe wrote the line with thinking on only. `EFFORT_LINE=thinking` (default) does the same: `start.sh`
+copies the chosen template to `.state/chat_template.jinja` with its second line taking the effort from
+`reasoning_effort`, which the engine passes with thinking on and leaves null with thinking off, and serves that copy.
+Thinking-on prompts are unchanged (same greedy replies). `EFFORT_LINE=always` serves the template as it is; a
+`CHAT_TEMPLATE` of your own is served as it is either way. On the 2x DGX Spark recipe sparkDash's QA suite went from
+79.3% to 86.0% with it (that recipe's README, "The effort line").
 
 ## Logs
 
@@ -347,6 +386,9 @@ diagnosis (export it in `scripts/local.sh`): `TF_GLM_DSEL=0`, `TF_GLM_PDL_CHAIN=
 | CUDA out of memory mid-request | The desktop or prompt scratch grew into the reserve. Raise `MEMORY_RESERVE_GIB`, or lower `PARALLEL`/`CONTEXT` |
 | The API takes long on the first start | Each rank hashes all 164 GiB once (the digest is cached in `CACHE_DIR`). Raise `WAIT_TIMEOUT` if needed |
 | `[W_P2P]` | NVML reports no peer-to-peer between the cards (IOMMU/ACS, BIOS). NCCL still works over host memory, but more slowly |
+| `[W_CONFIG] NCCL_SOCKET_IFNAME=^… is an NCCL exclusion list` | An exported value (often from `/etc/profile.d`) wins over `scripts/local.sh`; the ranks talk over loopback, so `lo` is used. `env -u NCCL_SOCKET_IFNAME ./start.sh` silences it |
+| `[E_CACHE] Rank 0 funds a X GiB prompt cache a rank, under PROMPT_CACHE_MIN_GIB` | That start's room funded less cache than the minimum. Lower `PARALLEL` or `CONTEXT`, free host memory, set `TF_GLM_HOST_CACHE_GIB`, or lower the minimum |
+| A thinking-off reply works the sum out in its answer and ends on `length` | The prompt carries the template's `Reasoning Effort: Max` line (`EFFORT_LINE=always`, or a `CHAT_TEMPLATE` of your own); `EFFORT_LINE=thinking` (default) writes it with thinking on only |
 | Wrong GPU per rank | After the start, `nvidia-smi` shows rank 0's GPU (first in `GPUS`) holding more memory. The rank logs' `p2p:` lines name each rank's PCI bus |
 
 ## Credits
@@ -355,7 +397,8 @@ TensorFold and its native engine are by Ash Hart and contributors ([ashhart/Tens
 The GLM-5.3-Flash EXL3 checkpoints are by Mia's AI Lab, from zai-org's GLM-5.3-Flash. DFlash2 is by incoai.
 
 Full credits, including the authors of carried patches and the Aevonix Research recipe these scripts are adapted from, are in
-[CREDITS.md](CREDITS.md). Required notices are in [NOTICE.md](NOTICE.md).
+[CREDITS.md](CREDITS.md). Patch 0103 is a backport of upstream #1411, and 0104 (KV sharding) is toward upstream #1431,
+both by Robert Wojciechowski ([@wojo](https://github.com/wojo), X [@rwojo](https://x.com/rwojo)). Required notices are in [NOTICE.md](NOTICE.md).
 
 ## License
 

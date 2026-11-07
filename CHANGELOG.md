@@ -1,5 +1,29 @@
 # Changelog
 
+- **2026-11-07** -- Ported from the 2x DGX Spark recipe's 2026-11-07 round, checked on this host (2x RTX PRO 6000,
+  `PARALLEL=4`, `CONTEXT=auto`, DFlash2, `DENSE=q8 HEAD=q8`, a 2.8 GiB reserve, the published weights):
+  - Engine patch `0103` (that recipe's 0109, upstream #1411 backported by Robert Wojciechowski): `LEARN_GIB`
+    (`--learn-conversations`, off by default) keeps the prompt states on disk, every rank's part. After a restart an
+    18.5k-token conversation resumed 16,384 tokens cached (first token 0.75 s) and a 101k-token one 98,304 (1.16 s),
+    replies byte-identical to the in-memory resume.
+  - Engine patch `0104` (that recipe's 0110, toward upstream #1431, one hunk moved by hand: this stack's
+    shared-window forward has no TF_GLM_PROF bracket): `KV_SHARD=1` (`TF_GLM_KV_SHARD`, off by default) keeps each
+    stream's latent rows on one GPU. The full 1,048,576-token window fits beside four streams (2,052 pages) where the
+    same image unsharded fitted 702,464 (1,396 pages); greedy hashes identical; decode 169-170 tok/s at one stream
+    against 171-172, 293-295 summed at four against 294-296; `tf-cuda-test glm-kv-shard-check` PASS on both GPUs
+    (10 prompt paths, 510 window rows byte-identical to the unsharded twin).
+  - With both off the image gives the same greedy hashes as the one before (prose `ed074e68e492`, code
+    `1388e42283e7`, thinking `650453259cef`); decode 171-172 tok/s at one stream and 294-296 summed at four against
+    174-179 and 300-314 (two runs each, another client's requests reached the server during the earlier ones).
+  - `EFFORT_LINE=thinking` (default; that recipe's #23): the template's `Reasoning Effort: Max` line with thinking on
+    only. Before, a thinking-off "binary of 217, digits only" at 64 tokens worked the division out and stopped on
+    `length` here too. `EFFORT_LINE=always` keeps the old template.
+  - `PROMPT_CACHE_MIN_GIB` (that recipe's issue 16): `start.sh` stops the server before LIVE when rank 0's prompt cache
+    (device pages plus host tier, a rank) comes out under it.
+  - An exported `NCCL_SOCKET_IFNAME` exclusion list (`^lo,docker,...`, that recipe's issue 17) is replaced by `lo` with
+    a warning, since it would keep NCCL off the ranks' loopback link.
+  - `scripts/tests/` (`run.sh`): script syntax, the patch-number check, and tests for the cache floor and the NCCL value.
+  - README: the `SERVE_EXTRA_ARGS='--top-k 20'` sampler default for requests that send no `top_k`.
 - **2026-11-06** -- `WITH_VIDEO=1`, opt-in, ported from the 2x DGX Spark recipe (its issue 8): `docker/Dockerfile`
   builds `libtfvideo.so` over upstream's static FFmpeg 9.0.2 into its own image tag (the default image and its tag are
   unchanged), so `VISION=1` serves `video_url` parts instead of HTTP 500. README: the Ablit weights drop a digit when
