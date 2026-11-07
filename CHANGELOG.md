@@ -12,6 +12,14 @@
     same image unsharded fitted 702,464 (1,396 pages); greedy hashes identical; decode 169-170 tok/s at one stream
     against 171-172, 293-295 summed at four against 294-296; `tf-cuda-test glm-kv-shard-check` PASS on both GPUs
     (10 prompt paths, 510 window rows byte-identical to the unsharded twin).
+  - What `KV_SHARD=1` buys on this host, against the deployment it replaced (the image before these patches, the same
+    settings): the pool went from about 973K tokens to the full 1,048,576 (+8%), for about 3.5% decode at one stream
+    (~176 to ~170 tok/s, both builds' costs together). The gain stops there because `CONTEXT=auto` sizes the pool for
+    one window at most: the start line reads 2,052 pages (3.47 GiB) of the 5.0 GiB left after the 2.8 GiB reserve,
+    3 x 417 MiB fixed for the streams beyond the engine's own, and the 0.3 GiB that remains goes to the prompt cache.
+    A sharded page costs about 1.73 MiB a GPU (3,542 B a token), so each GiB freed would hold about 300K more
+    tokens, which only helps several long conversations at once; one request still stops at 1,048,576. The 2x DGX
+    Spark recipe, with 128 GB a GPU, goes from 2.1M to 3.15M tokens with the same patch.
   - With both off the image gives the same greedy hashes as the one before (prose `ed074e68e492`, code
     `1388e42283e7`, thinking `650453259cef`); decode 171-172 tok/s at one stream and 294-296 summed at four against
     174-179 and 300-314 (two runs each, another client's requests reached the server during the earlier ones).
