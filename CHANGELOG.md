@@ -1,5 +1,18 @@
 # Changelog
 
+- **2026-11-10** -- `WITH_VIDEO=1` on x86_64 keeps FFmpeg's assembly, so `video_url` frames are PyAV's (transformers'
+  reader) byte for byte instead of the C-only build's, and video replies can change, toward that reference. Text
+  replies are unchanged (the greedy contract corpus is identical), and the default image builds no video library. The
+  x86_64 `--disable-asm` of 2026-11-06 was there because FFmpeg's x86 assembly reaches tables FFmpeg defines in C
+  (`ff_pw_*`, `ff_h264_cabac_tables`) PC-relatively, which cannot bind to symbols a shared library exports. Engine
+  patch `0105` (toward upstream [ashhart/TensorFold#2861](https://github.com/ashhart/TensorFold/pull/2861)) links `libtfvideo.so` with an ELF version
+  script that exports only the four `tf_video_*` functions, so those tables bind inside the library and the Dockerfile
+  drops the flag. On this host (Threadripper 3960X, AVX2):
+  - Frames, 23 clips (4,075 frames): the assembly library equals PyAV 19.0.1 on every frame; the C-only one differs on
+    every frame of 20 clips, by at most 3 a byte.
+  - Served (`PARALLEL=4`, DFlash2, the context `CONTEXT=auto` chose, two starts of each image): `video_url` first token
+    on three 720p clips, warm, 2.42 / 2.23-2.25 / 2.04-2.08 s before against 1.94 / 1.93-1.95 / 1.60-1.61 s after.
+  - The image rebuilds once and `CONTEXT=auto` re-fits once. Takes effect at the next `./start.sh restart` (new image).
 - **2026-11-07** -- Ported from the 2x DGX Spark recipe's 2026-11-07 round, checked on this host (2x RTX PRO 6000,
   `PARALLEL=4`, `CONTEXT=auto`, DFlash2, `DENSE=q8 HEAD=q8`, a 2.8 GiB reserve, the published weights):
   - Engine patch `0103` (that recipe's 0109, upstream #1411 backported by Robert Wojciechowski): `LEARN_GIB`
