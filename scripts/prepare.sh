@@ -62,6 +62,8 @@ validate_config() {
   is_number "$LEARN_MIN_FREE_GIB" || fail E_CONFIG 'LEARN_MIN_FREE_GIB must be a number of GiB.'
   [[ "$KV_SHARD" =~ ^[01]$ ]] || fail E_CONFIG 'KV_SHARD must be 0 or 1 (TF_GLM_KV_SHARD).'
   [[ "$L2PF" =~ ^[01]$ ]] || fail E_CONFIG 'L2PF must be 0 or 1 (TF_GLM_L2PF).'
+  [[ "$EXTRA_EOS" == none || "$EXTRA_EOS" =~ ^[^[:space:],]+(,[^[:space:],]+)*$ ]] \
+    || fail E_CONFIG 'EXTRA_EOS must be none or a comma-separated list of tokens, e.g. <|assistant|>.'
   [[ "$KV_SHARD" == 0 || ( "$KV" == fp8 && "$KV_PAGES" == on && "$DRAFTER" != mtp && "$PARALLEL" != 1 && "$GPUS" =~ ^[0-9]+,[0-9]+$ ) ]] \
     || fail E_CONFIG 'KV_SHARD=1 needs two GPUs in GPUS, KV=fp8, KV_PAGES=on, DRAFTER=dflash2 or none, and PARALLEL=auto or above 1.'
   [[ "$WITH_VIDEO" =~ ^[01]$ ]] || fail E_CONFIG 'WITH_VIDEO must be 0 or 1.'

@@ -151,6 +151,11 @@ CHAT_TEMPLATE="${CHAT_TEMPLATE:-auto}"
 # which the engine passes with thinking on only; always: the template as it is. CHAT_TEMPLATE=auto only; a template
 # of your own decides for itself.
 EFFORT_LINE="${EFFORT_LINE:-thinking}"
+# EXTRA_EOS (engine patch 0108, TF_EXTRA_EOS): tokens that end a reply besides the checkpoint's EOS ids
+# (<|endoftext|>, <|user|>, <|observation|>), comma-separated. GLM-5.3 can close a reply with <|assistant|>, which
+# its generation_config leaves out: the token then reaches the reply as text and the model writes a second turn of
+# its own until MAX_TOKENS. none: the checkpoint's list only.
+EXTRA_EOS="${EXTRA_EOS:-<|assistant|>}"
 THINKING="${THINKING:-0}"                        # --thinking / --no-thinking default; requests override
 REASONING_EFFORT="${REASONING_EFFORT:-high}"     # --reasoning-effort low|medium|high|xhigh (empty: omit)
 MAX_TOKENS="${MAX_TOKENS:-32768}"                # --max-tokens default reply limit

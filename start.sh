@@ -178,7 +178,7 @@ build_serve_args() {
 # TENSORFOLD_API_KEY's included, are never printed). The per-rank ones are set by the runner.
 MANAGED_ENV=' HOME HF_HUB_OFFLINE CUDA_DEVICE_ORDER CUDA_VISIBLE_DEVICES TENSORFOLD_NO_UPDATE_CHECK TENSORFOLD_NO_LIVE
  TENSORFOLD_MEMORY_RESERVE_GIB TF_GLM_DENSE_BITS TF_GLM_HEAD_BITS TF_GLM_CLEAR_THINKING TF_GLM_RANK TF_GLM_WORLD TF_CUDA_DEVICE
- TF_KV_PAGES TF_GLM_CE_EXCHANGE TF_GLM_ABSORB_MMA TF_GLM_W8A8 TENSORFOLD_PREFILL_SHARE TENSORFOLD_PREFILL_BUDGET TF_GLM_KV_SHARD TF_GLM_L2PF
+ TF_KV_PAGES TF_GLM_CE_EXCHANGE TF_GLM_ABSORB_MMA TF_GLM_W8A8 TENSORFOLD_PREFILL_SHARE TENSORFOLD_PREFILL_BUDGET TF_GLM_KV_SHARD TF_GLM_L2PF TF_EXTRA_EOS
  TF_BIN TF_REPO TF_REF NCCL_COMM_ID NCCL_P2P_LEVEL NCCL_SOCKET_IFNAME NCCL_IB_DISABLE RANK_DEVICES '
 build_env_args() {
   local key
@@ -194,6 +194,8 @@ build_env_args() {
   [[ "$KV_SHARD" != 1 ]] || ENV_ARGS+=(-e "TF_GLM_KV_SHARD=1")
   # L2PF=1: engine patch 0105 prefetches each decode window's next weights into L2 (every rank must agree)
   [[ "$L2PF" != 1 ]] || ENV_ARGS+=(-e "TF_GLM_L2PF=1")
+  # EXTRA_EOS: engine patch 0108 ends a reply at these tokens too (every rank alike)
+  [[ "$EXTRA_EOS" == none ]] || ENV_ARGS+=(-e "TF_EXTRA_EOS=$EXTRA_EOS")
   while IFS= read -r key; do
     [[ "$MANAGED_ENV" != *" $key "* ]] || continue
     case "$key" in TF_*|TENSORFOLD_*|NCCL_*) ENV_ARGS+=(-e "$key") ;; esac
