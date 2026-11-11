@@ -306,7 +306,7 @@ or numbers exactly, serve `ABLIT=0` or turn thinking on for those requests.
 
 ## Engine patches
 
-`patches/engine/` holds 101 patches on TensorFold `f350cd3e`, applied in order at image build. Grouped by purpose:
+`patches/engine/` holds 102 patches on TensorFold `f350cd3e`, applied in order at image build. Grouped by purpose:
 
 | Patches | What they do |
 | --- | --- |
@@ -336,6 +336,7 @@ or numbers exactly, serve `ABLIT=0` or turn thinking on for those requests.
 | 0097 | Warm turns for GLM: after a reply the server prefills the next turn's prompt in the background, so a user message after an agent loop resumes past the loop instead of re-reading it (GLM's template drops the loop's reasoning once the next message comes); the pass yields to real work at its next chunk gate, and (every family) to a request admitted ahead of it into the fill queue; each pass's outcome is logged (`next turn: background prefill of N tokens done` / `stepped aside` / `failed: ...`) |
 | 0103 | `--learn-conversations` for GLM on CUDA (`LEARN_GIB`, off by default), a backport of upstream [#1411](https://github.com/ashhart/TensorFold/pull/1411) by its author (the 2x DGX Spark recipe's 0109): kept prompt states on disk, every rank's part, written behind the request and read back after an eviction or a restart. `--spill-gib` and `--checkpoint-slots` are refused for GLM. Off: replies byte-identical |
 | 0104 | KV sharding (`KV_SHARD=1`, `TF_GLM_KV_SHARD`, off by default) at TP=2, toward upstream [#1431](https://github.com/ashhart/TensorFold/issues/1431) (the Spark recipe's 0110, one hunk moved): each stream's FP8 latent rows on its owner GPU, owner-computed decode and verify, prompts on a borrowed twin, kept states carried between owners, and 0103's disk image under it. Refused by name with the MTP drafter, `--parallel 1`, other KV caches, or a part under 131k tokens. `tf-cuda-test glm-kv-shard-check` checks it against an unsharded twin byte for byte. Off: replies byte-identical |
+| 0105 | `WITH_VIDEO=1` on x86_64 keeps FFmpeg's assembly, toward upstream [#2861](https://github.com/ashhart/TensorFold/pull/2861) by its author: `libtfvideo.so` exports only its four `tf_video_*` functions (an ELF version script), so FFmpeg's x86 assembly links into it and the Dockerfile no longer passes `--disable-asm`. Video frames then equal PyAV's (transformers' reader) byte for byte, so video replies can change, toward that reference. Text replies unchanged; the default image builds no video library |
 | 0076, 0079, 0085, 0087 | Test and contract-record changes |
 
 Every default-on patch was A/B tested against the image before it: greedy (T=0) replies identical, plus a measured

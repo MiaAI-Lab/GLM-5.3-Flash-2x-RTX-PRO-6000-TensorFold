@@ -25,6 +25,7 @@ These are upstream TensorFold pull requests, carried with their authors' names i
 | 0049-0056 | [@Bizuayeu](https://github.com/Bizuayeu) | [#1423](https://github.com/ashhart/TensorFold/pull/1423) | Paired prompt chunks |
 | 0103 | Robert Wojciechowski ([@wojo](https://github.com/wojo), X [@rwojo](https://x.com/rwojo)) | [#1411](https://github.com/ashhart/TensorFold/pull/1411) | GLM conversation states on disk, every rank's part (`--learn-conversations`), backported by its author |
 | 0104 | Robert Wojciechowski ([@wojo](https://github.com/wojo), X [@rwojo](https://x.com/rwojo)) | [#1431](https://github.com/ashhart/TensorFold/issues/1431) | KV sharding at TP=2: each stream's latent rows on its owner rank, with 0103's disk states under it |
+| 0105 | Scott Biggart ([@swbiggart](https://github.com/swbiggart)) | [#2861](https://github.com/ashhart/TensorFold/pull/2861) | `libtfvideo.so` exports only `tf_video_*`, so FFmpeg's x86_64 assembly links and `WITH_VIDEO=1` keeps it |
 
 Patches 0057-0063 are Mia's AI Lab's extension of #1423 to DFlash2.
 
