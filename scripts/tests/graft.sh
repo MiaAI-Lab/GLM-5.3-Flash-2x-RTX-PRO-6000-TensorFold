@@ -63,7 +63,12 @@ with open(p, "rb") as f:
 check "the rest of the tree is copied" test -f "$tmp/out/config.json"
 check "the index is copied" cmp -s "$tmp/parent/model.safetensors.index.json" "$tmp/out/model.safetensors.index.json"
 check "a missing layer is refused" bash -c '! python3 scripts/graft.py "$1/parent" "$1/donor" "$1/out2" --layers 7 >/dev/null 2>&1' _ "$tmp"
-check "a dtype or shape mismatch is refused" python3 -c '
+ln -s "$tmp/parent" "$tmp/alias"  # OUT spelled through a symlink to PARENT: refused, and the parent keeps every file
+check "an OUT that resolves to PARENT is refused" bash -c '! python3 scripts/graft.py "$1/parent" "$1/donor" "$1/alias" --layers 1 >/dev/null 2>&1' _ "$tmp"
+check "the parent is untouched after that refusal" [ "$before" = "$(cd "$tmp/parent" && sha256sum * | sort)" ]
+# both steps inside the check, so a refusal that does not come is a FAIL line, not a silent set -e exit
+shape_mismatch_refused() {
+  python3 -c '
 import json, struct, sys
 d = sys.argv[1] + "/donor"
 p = d + "/model-00001-of-00001.safetensors"
@@ -73,5 +78,7 @@ name = "model.language_model.layers.1.self_attn.o_proj.weight"
 h[name]["shape"] = [8]
 blob = json.dumps(h).encode()
 open(p, "wb").write(struct.pack("<Q", len(blob)) + blob + body)
-' "$tmp" && bash -c '! python3 scripts/graft.py "$1/parent" "$1/donor" "$1/out3" --layers 1 >/dev/null 2>&1' _ "$tmp"
+' "$tmp" && ! python3 scripts/graft.py "$tmp/parent" "$tmp/donor" "$tmp/out3" --layers 1 >/dev/null 2>&1
+}
+check "a dtype or shape mismatch is refused" shape_mismatch_refused
 (( fails == 0 )) || { echo "graft: $fails check(s) failed"; exit 1; }

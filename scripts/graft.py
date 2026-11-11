@@ -115,11 +115,12 @@ def main():
     ap.add_argument("--verify", action="store_true", help="re-read each grafted tensor and compare it with the donor's")
     a = ap.parse_args()
 
-    parent, donor, out = (os.path.abspath(p) for p in (a.parent, a.donor, a.out))
+    # resolved paths: an OUT spelled through a symlink must not reach the parent's files, which copy_or_link unlinks
+    parent, donor, out = (os.path.realpath(p) for p in (a.parent, a.donor, a.out))
     for path, what in ((parent, "parent"), (donor, "donor")):
         if not os.path.isdir(path):
             fail(f"{what} {path}: not a directory")
-    if out == parent or out == donor:
+    if out == parent or out == donor or (os.path.exists(out) and (os.path.samefile(out, parent) or os.path.samefile(out, donor))):
         fail("OUT must differ from PARENT and DONOR")
     if out.startswith(parent + os.sep):
         fail("OUT must not sit inside PARENT (its hardlinks would follow the parent's files)")
