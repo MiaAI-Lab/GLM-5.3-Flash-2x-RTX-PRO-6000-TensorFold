@@ -507,10 +507,12 @@ if [[ "$DRY_RUN" != 1 ]]; then
   if [[ "$CONTEXT" == auto ]]; then
     remember_context "$FIT_KEY" "$CTX"
     log "Context: $CTX tokens (kept for the next start with these settings; delete $FIT_FILE to probe again)."
-    pool=$(grep -ho 'taking [0-9]* pages of 512 rows' "$RUN_LOG_DIR/rank0.log" 2>/dev/null | tail -1 | grep -o '[0-9]*' | head -1)
+    # Windows (KV_PAGES=off, or auto with KV=fp8) have no pages line, so no pool to report and no pipefail exit.
+    pool=$(grep -ho 'taking [0-9]* pages of 512 rows' "$RUN_LOG_DIR/rank0.log" 2>/dev/null | tail -1 | grep -o '[0-9]*' | head -1) || true
     [[ -z "$pool" ]] || log "KV pool: $pool pages = $(( pool * 512 )) tokens shared by $PARALLEL streams (one request up to $CTX)."
     # A few MiB more fixed memory can quietly drop a stream or, with the device leftover gone, the whole prompt cache.
-    grep -q "$PARALLEL streams at once" "$RUN_LOG_DIR/rank0.log" 2>/dev/null ||
+    # One stream reads "1 stream at once"; auto names no count.
+    [[ "$PARALLEL" == auto ]] || grep -qE "(^|[^0-9])$PARALLEL streams? at once" "$RUN_LOG_DIR/rank0.log" 2>/dev/null ||
       warn W_STREAMS "The engine serves fewer than PARALLEL=$PARALLEL streams at once; see the startup line in $RUN_LOG_DIR/rank0.log."
     [[ "$PROMPT_CACHE_GIB" == 0 ]] || grep -q 'pinned host memory' "$RUN_LOG_DIR/rank0.log" 2>/dev/null ||
       warn W_CACHE "No host prompt-cache tier this start: follow-up turns re-read their whole prompt. See the prompt cache line in $RUN_LOG_DIR/rank0.log."
