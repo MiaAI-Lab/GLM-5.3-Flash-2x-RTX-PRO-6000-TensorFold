@@ -132,6 +132,12 @@ LEARN_MIN_FREE_GIB="${LEARN_MIN_FREE_GIB:-15}"
 # both, so the same memory holds about 1.8x the tokens; the other GPU's queries go to the owner for attention. Needs
 # GPUS with two GPUs, KV=fp8, KV_PAGES=on, DRAFTER=dflash2 or none, PARALLEL above 1. 0 (default): off, as before.
 KV_SHARD="${KV_SHARD:-0}"
+# L2PF=1 (engine patch 0105, TF_GLM_L2PF, from upstream): each decode window reads the next layer's mixer weights, this
+# layer's router and KDA's o_proj into L2 on a side stream while the gathers and chains run (not the EXL3 routed
+# experts). Upstream turns it on by default on GB10 at TP>=2 only; on the 2x DGX Spark pair it gave +2% at one stream
+# and nothing measurable at four or eight, and it is not measured on RTX PRO 6000. Every rank must agree (the
+# fingerprint carries it). 0 (default): off, as before.
+L2PF="${L2PF:-0}"
 VISION="${VISION:-1}"                            # --vision: images (rank 0's tower)
 VISION_MAX_IMAGES="${VISION_MAX_IMAGES:-100}"    # --vision-max-images: images per request (engine default 4, at most 100 with patch 0102)
 # --chat-template: auto = with VISION=1, templates/glm-5.3-flash-vision.jinja (the checkpoint's own template, whose media

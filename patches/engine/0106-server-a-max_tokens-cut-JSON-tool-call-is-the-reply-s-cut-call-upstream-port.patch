@@ -1,0 +1,712 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Tue, 10 Nov 2026 12:05:00 +0200
+Subject: [PATCH] server: a JSON tool call max_tokens cuts is the reply's cut
+ call, as XML and GLM calls are (upstream port)
+
+Ported onto f350cd3 + patches 0001-0113 from upstream ashhart/TensorFold:
+  b10fda39f server: a JSON tool call max_tokens cuts is the reply's cut call, as XML and GLM calls are (Anders Jensen-Waud)
+  1b5ac18bb server: a cut JSON call reads the keys a closed one does, and whole arguments spell as the closed call's (Anders Jensen-Waud)
+  7faa962a0 server: a whole /v1/messages reply closes a max_tokens-cut call's input as far as written, as the stream does (Anders Jensen-Waud)
+
+tool_stream.cutCalls falls back to tool_json_cut once GLM's cut finds none: an open <tool_call> whose JSON payload has
+named an offered tool returns that call with its arguments as far as written; a call cut before its name, or naming a
+tool not offered, stays text, so patch 0107/0112's TF_TOOL_CALL_GUARD sees the same offered-only calls. A whole
+/v1/messages reply closes a cut call's input where it parses (tool_args_close.zig) instead of answering 500.
+
+Port notes: only root.zig's test list and tool_stream.zig's imports conflicted (upstream-only neighbours not taken);
+CHANGELOG lines not taken. Local fixes over upstream, from review: a member with a key and no value (`{"name":,`)
+ended the member scan with an empty value that cutCall then indexed ([0] on an empty slice); it now stops the scan,
+so the call stays text. A cut call's name matches an offered tool trimmed and in any case, as tool_parse matches a
+closed call's, and returns the offered spelling. Host tests for both.
+Known, unchanged from upstream and from the XML/GLM cut path this extends: a reply that streamed an earlier call and
+then ends in a cut JSON call does not replay the cut call (tool_calls_streamed), and cutProse drops every envelope
+before the cut call, a malformed one that 0112 would keep as text included.
+
+Co-authored-by: Anders Jensen-Waud <5827908+ajensenwaud@users.noreply.github.com>
+---
+ zig/src/server/anthropic.zig                 |   6 +-
+ zig/src/server/root.zig                      |   3 +
+ zig/src/server/tool_args_close.zig           | 112 ++++++++++
+ zig/src/server/tool_cut_test.zig             |  32 +++
+ zig/src/server/tool_json_cut.zig             | 219 ++++++++++++++++++
+ zig/src/server/tool_json_cut_routes_test.zig | 221 +++++++++++++++++++
+ zig/src/server/tool_stream.zig               |   4 +-
+ 7 files changed, 594 insertions(+), 3 deletions(-)
+ create mode 100644 zig/src/server/tool_args_close.zig
+ create mode 100644 zig/src/server/tool_json_cut.zig
+ create mode 100644 zig/src/server/tool_json_cut_routes_test.zig
+
+diff --git a/zig/src/server/anthropic.zig b/zig/src/server/anthropic.zig
+index 34f7e3298..e4e93a983 100644
+--- a/zig/src/server/anthropic.zig
++++ b/zig/src/server/anthropic.zig
+@@ -355,12 +355,14 @@ const Reply = struct {
+             try b.put(a, "text", t);
+             try content.append(a, .{ .object = b });
+         };
+-        if (message.get("tool_calls")) |calls| if (calls == .array) for (calls.array) |call| {
++        const cut = std.mem.eql(u8, json.strOr(choice.get("finish_reason")), "length");
++        if (message.get("tool_calls")) |calls| if (calls == .array) for (calls.array, 0..) |call, i| {
+             const function = call.get("function").?;
+             const raw = function.get("arguments").?;
+             const args = if (raw == .string) switch (try json.parseText(a, raw.string)) {
+                 .ok => |v| v,
+-                .err => |m| {
++                .err => |m| blk: { // max_tokens cut the last call: its input closed as far as written, as the stream's
++                    if (cut and i + 1 == calls.array.len) if (try @import("tool_args_close.zig").close(a, raw.string)) |v| break :blk v;
+                     r.problem = m;
+                     return error.InvalidResponse;
+                 },
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index 956d74139..756715276 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -88,6 +88,9 @@ test {
+     _ = @import("stream_preflight_test.zig");
+     _ = @import("stream_dsml_test.zig");
+     _ = @import("tool_cut_test.zig");
++    _ = @import("tool_args_close.zig");
++    _ = @import("tool_json_cut.zig");
++    _ = @import("tool_json_cut_routes_test.zig");
+     _ = @import("logprobs_test.zig");
+     _ = @import("think_split_test.zig");
+     _ = @import("thinking_reserve_test.zig");
+diff --git a/zig/src/server/tool_args_close.zig b/zig/src/server/tool_args_close.zig
+new file mode 100644
+index 000000000..0130d72db
+--- /dev/null
++++ b/zig/src/server/tool_args_close.zig
+@@ -0,0 +1,112 @@
++//! A tool call's arguments that max_tokens cut, closed as far as written: a whole Messages reply needs an input object.
++const std = @import("std");
++const json = @import("json");
++const Allocator = std.mem.Allocator;
++const Value = json.Value;
++
++const max_depth = 64;
++const kept = 8; // the last points a cut may close at, newest first when tried
++
++/// A place the text can be closed: its length, the closers it needs, a cut string to end first.
++const Point = struct { len: usize, closers: [max_depth]u8 = undefined, n: usize = 0, string: bool = false };
++
++/// `text`, a cut JSON object, closed where it parses: in its cut string value, else after its last whole member.
++pub fn close(a: Allocator, text: []const u8) Allocator.Error!?Value {
++    var stack: [max_depth]u8 = undefined;
++    var keys: [max_depth]bool = undefined; // an object's next string is a key
++    var depth: usize = 0;
++    var in_string = false;
++    var escape = false;
++    var key_string = false;
++    var ring: [kept]Point = undefined;
++    var count: usize = 0;
++    const start = std.mem.indexOfNone(u8, text, " \t\r\n") orelse return null;
++    if (text[start] != '{') return null;
++    for (text[start..], start..) |ch, i| {
++        if (in_string) {
++            if (escape) {
++                escape = false;
++            } else if (ch == '\\') {
++                escape = true;
++                continue;
++            } else if (ch == '"') {
++                in_string = false;
++                if (!key_string) mark(&ring, &count, i + 1, stack[0..depth], false);
++                continue;
++            }
++            if (!key_string) mark(&ring, &count, i + 1, stack[0..depth], true); // a cut escape or UTF-8 fails to parse
++            continue;
++        }
++        switch (ch) {
++            '{', '[' => {
++                if (depth == max_depth) return null;
++                stack[depth] = if (ch == '{') '}' else ']';
++                keys[depth] = ch == '{';
++                depth += 1;
++                mark(&ring, &count, i + 1, stack[0..depth], false);
++            },
++            '}', ']' => {
++                if (depth == 0) return null;
++                depth -= 1;
++                mark(&ring, &count, i + 1, stack[0..depth], false);
++            },
++            '"' => {
++                in_string = true;
++                key_string = depth > 0 and keys[depth - 1];
++                if (!key_string) mark(&ring, &count, i + 1, stack[0..depth], true);
++            },
++            ':' => if (depth > 0) {
++                keys[depth - 1] = false;
++            },
++            ',' => if (depth > 0) {
++                mark(&ring, &count, i, stack[0..depth], false); // a whole member or element before it
++                keys[depth - 1] = stack[depth - 1] == '}';
++            },
++            else => {},
++        }
++    }
++    var tried: usize = 0;
++    while (tried < @min(count, kept)) : (tried += 1) {
++        const p = &ring[(count - 1 - tried) % kept];
++        var buf: std.ArrayList(u8) = .empty;
++        try buf.appendSlice(a, text[0..p.len]);
++        if (p.string) try buf.append(a, '"');
++        var j = p.n;
++        while (j > 0) : (j -= 1) try buf.append(a, p.closers[j - 1]);
++        switch (try json.parseText(a, buf.items)) {
++            .ok => |v| if (v == .object) return v,
++            .err => {},
++        }
++    }
++    return null;
++}
++
++fn mark(ring: *[kept]Point, count: *usize, len: usize, open: []const u8, string: bool) void {
++    const p = &ring[count.* % kept];
++    p.* = .{ .len = len, .n = open.len, .string = string };
++    @memcpy(p.closers[0..open.len], open);
++    count.* += 1;
++}
++
++fn expectClosed(want: ?[]const u8, text: []const u8) !void {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const got = try close(a, text);
++    if (want == null) return std.testing.expect(got == null);
++    try std.testing.expectEqualStrings(want.?, try json.stringify(a, got orelse return error.TestExpectedClosed, .{ .ascii = false, .compact = true }));
++}
++
++test "cut arguments close inside the cut string value, or after the last whole member" {
++    try expectClosed("{\"path\":\"notes.txt\",\"content\":\"The history of\"}", "{\"path\": \"notes.txt\", \"content\": \"The history of");
++    try expectClosed("{\"path\":\"notes.txt\"}", "{\"path\": \"notes.txt\", \"cont");
++    try expectClosed("{\"path\":\"notes.txt\"}", "{\"path\": \"notes.txt\", \"content\":");
++    try expectClosed("{\"path\":\"notes.txt\"}", "{\"path\": \"notes.txt\", \"n\": 12");
++    try expectClosed("{\"a\":[1,{\"b\":\"x\"}]}", "{\"a\": [1, {\"b\": \"x\"}");
++    try expectClosed("{\"a\":[1,2]}", "{\"a\": [1, 2, tr");
++    try expectClosed("{\"s\":\"line\\n\"}", "{\"s\": \"line\\n\\");
++    try expectClosed("{\"s\":\"x\"}", "{\"s\": \"x\\u00");
++    try expectClosed("{}", "{");
++    try expectClosed(null, "");
++    try expectClosed(null, "[1, 2");
++}
+diff --git a/zig/src/server/tool_cut_test.zig b/zig/src/server/tool_cut_test.zig
+index 1bfa25ca7..11ee4c78d 100644
+--- a/zig/src/server/tool_cut_test.zig
++++ b/zig/src/server/tool_cut_test.zig
+@@ -91,6 +91,38 @@ test "a cut GLM call keeps the one-call policy, and one not yet named or not off
+     try expectGlmCut(unoffered, 0, "", unoffered, "");
+ }
+ 
++test "a JSON call max_tokens cuts is the whole reply's tool call, cut, as an XML call is" {
++    const named = "<tool_call>\n{\"name\": \"write_file\", \"arguments\": ";
++    const args = "{\"path\": \"notes.txt\", \"content\": \"The history of";
++    try expectCutBefore(" the bicycle\"}}\n</tool_call>", named ++ args, 1, args, "", "");
++    try expectCutBefore(" the bicycle\"}}\n</tool_call>", "Writing it.\n" ++ named ++ args, 1, args, "Writing it.", "");
++    // a whole call first: both calls, the second cut
++    const first = "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.txt\"}}\n</tool_call>\n";
++    const both = "{\"path\":\"a.txt\"}" ++ args;
++    try expectCutBefore(" the bicycle\"}}\n</tool_call>", first ++ named ++ args, 2, both, "", "");
++    // arguments whole, the payload or only the envelope not yet closed: spelled as the closed call spells them
++    try expectCutBefore("}\n</tool_call>", named ++ "{\"path\": \"a.txt\"}", 1, "{\"path\":\"a.txt\"}", "", "");
++    try expectCutBefore("\n</tool_call>", named ++ "{\"path\": \"a.txt\"}}", 1, "{\"path\":\"a.txt\"}", "", "");
++}
++
++test "a cut JSON call reads parameters, and arguments written before the name" {
++    const params = "<tool_call>\n{\"name\": \"write_file\", \"parameters\": {\"path\": \"no";
++    try expectCutBefore("tes.txt\"}}\n</tool_call>", params, 1, "{\"path\": \"no", "", "");
++    const first = "<tool_call>\n{\"arguments\": {\"path\": \"a.txt\"}, \"name\": \"write_file\"";
++    try expectCutBefore("}\n</tool_call>", first, 1, "{\"path\":\"a.txt\"}", "", "");
++    // the arguments' own "name" is not the call's: cut before the call's, the reply is text
++    const unnamed = "<tool_call>\n{\"arguments\": {\"name\": \"write_file\", \"path\": \"a";
++    try expectCutBefore(".txt\"}, \"name\": \"write_file\"}\n</tool_call>", unnamed, 0, "", unnamed, "");
++}
++
++test "a cut JSON call keeps the one-call policy, and one not yet named or not offered stays text" {
++    const cut = "Writing it.\n<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"no";
++    try expectCutBefore("tes.txt\"}}\n</tool_call>", cut, 0, "", null, ",\"parallel_tool_calls\":false");
++    try expectCutBefore("e\": \"write_file\"}\n</tool_call>", "<tool_call>\n{\"nam", 0, "", "<tool_call>\n{\"nam", "");
++    const unoffered = "<tool_call>\n{\"name\": \"launch\", \"arguments\": {\"x\": 1";
++    try expectCutBefore("}}\n</tool_call>", unoffered, 0, "", unoffered, "");
++}
++
+ test "a chunked XML cut drops only the pending framing newline" {
+     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+     defer arena.deinit();
+diff --git a/zig/src/server/tool_json_cut.zig b/zig/src/server/tool_json_cut.zig
+new file mode 100644
+index 000000000..2ec8279a6
+--- /dev/null
++++ b/zig/src/server/tool_json_cut.zig
+@@ -0,0 +1,219 @@
++//! A JSON call max_tokens cut (``<tool_call>\n{"name": "f", "arguments": {...``, Ripple's form): the call, cut.
++const std = @import("std");
++const json = @import("json");
++const ids = @import("ids.zig");
++const reply_text = @import("reply_text.zig");
++const tool_parse = @import("tool_parse.zig");
++const tool_specs = @import("tool_specs.zig");
++const Value = json.Value;
++const Allocator = std.mem.Allocator;
++
++/// The keys ``tool_parse.payload`` reads a call's name and arguments from (a nested `function` names by the first 3).
++const name_keys = [_][]const u8{ "name", "tool", "function", "call" };
++const argument_keys = [_][]const u8{ "arguments", "args", "parameters" };
++
++/// A reply max_tokens cut inside a JSON call: the whole calls before it, then it, cut; null when it ends in none.
++pub fn cutCalls(a: Allocator, text: []const u8, tools: []const Value) Allocator.Error!?[]Value {
++    const start = tool_parse.openCall(text) orelse return null;
++    const cut = try cutCall(a, text[start + "<tool_call>".len ..], tools) orelse return null;
++    const before = (try tool_parse.parse(a, text[0..start], tools, null)).calls orelse &.{};
++    return try std.mem.concat(a, Value, &.{ before, &.{cut} });
++}
++
++/// The JSON string at `s[0]` (a quote): its end past the closing quote; null when the cut came first.
++fn stringEnd(s: []const u8) ?usize {
++    var i: usize = 1;
++    while (i < s.len) : (i += 1) switch (s[i]) {
++        '\\' => i += 1,
++        '"' => return i + 1,
++        else => {},
++    };
++    return null;
++}
++
++/// The end of the JSON value `s` begins with when it is whole (balanced brackets outside strings); null if cut.
++fn valueEnd(s: []const u8) ?usize {
++    var depth: usize = 0;
++    var i: usize = 0;
++    while (i < s.len) {
++        switch (s[i]) {
++            '"' => {
++                i += stringEnd(s[i..]) orelse return null;
++                if (depth == 0) return i;
++                continue;
++            },
++            '{', '[' => depth += 1,
++            '}', ']' => {
++                if (depth == 0) return i;
++                depth -= 1;
++                if (depth == 0) return i + 1;
++            },
++            else => if (depth == 0 and (s[i] == ',' or std.ascii.isWhitespace(s[i]))) return i,
++        }
++        i += 1;
++    }
++    return null;
++}
++
++/// A member of a written object: its key, its value as far as written, and whether the cut came inside the value.
++const Member = struct { key: []const u8, value: []const u8, cut: bool };
++
++/// The members the object text `body` (from its `{`) writes before the cut, in order.
++fn members(a: Allocator, body: []const u8) Allocator.Error![]const Member {
++    var out: std.ArrayList(Member) = .empty;
++    var i = skip(body, 1);
++    while (i < body.len and body[i] == '"') {
++        const key_end = i + (stringEnd(body[i..]) orelse break);
++        const key = switch (try json.parseText(a, body[i..key_end])) {
++            .ok => |v| if (v == .string) v.string else break,
++            .err => break,
++        };
++        i = skip(body, key_end);
++        if (i >= body.len or body[i] != ':') break;
++        i = skip(body, i + 1);
++        if (i >= body.len) break;
++        const end = valueEnd(body[i..]) orelse {
++            try out.append(a, .{ .key = key, .value = body[i..], .cut = true });
++            break;
++        };
++        if (end == 0) break; // a key with no value written (`{"name":,`): nothing past it is a member
++        try out.append(a, .{ .key = key, .value = body[i..][0..end], .cut = false });
++        i = skip(body, i + end);
++        if (i >= body.len or body[i] != ',') break;
++        i = skip(body, i + 1);
++    }
++    return out.items;
++}
++
++fn skip(s: []const u8, from: usize) usize {
++    var i = from;
++    while (i < s.len and std.ascii.isWhitespace(s[i])) i += 1;
++    return i;
++}
++
++/// The first written member named `key`.
++fn find(ms: []const Member, key: []const u8) ?Member {
++    for (ms) |m| if (std.mem.eql(u8, m.key, key)) return m;
++    return null;
++}
++
++/// The call the whole payload `doc` makes in a closed envelope, as ``tool_parse.parse`` reads it; null if none.
++fn closed(a: Allocator, doc: []const u8, tools: []const Value) Allocator.Error!?Value {
++    const text = try std.mem.concat(a, u8, &.{ "<tool_call>", doc, "</tool_call>" });
++    const calls = (try tool_parse.parse(a, text, tools, null)).calls orelse return null;
++    return calls[0];
++}
++
++/// The call an open envelope's `written` payload begins, keyed as a closed one; null unless it names a tool.
++fn cutCall(a: Allocator, written: []const u8, tools: []const Value) Allocator.Error!?Value {
++    const body = reply_text.pyLstrip(written);
++    if (body.len == 0 or body[0] != '{') return null;
++    if (valueEnd(body)) |end| return closed(a, body[0..end], tools);
++    const top = try members(a, body);
++    const nested = find(top, "function");
++    const inner = nested != null and nested.?.value[0] == '{';
++    const holder = if (inner) try members(a, nested.?.value) else top;
++    const quoted = for (if (inner) name_keys[0..3] else &name_keys) |k| {
++        const m = find(holder, k) orelse continue;
++        if (m.cut) return null; // the name is whole once its closing quote came
++        if (m.value[0] == '"' and m.value.len > 2) break m.value;
++    } else return null;
++    const args = for (argument_keys) |k| {
++        if (find(holder, k)) |m| break m;
++    } else return null; // no arguments written yet: the text stays
++    if (!args.cut) {
++        const doc = try std.mem.concat(a, u8, &.{ "{\"name\":", quoted, ",\"arguments\":", args.value, "}" });
++        return closed(a, doc, tools);
++    }
++    const name = switch (try json.parseText(a, quoted)) {
++        .ok => |v| if (v == .string) (try offered(a, v.string, tools)) orelse return null else return null,
++        .err => return null,
++    };
++    const function = try json.newObject(a);
++    try function.put(a, "name", .{ .string = name });
++    const written_args = if (args.value[0] == '"') try cutString(a, args.value) else args.value;
++    try function.put(a, "arguments", .{ .string = written_args });
++    const call = try json.newObject(a);
++    try call.put(a, "id", .{ .string = try ids.make(a, "call_", 24) });
++    try call.put(a, "type", .{ .string = "function" });
++    try call.put(a, "function", .{ .object = function });
++    return .{ .object = call };
++}
++
++/// A cut JSON string's text as far as written; an escape the cut split is dropped.
++fn cutString(a: Allocator, s: []const u8) Allocator.Error![]const u8 {
++    var end = s.len;
++    while (end > 1 and end + 6 > s.len) : (end -= 1) {
++        switch (try json.parseText(a, try std.mem.concat(a, u8, &.{ s[0..end], "\"" }))) {
++            .ok => |v| if (v == .string) return v.string,
++            .err => {},
++        }
++    }
++    return "";
++}
++
++/// The offered tool's spelling of `name`, as ``tool_parse.parse`` matches it (trimmed, any case); null if none.
++fn offered(a: Allocator, name: []const u8, tools: []const Value) Allocator.Error!?[]const u8 {
++    const want = std.mem.trim(u8, name, " \t\r\n\x0b\x0c");
++    for (tools) |tool| {
++        const spelled = try tool_specs.toolName(a, tool);
++        if (spelled.len > 0 and std.ascii.eqlIgnoreCase(spelled, want)) return spelled;
++    }
++    return null;
++}
++
++const weather = "[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"parameters\":{}}}]";
++
++/// The arguments of the call `payload` begins in an open envelope; null when it stays text.
++fn cutArguments(a: Allocator, payload: []const u8) !?[]const u8 {
++    const tools = (try json.parseText(a, weather)).ok.array;
++    const calls = try cutCalls(a, try std.mem.concat(a, u8, &.{ "<tool_call>\n", payload }), tools) orelse return null;
++    try std.testing.expectEqual(@as(usize, 1), calls.len);
++    try std.testing.expectEqualStrings("get_weather", calls[0].get("function").?.strField("name").?);
++    return calls[0].get("function").?.strField("arguments").?;
++}
++
++test "a JSON call cut inside its arguments is the call, cut; one cut before its name is whole stays text" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parseText(a, weather)).ok.array;
++    const head = "<think>\nok\n</think>\n\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": ";
++    const mid = (try cutCalls(a, head ++ "{\"city\": \"Syd", tools)).?;
++    try std.testing.expectEqual(@as(usize, 1), mid.len);
++    const f = mid[0].get("function").?;
++    try std.testing.expectEqualStrings("get_weather", f.strField("name").?);
++    try std.testing.expectEqualStrings("{\"city\": \"Syd", f.strField("arguments").?);
++    const whole = (try cutCalls(a, head ++ "{\"city\": \"Sydney\"}}\n</", tools)).?;
++    try std.testing.expectEqualStrings("{\"city\":\"Sydney\"}", whole[0].get("function").?.strField("arguments").?);
++    try std.testing.expect(try cutCalls(a, "<tool_call>\n{\"na", tools) == null);
++    try std.testing.expect(try cutCalls(a, "<tool_call>\n{\"name\": \"other\", \"arguments\": {", tools) == null);
++    try std.testing.expect(try cutCalls(a, "<tool_call>\n{\"name\": \"get_weather\"}\n</tool_call>", tools) == null);
++}
++
++test "a cut JSON call reads the keys a closed one does, and whole arguments spell as the closed call's" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const city = "{\"city\":\"Sydney\"}";
++    const named = "{\"name\": \"get_weather\", ";
++    try expectArguments(a, city, named ++ "\"arguments\": {\"city\": \"Sydney\"}");
++    try expectArguments(a, city, "{\"arguments\": {\"city\": \"Sydney\"}, \"name\": \"get_weather\"");
++    try expectArguments(a, "{\"city\": \"Sy", named ++ "\"parameters\": {\"city\": \"Sy");
++    try expectArguments(a, "{\"city\": \"Sy", "{\"tool\": \"get_weather\", \"args\": {\"city\": \"Sy");
++    const nested = "{\"type\": \"function\", \"function\": " ++ named ++ "\"arguments\": ";
++    try expectArguments(a, "{\"city\": \"Sy", nested ++ "\"{\\\"city\\\": \\\"Sy");
++    try expectArguments(a, "{\"city\": \"Sy", nested ++ "\"{\\\"city\\\": \\\"Sy\\");
++    try expectArguments(a, city, nested ++ "{\"city\": \"Sydney\"}");
++    // the arguments' own "name" is not the call's, and a call with no arguments key yet stays text
++    try std.testing.expect(try cutArguments(a, "{\"arguments\": {\"name\": \"get_weather\", \"city\": \"Sy") == null);
++    try std.testing.expect(try cutArguments(a, named ++ "\"argu") == null);
++    // a key with no value stays text, and a name in another case is the offered tool's, as a closed call's is
++    try std.testing.expect(try cutArguments(a, "{\"name\":, \"arguments\": {\"city\": \"Sy") == null);
++    try std.testing.expect(try cutArguments(a, "{\"function\":, \"arguments\": {\"city\": \"Sy") == null);
++    try expectArguments(a, "{\"city\": \"Sy", "{\"name\": \" GET_WEATHER \", \"arguments\": {\"city\": \"Sy");
++}
++
++fn expectArguments(a: Allocator, want: []const u8, payload: []const u8) !void {
++    try std.testing.expectEqualStrings(want, (try cutArguments(a, payload)) orelse return error.NoCall);
++}
+diff --git a/zig/src/server/tool_json_cut_routes_test.zig b/zig/src/server/tool_json_cut_routes_test.zig
+new file mode 100644
+index 000000000..16c2432c5
+--- /dev/null
++++ b/zig/src/server/tool_json_cut_routes_test.zig
+@@ -0,0 +1,221 @@
++//! A JSON call max_tokens cuts on /v1/messages and /v1/responses, whole and streamed (the chat run's cut call).
++const std = @import("std");
++const api = @import("engine_api");
++const server = @import("root.zig");
++const json = server.json;
++const model_text = @import("model_text.zig");
++const exchange = @import("late_system_test.zig").exchange;
++const testing = std.testing;
++const Allocator = std.mem.Allocator;
++
++/// Bytes as tokens, no end token; every prompt renders as "prompt".
++const ByteText = struct {
++    fn text(t: *@This()) model_text.Text {
++        return .{ .ctx = t, .vtable = &.{
++            .encode = encode,
++            .decode = decode,
++            .token_id = tokenId,
++            .token_string = tokenString,
++            .vocab_size = vocabSize,
++            .eos_ids = eosIds,
++            .render = render,
++            .template_source = templateSource,
++        } };
++    }
++
++    fn encode(_: *anyopaque, a: Allocator, input: []const u8, _: bool) model_text.Error![]u32 {
++        const out = try a.alloc(u32, input.len);
++        for (input, out) |byte, *id| id.* = byte;
++        return out;
++    }
++
++    fn decode(_: *anyopaque, a: Allocator, tokens: []const u32) Allocator.Error![]u8 {
++        const out = try a.alloc(u8, tokens.len);
++        for (tokens, out) |id, *byte| byte.* = @intCast(id);
++        return out;
++    }
++
++    fn tokenId(_: *anyopaque, _: []const u8) ?u32 {
++        return null;
++    }
++
++    fn tokenString(_: *anyopaque, a: Allocator, id: u32) Allocator.Error![]u8 {
++        return decode(undefined, a, &.{id});
++    }
++
++    fn vocabSize(_: *anyopaque) u32 {
++        return 256;
++    }
++
++    fn eosIds(_: *anyopaque) []const u32 {
++        return &.{};
++    }
++
++    const Rendered = model_text.Error!model_text.Rendered;
++
++    fn render(_: *anyopaque, a: Allocator, _: json.Value, _: model_text.RenderOptions, _: *[]const u8) Rendered {
++        return .{ .text = try a.dupe(u8, "prompt") };
++    }
++
++    fn templateSource(_: *anyopaque) []const u8 {
++        return "";
++    }
++};
++
++/// Writes `reply` a byte a token, then stops at max_tokens.
++const Script = struct {
++    reply: []const u8,
++
++    fn engine(e: *@This()) api.Engine {
++        return .{ .ctx = e, .vtable = &.{
++            .info = info,
++            .submit = submit,
++            .cancel = cancel,
++            .status = status,
++            .memory = memory,
++        } };
++    }
++
++    fn info(_: *anyopaque) api.Info {
++        return .{ .context_window = 4096 };
++    }
++
++    fn submit(ctx: *anyopaque, id: api.Id, _: *const api.Request, sink: api.Sink) api.SubmitError!void {
++        const e: *Script = @ptrCast(@alignCast(ctx));
++        sink.event(sink.ctx, id, &.{ .prefilled = 0 });
++        for (e.reply) |byte| sink.event(sink.ctx, id, &.{ .tokens = &.{byte} });
++        sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .length } });
++    }
++
++    fn cancel(_: *anyopaque, _: api.Id) void {}
++
++    fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
++        out.* = .{};
++    }
++
++    fn memory(_: *anyopaque, _: bool) ?api.Memory {
++        return null;
++    }
++};
++
++const schema = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}," ++
++    "\"content\":{\"type\":\"string\"}}}";
++const named = "Writing it.\n<tool_call>\n{\"name\": \"write_file\", \"arguments\": ";
++const cut_args = "{\"path\": \"notes.txt\", \"content\": \"The history of";
++const whole_args = "{\"path\": \"notes.txt\"}";
++const compact = "{\"path\":\"notes.txt\"}";
++const cut_closed = "{\"path\":\"notes.txt\",\"content\":\"The history of\"}";
++const xml_cut = "Writing it.\n<tool_call>\n<function=write_file>\n<parameter=path>\nnotes.txt\n</parameter>\n" ++
++    "<parameter=content>\nThe history of";
++
++const messages_tool = "{\"name\":\"write_file\",\"input_schema\":" ++ schema ++ "}";
++const responses_tool = "{\"type\":\"function\",\"name\":\"write_file\",\"parameters\":" ++ schema ++ "}";
++
++/// What a route's reply says: its status, text, the call's arguments, and why it ended.
++const Seen = struct { status: u16, text: []const u8 = "", args: []const u8 = "", finish: []const u8 = "" };
++
++/// `reply` cut at its end on `path`, whole or streamed, read back as `Seen`.
++fn send(a: Allocator, path: []const u8, reply: []const u8, stream: bool) !Seen {
++    var text: ByteText = .{};
++    var backend: Script = .{ .reply = reply };
++    const srv = try server.Server.init(testing.allocator, testing.io, backend.engine(), text.text(), .{
++        .served_name = "m",
++        .model_ids = &.{"m"},
++        .enable_thinking = false,
++        .use_drafts = false,
++    }, null);
++    defer srv.deinit();
++    const messages = std.mem.eql(u8, path, "/v1/messages");
++    const body = try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"{s}\":{d},\"stream\":{s},{s},\"tools\":[{s}]}}", .{
++        if (messages) "max_tokens" else "max_output_tokens",
++        reply.len,
++        if (stream) "true" else "false",
++        if (messages) "\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]" else "\"input\":\"x\"",
++        if (messages) messages_tool else responses_tool,
++    });
++    const got = try exchange(srv, path, body);
++    defer testing.allocator.free(got.body);
++    const raw = try a.dupe(u8, got.body);
++    var seen: Seen = .{ .status = got.status };
++    if (got.status != 200) return seen;
++    if (!stream) {
++        const doc = (try json.parseText(a, raw)).ok;
++        if (messages) {
++            for (doc.get("content").?.array) |b| {
++                if (b.typeIs("text")) seen.text = b.strField("text").?;
++                const compacted: json.Options = .{ .ascii = false, .compact = true };
++                if (b.typeIs("tool_use")) seen.args = try json.stringify(a, b.get("input").?, compacted);
++            }
++            seen.finish = doc.strField("stop_reason").?;
++            return seen;
++        }
++        for (doc.get("output").?.array) |item| {
++            if (item.typeIs("message")) seen.text = item.get("content").?.array[0].strField("text").?;
++            if (item.typeIs("function_call")) seen.args = item.strField("arguments").?;
++        }
++        seen.finish = doc.get("incomplete_details").?.strField("reason").?;
++        return seen;
++    }
++    var text_out: std.ArrayList(u8) = .empty;
++    var args_out: std.ArrayList(u8) = .empty;
++    var lines = std.mem.splitScalar(u8, raw, '\n');
++    while (lines.next()) |line| {
++        if (!std.mem.startsWith(u8, line, "data: ")) continue;
++        const ev = switch (try json.parseText(a, std.mem.trim(u8, line[6..], "\r"))) {
++            .ok => |v| v,
++            .err => continue,
++        };
++        if (messages) {
++            if (ev.get("delta")) |d| {
++                if (d.typeIs("text_delta")) try text_out.appendSlice(a, d.strField("text").?);
++                if (d.typeIs("input_json_delta")) try args_out.appendSlice(a, d.strField("partial_json").?);
++                if (d.strField("stop_reason")) |r| seen.finish = r;
++            }
++            continue;
++        }
++        if (ev.typeIs("response.output_text.delta")) try text_out.appendSlice(a, ev.strField("delta").?);
++        if (ev.typeIs("response.function_call_arguments.delta")) try args_out.appendSlice(a, ev.strField("delta").?);
++        // the stream only grows: its pieces join to the arguments it ends with
++        if (ev.typeIs("response.function_call_arguments.done"))
++            try testing.expectEqualStrings(args_out.items, ev.strField("arguments").?);
++        const details = if (ev.typeIs("response.incomplete")) ev.get("response").?.get("incomplete_details") else null;
++        if (details) |d| seen.finish = d.strField("reason").?;
++    }
++    seen.text = text_out.items;
++    seen.args = args_out.items;
++    return seen;
++}
++
++fn expectSeen(want: Seen, got: Seen) !void {
++    try testing.expectEqual(want.status, got.status);
++    try testing.expectEqualStrings(want.text, got.text);
++    try testing.expectEqualStrings(want.args, got.args);
++    try testing.expectEqualStrings(want.finish, got.finish);
++}
++
++test "a cut JSON call on /v1/responses is the cut function_call, whole and streamed" {
++    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    for ([_]bool{ false, true }) |stream| {
++        const cut: Seen = .{ .status = 200, .text = "Writing it.", .args = cut_args, .finish = "max_output_tokens" };
++        try expectSeen(cut, try send(a, "/v1/responses", named ++ cut_args, stream));
++        const whole: Seen = .{ .status = 200, .text = "Writing it.", .args = compact, .finish = "max_output_tokens" };
++        try expectSeen(whole, try send(a, "/v1/responses", named ++ whole_args, stream));
++    }
++}
++
++test "a cut JSON or XML call on /v1/messages is a tool_use with its input as far as written, whole and streamed" {
++    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const cut: Seen = .{ .status = 200, .text = "Writing it.", .args = cut_args, .finish = "max_tokens" };
++    try expectSeen(cut, try send(a, "/v1/messages", named ++ cut_args, true));
++    const whole: Seen = .{ .status = 200, .text = "Writing it.", .args = compact, .finish = "max_tokens" };
++    for ([_]bool{ false, true }) |stream|
++        try expectSeen(whole, try send(a, "/v1/messages", named ++ whole_args, stream));
++    // a whole Messages reply needs an input object: the cut arguments closed as far as written, the XML cut's alike
++    const closed: Seen = .{ .status = 200, .text = "Writing it.", .args = cut_closed, .finish = "max_tokens" };
++    try expectSeen(closed, try send(a, "/v1/messages", named ++ cut_args, false));
++    try expectSeen(closed, try send(a, "/v1/messages", xml_cut, false));
++}
+diff --git a/zig/src/server/tool_stream.zig b/zig/src/server/tool_stream.zig
+index eaca9d5a3..8fb65a4b0 100644
+--- a/zig/src/server/tool_stream.zig
++++ b/zig/src/server/tool_stream.zig
+@@ -5,6 +5,7 @@ const ids = @import("ids.zig");
+ const reply_text = @import("reply_text.zig");
+ const tool_dsml = @import("tool_dsml.zig");
+ const tool_glm_cut = @import("tool_glm_cut.zig");
++const tool_json_cut = @import("tool_json_cut.zig");
+ const tool_params = @import("tool_params.zig");
+ const tool_specs = @import("tool_specs.zig");
+ const tool_parse = @import("tool_parse.zig");
+@@ -356,7 +357,8 @@ pub fn cutCalls(a: Allocator, text: []const u8, tools: []const Value) Allocator.
+     var s: Streamer = try .init(a, tools);
+     var deltas: std.ArrayList(Value) = .empty;
+     try s.finishCut(text, &deltas);
+-    if (!s.open()) return tool_glm_cut.cutCalls(a, text, tools); // a GLM envelope streams no call before it closes
++    // GLM and JSON envelopes stream no call before they close
++    if (!s.open()) return (try tool_glm_cut.cutCalls(a, text, tools)) orelse try tool_json_cut.cutCalls(a, text, tools);
+     const Call = struct { id: []const u8 = "", name: []const u8 = "", args: std.ArrayList(u8) = .empty };
+     const built = try a.alloc(Call, @intCast(s.index + 1));
+     for (built) |*c| c.* = .{};
+-- 
+2.43.0
+

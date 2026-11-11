@@ -1,0 +1,748 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0200
+Subject: [PATCH] glm cuda: TF_GLM_L2PF=1 reads a decode window's next weights
+ into L2 on a side stream (upstream port)
+
+Ported onto f350cd3 + patches 0001-0112 from upstream ashhart/TensorFold:
+  8cc6ac420 glm cuda: TF_GLM_L2PF reads a decode window's next weights into L2 on a side stream while gathers and chains run (Bizuayeu)
+  a0ddae24d glm cuda: TF_GLM_L2PF's two launches carry nvcc 13.0 contract records (Bizuayeu)
+
+Opt-in, off by default. Upstream's later default-on commits (96e9ebf29, e26a99ad1) are not taken: the prefetch is not
+yet qualified on this patched engine. Each decode window of a rank alone has three sites: n before gather_b reads the
+next layer's mixer input (KDA's qkv scales, codes and bf16 rest, or DSA's proj and q_b), f before gather_a reads this
+layer's ffn head (the router, or a dense layer's gate and up), and o between KDA's projections and its chain reads its
+o. EXL3 routed experts are not prefetched. Rows are the weights' own allocations after they tile, within
+TF_GLM_L2PF_MB (12) a site; the kernels are DeepSeek V4.1's l2pf (TF_GLM_L2PF_CTAS, 2) and l2pace
+(TF_GLM_L2PF_PACE_GBPS, 150; 0 unpaced). The side stream only reads, and joins the main stream once at the window's end.
+
+Port notes: Settings, Fingerprint and the Forward fields keep patches 0041/0064/0110's members (numerics, kv_shard) and
+add l2pf beside them; the Fingerprint layout goes 15 -> 16 (the recipe's own numbering, not upstream's 18). The shared
+window's KDA mixer forks site o before the batched chains of patches 0075/0088. Upstream-only fields that came with the
+hunk context (roce_multi, kv_host, solo, share_pages) are not taken. The contract records join landed_cuda after
+penalty_sampling. Local addition: L2pf.deinit drains the side stream before destroying it.
+
+Co-authored-by: Bizuayeu <30091157+Bizuayeu@users.noreply.github.com>
+---
+ zig/build/cuda_kernels.zig                 |   2 +
+ zig/src/core/contract/glm_l2pf_pending.zig |  13 +
+ zig/src/core/contract/registry.zig         |   3 +-
+ zig/src/cuda/kernels.zig                   |   2 +
+ zig/src/families/glm/cuda.zig              |   1 +
+ zig/src/families/glm/cuda_engine.zig       |   9 +-
+ zig/src/families/glm/cuda_forward.zig      |  13 +-
+ zig/src/families/glm/cuda_kda_block.zig    |   6 +-
+ zig/src/families/glm/cuda_l2pf.zig         | 336 +++++++++++++++++++++
+ zig/src/families/glm/cuda_ranks.zig        |  10 +-
+ zig/src/families/glm/cuda_ranks_test.zig   |  22 ++
+ zig/src/families/glm/cuda_shared.zig       |   1 +
+ zig/tests/cuda/contract_limits.zig         |   2 +
+ 13 files changed, 413 insertions(+), 7 deletions(-)
+ create mode 100644 zig/src/core/contract/glm_l2pf_pending.zig
+ create mode 100644 zig/src/families/glm/cuda_l2pf.zig
+
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 711e85af2..7f7265e48 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -115,6 +115,8 @@ pub const kernels = [_]Kernel{
+     .{ .name = "torch_movement", .src = "torch_ops/movement", .flags = torch_ops },
+     .{ .name = "torch_nemotron_constants", .src = "torch_ops/nemotron_constants", .flags = torch_ops },
+     .{ .name = "roce_gather", .src = "roce_gather", .flags = &.{"-O3"} }, // b12x's one-shot RoCE all-gather, two ranks
++    .{ .name = "l2pf", .src = "deepseek_v41/l2pf", .flags = &.{"-O3"} }, // DeepSeek V4.1's L2 prefetch of a weight table, as GLM's too (records: glm_l2pf_pending.zig)
++    .{ .name = "l2pace", .src = "deepseek_v41/l2pace", .flags = &.{"-O3"} }, // and its paced form
+     .{ .name = "drama3_staged_gemv", .flags = glue },
+     .{ .name = "drama3", .flags = &.{"-O3"} },
+     .{ .name = "drama3_fp8", .flags = &.{"-O3"} },
+diff --git a/zig/src/core/contract/glm_l2pf_pending.zig b/zig/src/core/contract/glm_l2pf_pending.zig
+new file mode 100644
+index 000000000..55cd9b636
+--- /dev/null
++++ b/zig/src/core/contract/glm_l2pf_pending.zig
+@@ -0,0 +1,13 @@
++//! GLM's L2 prefetch (TF_GLM_L2PF) from DeepSeek V4.1's l2pf and l2pace sources: nvcc 13.0 resources.
++const registry = @import("registry.zig");
++pub const records = [_]registry.CudaRecord{
++    .{ .launch = .{ .name = "l2pf _ZN6tfl2pf15segments_kernelILb1EEEvPKlij", .symbol = "_ZN6tfl2pf15segments_kernelILb1EEEvPKlij", .image = "l2pf", .threads = 128, .min_sm = 80 }, .usage = .{ .{ .regs = 30, .static = 0, .bound = 256 }, .{ .regs = 28, .static = 0, .bound = 256 }, .{ .regs = 28, .static = 0, .bound = 256 }, .{ .regs = 28, .static = 0, .bound = 256 }, .{ .regs = 28, .static = 0, .bound = 256 } }, .later_pending = true },
++    .{ .launch = .{ .name = "l2pace _ZN12dsv41_l2pace12paced_kernelEPKlijmm", .symbol = "_ZN12dsv41_l2pace12paced_kernelEPKlijmm", .image = "l2pace", .threads = 32, .min_sm = 80 }, .usage = .{ .{ .regs = 24, .static = 0, .bound = 32 }, .{ .regs = 23, .static = 0, .bound = 32 }, .{ .regs = 23, .static = 0, .bound = 32 }, .{ .regs = 20, .static = 0, .bound = 32 }, .{ .regs = 20, .static = 0, .bound = 32 } }, .later_pending = true },
++};
++test "GLM L2 prefetch: measured 13.0 launches fit their physical resource limits" {
++    const t = @import("std").testing;
++    for (records) |r| {
++        for (r.usage) |u| try t.expect(u.regs > 0);
++        try t.expectEqual(@as(usize, 0), try registry.checkCuda(t.allocator, &.{r}, true));
++    }
++}
+diff --git a/zig/src/core/contract/registry.zig b/zig/src/core/contract/registry.zig
+index 75e0e049f..865aa09cb 100644
+--- a/zig/src/core/contract/registry.zig
++++ b/zig/src/core/contract/registry.zig
+@@ -577,7 +577,7 @@ const learning = @import("registry_learning.zig");
+ pub const gradient_pending = learning.gradient_pending;
+ pub const qwen_learning_pending = learning.qwen_learning_pending;
+ pub const glm_pending = @import("glm_sampling_pending.zig");
+-pub const landed_cuda = cuda ++ @import("dory_cuda_records.zig").cuda ++ gradient_pending ++ qwen_learning_pending ++ paging.extra ++ @import("qwen_served_records.zig").records ++ cuda_pending ++ @import("qwen_decode_pending.zig").records ++ glm_pending.sampling ++ @import("glm_kv_pending.zig").records ++ @import("exl3_grouped_records.zig").records ++ @import("proposal_sampling_records.zig").records ++ @import("flashnext_pages_pending.zig").records ++ @import("glm_f32w_pending.zig").records ++ @import("penalty_sampling_records.zig").records;
++pub const landed_cuda = cuda ++ @import("dory_cuda_records.zig").cuda ++ gradient_pending ++ qwen_learning_pending ++ paging.extra ++ @import("qwen_served_records.zig").records ++ cuda_pending ++ @import("qwen_decode_pending.zig").records ++ glm_pending.sampling ++ @import("glm_kv_pending.zig").records ++ @import("exl3_grouped_records.zig").records ++ @import("proposal_sampling_records.zig").records ++ @import("flashnext_pages_pending.zig").records ++ @import("glm_f32w_pending.zig").records ++ @import("penalty_sampling_records.zig").records ++ @import("glm_l2pf_pending.zig").records;
+ test {
+     _ = learning;
+ }
+@@ -587,6 +587,7 @@ test {
+     _ = @import("qwen4_cuda_receipts_test.zig");
+     _ = @import("glm_kv_pending.zig");
+     _ = @import("glm_f32w_pending.zig");
++    _ = @import("glm_l2pf_pending.zig");
+     _ = @import("registry_pending_test.zig");
+     _ = @import("exl3_prompt_records.zig");
+     _ = @import("glm_kv_paged_records.zig");
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index ae74a5169..6f56d5470 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -97,6 +97,8 @@ pub const act_rows: []const u8 = if (available) &Blob("fatbin_act_rows").bytes e
+ pub const gdn_prep: []const u8 = if (available) &Blob("fatbin_gdn_prep").bytes else &.{};
+ pub const qk_rows: []const u8 = if (available) &Blob("fatbin_qk_rows").bytes else &.{};
+ pub const roce_gather: []const u8 = if (available) &Blob("fatbin_roce_gather").bytes else &.{};
++pub const l2pf: []const u8 = if (available) &Blob("fatbin_l2pf").bytes else &.{};
++pub const l2pace: []const u8 = if (available) &Blob("fatbin_l2pace").bytes else &.{};
+ pub const route_rows: []const u8 = if (available) &Blob("fatbin_route_rows").bytes else &.{};
+ pub const flashnext_hc: []const u8 = if (available) &Blob("fatbin_flashnext_hc").bytes else &.{};
+ pub const flashnext_attn: []const u8 = if (available) &Blob("fatbin_flashnext_attn").bytes else &.{};
+diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
+index b483f8f6e..22dfb0707 100644
+--- a/zig/src/families/glm/cuda.zig
++++ b/zig/src/families/glm/cuda.zig
+@@ -64,6 +64,7 @@ test {
+     _ = @import("cuda_lanes_test.zig");
+     _ = prompt_pair;
+     _ = @import("cuda_disk_image.zig");
++    _ = @import("cuda_l2pf.zig");
+     _ = experts;
+     _ = exl3;
+     _ = vision;
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index cb79e054b..980f9ff2f 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -22,6 +22,7 @@ const prompt_pair = @import("cuda_prompt_pair.zig");
+ const kv_shard = @import("cuda_kv_shard.zig");
+ const kv_attn = @import("cuda_kv_shard_attn.zig");
+ const kv_keep = @import("cuda_kv_shard_keep.zig");
++const l2pf_mod = @import("cuda_l2pf.zig");
+ pub const Options = @import("cuda_engine_types.zig").Options;
+ 
+ /// Rank 0's own word on its request (cancelled or not); the other ranks have none and hear rank 0's.
+@@ -136,6 +137,7 @@ pub const Engine = struct {
+     kv_room: ?cuda.DeviceBuffer = null, // TF_GLM_KV_SHARD: owner-computed attention's peer queries and outputs
+     kv_stage: ?cuda.DeviceBuffer = null, // ...and a resume's carry pieces (cuda_kv_shard_keep.piece_bytes)
+     kv_ctx: kv_attn.Ctx = undefined, // ...their place for the forward (read only with settings.kv_shard.on)
++    l2pf: ?l2pf_mod.L2pf = null, // TF_GLM_L2PF: the prefetch's side stream, kernels and table, made after the weights tile
+ 
+     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
+@@ -223,6 +225,8 @@ pub const Engine = struct {
+             e.settings.pages = false;
+             if (rank == 0) std.log.info("kv pages: the loaded layers keep no KV rows to page (no DSA layer, no target MTP head): each stream keeps its own window", .{});
+         }
++        if (e.settings.l2pf.on) e.l2pf = try l2pf_mod.L2pf.init(gpa, d, &e.w, e.settings.l2pf);
++        errdefer if (e.l2pf) |*p| p.deinit();
+         if (e.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it
+         errdefer {
+             e.free(0);
+@@ -292,6 +296,7 @@ pub const Engine = struct {
+         if (e.pages) |p| p.deinit();
+         for (0..e.seqs.items.len) |i| e.free(i);
+         e.seqs.deinit(e.gpa);
++        if (e.l2pf) |*p| p.deinit();
+         e.w.deinit();
+         e.pieces.deinit();
+         if (e.side) |*x| freeSide(x);
+@@ -375,7 +380,7 @@ pub const Engine = struct {
+         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
+         const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
+         const twin = if (e.pair) |*p| (if (b == &p.bp) &p.pieces else null) else null;
+-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else twin, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .side = if (b.prefill) null else e.side, .moe_fuse = e.moe_fuse, .ce = if (b == &e.bp) e.ce else null, .kv = e.kvCtx() }; // prompt buffers (the pair's twin too) keep the shared expert on their stream; the twin's exchanges stay on NCCL (its rows are not registered)
++        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else twin, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .side = if (b.prefill) null else e.side, .moe_fuse = e.moe_fuse, .ce = if (b == &e.bp) e.ce else null, .kv = e.kvCtx(), .l2pf = if (e.l2pf) |*p| p else null }; // prompt buffers (the pair's twin too) keep the shared expert on their stream; the twin's exchanges stay on NCCL (its rows are not registered)
+     }
+ 
+     /// An on-by-default switch: off only when `name` is "0".
+@@ -673,7 +678,7 @@ pub const Engine = struct {
+             rows += p.ids.len;
+         }
+         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
+-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .taps = if (e.drafter) |dr| dr.taps(false) else null, .side = e.side, .moe_fuse = e.moe_fuse, .kv = e.kvCtx() };
++        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .taps = if (e.drafter) |dr| dr.taps(false) else null, .side = e.side, .moe_fuse = e.moe_fuse, .kv = e.kvCtx(), .l2pf = if (e.l2pf) |*p| p else null };
+         try f.run(@ptrCast(ids[0..rows]));
+         if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
+         // every part greedy (no grammar, no sampled stream; the same on every rank): all rows in one pick, one launch,
+diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
+index 511cebc98..4ba2db433 100644
+--- a/zig/src/families/glm/cuda_forward.zig
++++ b/zig/src/families/glm/cuda_forward.zig
+@@ -26,6 +26,7 @@ const exl3 = @import("cuda_exl3.zig");
+ const shared = @import("cuda_shared.zig");
+ const index_mod = @import("cuda_index.zig");
+ const kv_attn = @import("cuda_kv_shard_attn.zig");
++const l2pf_mod = @import("cuda_l2pf.zig");
+ 
+ pub const prefill_rows = state.prefill_rows;
+ pub const window_rows = state.window_rows;
+@@ -236,6 +237,12 @@ pub const Forward = struct {
+     moe_fuse: bool = false, // a decode window's EXL3 MoE glue fused (TF_GLM_MOE_FUSE, default on in the engine)
+     absorb_mma: bool = false, // TF_GLM_ABSORB_MMA=1: a prompt pass's absorb_q and expand_v on tensor cores
+     kv: ?*const kv_attn.Ctx = null, // TF_GLM_KV_SHARD: owner-computed attention's exchange room (null: unsharded)
++    l2pf: ?*const l2pf_mod.L2pf = null, // TF_GLM_L2PF: a decode window's sites read their next weights into L2
++
++    /// TF_GLM_L2PF on this forward: a decode window of this process's one rank (a prompt chunk reads at full rate).
++    pub fn prefetch(f: *const Forward) ?*const l2pf_mod.L2pf {
++        return if (f.ranks.len == 1 and !f.ranks[0].b.prefill) f.l2pf else null;
++    }
+ 
+     pub fn set(f: *const Forward) glue.Set {
+         return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .absorb_mma = f.absorb_mma and f.ranks[0].b.prefill, .dsel = f.m.dsel, .pdl_hc = f.m.mm.chain.hc and !f.ranks[0].b.prefill, .pdl_moe = f.m.mm.chain.moe and !f.ranks[0].b.prefill, .hc_split = f.m.hc_split, .hc_part = f.m.hc_part, .dscore = if (f.m.dscore) |*x| x else null };
+@@ -301,7 +308,7 @@ pub const Forward = struct {
+                     s.saves.b = st.save_b + li * window_rows * st.heads * 4;
+                 }
+                 const conv = st.conv + li * 3 * st.conv_c * 2;
+-                try kda_block.bodyProfile(f.set(), &f.m.kda, f.stream, k, s, b.normed, c.hidden, rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide, b.prefill, f.prof);
++                try kda_block.bodyProfile(f.set(), &f.m.kda, f.stream, k, s, b.normed, c.hidden, rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide, b.prefill, f.prof, if (f.prefetch()) |p| .{ .l2 = p, .layer = l.index } else null);
+                 if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
+                 if (b.prefill) st.cur[li] = 1 - cur; // a prompt chunk keeps every row: the layer commits now
+             },
+@@ -480,6 +487,7 @@ pub const Forward = struct {
+     /// The unpieced loop over the layers (and the stream mean): each site's partials whole, then the glue.
+     fn whole(f: *const Forward, R: usize) !void {
+         const c = &f.ranks[0].w.config;
++        const pf = f.prefetch();
+         var li: usize = 0;
+         var di: usize = 0;
+         for (f.ranks[0].w.layers, 0..) |_, j| {
+@@ -490,6 +498,7 @@ pub const Forward = struct {
+                 if (r.segs.len > 0) try shared.mixer(f, r, l, li, di, R, slot(r, R)) else try f.mixer(r, l, li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), slot(r, R));
+             }
+             if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].mixer == .kda) .kda else .mla);
++            if (pf) |p| try p.fork(f.stream, j, .f);
+             try f.gather(R);
+             if (f.prof) |p| p.mark(f.stream, .gather_a);
+             prof_mod.context(f.prof, j, null, .ffn);
+@@ -500,6 +509,7 @@ pub const Forward = struct {
+                 try f.ffn(r, l, R, slot(r, R));
+             }
+             if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].ffn == .dense) .dense else .shared); // MoE: its fill
++            if (pf) |p| try p.fork(f.stream, j, .n);
+             try f.gather(R);
+             for (f.ranks) |r| try f.post(r, R);
+             if (f.taps) |t| try t.at(f.stream, j, f.ranks[0].b.x, 0, R);
+@@ -510,6 +520,7 @@ pub const Forward = struct {
+             }
+         }
+         for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, r.b.x, r.b.hidden, R, c.hidden, c.hc);
++        if (pf) |p| try p.join(f.stream);
+     }
+ 
+     /// The final norm and this rank's rows of the head (a prompt buffer's last row only).
+diff --git a/zig/src/families/glm/cuda_kda_block.zig b/zig/src/families/glm/cuda_kda_block.zig
+index 95639fb0a..3bf843cdf 100644
+--- a/zig/src/families/glm/cuda_kda_block.zig
++++ b/zig/src/families/glm/cuda_kda_block.zig
+@@ -6,6 +6,7 @@ const glue = @import("cuda_glue.zig");
+ const kda = @import("cuda_kda.zig");
+ const b16 = @import("cuda_b16.zig");
+ const prof = @import("cuda_prof.zig");
++const l2pf = @import("cuda_l2pf.zig");
+ const projection = @import("cuda_proj.zig");
+ 
+ /// The input projection [q | k | v | f_a | g_a | b] [3 heads 128 + 256 + heads][dims]: one bf16 stack, or two parts.
+@@ -56,13 +57,14 @@ pub fn fill(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize,
+ 
+ /// The block up to its out_proj: the projections, the chain, and a prompt chunk's conv window commit.
+ pub fn body(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, conv_state: u64, state_in: u64, wide: bool, prompt: bool) !void {
+-    return bodyProfile(set, ks, stream, l, s, x, x_stride, rows, conv_state, state_in, wide, prompt, null);
++    return bodyProfile(set, ks, stream, l, s, x, x_stride, rows, conv_state, state_in, wide, prompt, null, null);
+ }
+ 
+-pub fn bodyProfile(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, conv_state: u64, state_in: u64, wide: bool, prompt: bool, profile: ?*prof.Prof) !void {
++pub fn bodyProfile(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, conv_state: u64, state_in: u64, wide: bool, prompt: bool, profile: ?*prof.Prof, o_site: ?l2pf.At) !void {
+     var stamp = prof.span(profile, stream, .projections);
+     try project(set, stream, l, s, x, x_stride, rows);
+     stamp.end();
++    if (o_site) |at| try at.fork(stream); // TF_GLM_L2PF: o read into L2 while the chain runs
+     stamp = prof.span(profile, stream, .kda);
+     defer stamp.end();
+     try chainRows(ks, stream, l, s, rows, conv_state, state_in, wide);
+diff --git a/zig/src/families/glm/cuda_l2pf.zig b/zig/src/families/glm/cuda_l2pf.zig
+new file mode 100644
+index 000000000..e4186dd2f
+--- /dev/null
++++ b/zig/src/families/glm/cuda_l2pf.zig
+@@ -0,0 +1,336 @@
++//! TF_GLM_L2PF: a decode window's next weights read into L2 on a side stream (DeepSeek V4.1's l2pf and l2pace kernels).
++
++const std = @import("std");
++const cuda = @import("cuda");
++const weights = @import("cuda_weights.zig");
++const projection = @import("cuda_proj.zig");
++
++/// TF_GLM_L2PF and its knobs at DeepSeek V4.1's defaults (TF_DSV41_L2PF's), the knobs read only when it is 1.
++pub const Options = struct {
++    on: bool = false,
++    mb: u32 = 12, // TF_GLM_L2PF_MB: a site's budget in MiB
++    ctas: u32 = 2, // TF_GLM_L2PF_CTAS: the CTAs a site's prefetch spreads over
++    pace_gbps: u32 = 150, // TF_GLM_L2PF_PACE_GBPS: the sites beside a gather read at this rate (0: unpaced)
++
++    pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Options {
++        var o: Options = .{};
++        const v = get("TF_GLM_L2PF") orelse return o;
++        if (std.mem.eql(u8, v, "0")) return o;
++        if (!std.mem.eql(u8, v, "1")) {
++            problem.* = "TF_GLM_L2PF: 0 or 1";
++            return error.BadSetting;
++        }
++        o.on = true;
++        const knobs = .{
++            .{ "TF_GLM_L2PF_MB", "mb", 1, "TF_GLM_L2PF_MB: a site's budget in MiB, 1 or more" },
++            .{ "TF_GLM_L2PF_CTAS", "ctas", 1, "TF_GLM_L2PF_CTAS: 1 or more" },
++            .{ "TF_GLM_L2PF_PACE_GBPS", "pace_gbps", 0, "TF_GLM_L2PF_PACE_GBPS: GB/s, or 0 for unpaced" },
++        };
++        inline for (knobs) |k| if (get(k[0])) |x| {
++            const n = std.fmt.parseInt(u32, x, 10) catch null;
++            if (n == null or n.? < k[2]) {
++                problem.* = k[3];
++                return error.BadSetting;
++            }
++            @field(o, k[1]) = n.?;
++        };
++        return o;
++    }
++
++    /// What the ranks agree on: zeros when off, so knobs nobody reads never differ.
++    pub fn words(o: Options) [4]u32 {
++        return if (o.on) .{ 1, o.mb, o.ctas, o.pace_gbps } else @splat(0);
++    }
++};
++
++/// A layer's sites: n before gather_b (the next mixer's input), f before gather_a (the ffn's head), o (KDA's chain).
++pub const Site = enum(u2) { n, f, o };
++
++/// One site's rows of the table and their bytes.
++pub const Span = struct { at: u32 = 0, rows: u32 = 0, bytes: u64 = 0 };
++
++const max_sources = 8;
++
++const Sources = struct {
++    ptrs: [max_sources]u64 = undefined,
++    len: usize = 0,
++
++    fn add(s: *Sources, p: u64) void {
++        if (p != 0) {
++            s.ptrs[s.len] = p;
++            s.len += 1;
++        }
++    }
++
++    fn lane(s: *Sources, q: cuda.qmmf.Weight) void {
++        s.add(q.scales);
++        s.add(q.codes);
++    }
++
++    fn proj(s: *Sources, w: projection.Proj) void {
++        switch (w) {
++            .bf16 => |p| s.add(p),
++            .fp8g, .mxfp8 => |q| s.lane(q),
++        }
++    }
++};
++
++/// The buffers site `site` of layer `l` reads first, in its matmuls' order: a lane weight's scales, then its codes.
++fn sources(l: weights.Layer, site: Site) Sources {
++    var s: Sources = .{};
++    switch (site) {
++        .n => switch (l.mixer) {
++            .kda => |k| switch (k.proj) {
++                .bf16 => |p| s.add(p),
++                .split => |sp| {
++                    s.lane(sp.qkv);
++                    s.add(sp.rest);
++                },
++            },
++            .mla => |a| {
++                s.proj(a.proj);
++                s.proj(a.q_b);
++            },
++        },
++        .f => switch (l.ffn) {
++            .moe => |m| s.add(m.router),
++            .dense => |m| switch (m.w) {
++                .nvfp4 => |x| {
++                    s.lane(x.gate);
++                    s.lane(x.up);
++                },
++                .bf16 => |x| s.add(x.gu),
++                .mxfp8 => |x| s.lane(x.gu),
++            },
++        },
++        .o => switch (l.mixer) {
++            .kda => |k| s.proj(k.o),
++            .mla => {},
++        },
++    }
++    return s;
++}
++
++/// l2pf.take: the bytes of each of `sizes` in order within `budget`, 16-byte multiples, the last one's head, 0 past it.
++pub fn take(sizes: []const u64, budget: u64, out: []u64) void {
++    var left = budget;
++    for (sizes, out) |s, *n| {
++        n.* = if (left < 16) 0 else @min(left, s) / 16 * 16;
++        left -= n.*;
++    }
++}
++
++/// Every site's rows of (address, bytes) from `bufs`, the weights' allocations; false when a source starts none.
++pub fn table(gpa: std.mem.Allocator, bufs: []const cuda.DeviceBuffer, layers: []const weights.Layer, budget: u64, rows: *std.ArrayList([2]i64), spans: []Span) !bool {
++    std.debug.assert(spans.len == layers.len * 3);
++    for (layers, 0..) |_, j| for ([_]Site{ .n, .f, .o }) |site| {
++        const sp = &spans[j * 3 + @backingInt(site)];
++        sp.* = .{ .at = @intCast(rows.items.len) };
++        if (site == .n and j + 1 == layers.len) continue; // the last layer's next is the head
++        const src = sources(layers[if (site == .n) j + 1 else j], site);
++        var sizes: [max_sources]u64 = undefined;
++        for (src.ptrs[0..src.len], sizes[0..src.len]) |p, *n| n.* = for (bufs) |b| {
++            if (b.ptr == p) break b.len;
++        } else {
++            std.log.warn("TF_GLM_L2PF: layer {d}'s site {t} reads 0x{x}, which starts no weight buffer; prefetch off", .{ j, site, p });
++            return false;
++        };
++        var got: [max_sources]u64 = undefined;
++        take(sizes[0..src.len], budget, got[0..src.len]);
++        for (src.ptrs[0..src.len], got[0..src.len]) |p, b| if (b > 0) {
++            try rows.append(gpa, .{ @intCast(p), @intCast(b) });
++            sp.rows += 1;
++            sp.bytes += b;
++        };
++    };
++    return true;
++}
++
++/// DeepSeek V4.1's launch: 32 KiB pieces, segments over 128 threads a CTA, paced as one piece per `chunk / rate` ns.
++const chunk: u32 = 32 << 10;
++
++/// The prefetch's own stream, events, kernels and table; the main stream forks at each site and joins once a window.
++pub const L2pf = struct {
++    gpa: std.mem.Allocator,
++    o: Options,
++    side: cuda.Stream,
++    fork_ev: cuda.Event,
++    join_ev: cuda.Event,
++    mods: [2]cuda.Module,
++    segments: cuda.Function,
++    paced: cuda.Function,
++    rows: cuda.DeviceBuffer,
++    spans: []Span,
++
++    /// Built after the weights load and tile (tiling moves packed linears); null when a source is not a buffer.
++    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, o: Options) !?L2pf {
++        const spans = try gpa.alloc(Span, w.layers.len * 3);
++        errdefer gpa.free(spans);
++        var host: std.ArrayList([2]i64) = .empty;
++        defer host.deinit(gpa);
++        if (!try table(gpa, w.buffers.items, w.layers, @as(u64, o.mb) << 20, &host, spans)) {
++            gpa.free(spans);
++            return null;
++        }
++        if (host.items.len == 0) return error.NoPrefetchRows;
++        var total: u64 = 0;
++        for (spans) |sp| total += sp.bytes;
++        std.log.info("TF_GLM_L2PF: {d} rows, {d} MiB a decode window, {d} CTAs a site, the gathers' sites at {d} GB/s (0: unpaced)", .{ host.items.len, total >> 20, o.ctas, o.pace_gbps });
++        var rows = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(host.items));
++        errdefer rows.free();
++        var mods: [2]cuda.Module = .{ try cuda.Module.load(d, cuda.kernels.l2pf), undefined };
++        errdefer mods[0].unload();
++        mods[1] = try cuda.Module.load(d, cuda.kernels.l2pace);
++        errdefer mods[1].unload();
++        var side = try cuda.Stream.init(d, true);
++        errdefer side.deinit();
++        var fork_ev = try cuda.Event.init(d, false);
++        errdefer fork_ev.deinit();
++        var join_ev = try cuda.Event.init(d, false);
++        errdefer join_ev.deinit();
++        const segments = try mods[0].function("_ZN6tfl2pf15segments_kernelILb1EEEvPKlij");
++        const paced = try mods[1].function("_ZN12dsv41_l2pace12paced_kernelEPKlijmm");
++        return .{ .gpa = gpa, .o = o, .side = side, .fork_ev = fork_ev, .join_ev = join_ev, .mods = mods, .segments = segments, .paced = paced, .rows = rows, .spans = spans };
++    }
++
++    /// Before the weights free: the side stream drains first (Stream.deinit synchronizes).
++    pub fn deinit(p: *L2pf) void {
++        p.side.synchronize() catch {}; // a window that failed before its join may still read the weights freed next
++        p.side.deinit();
++        p.fork_ev.deinit();
++        p.join_ev.deinit();
++        p.rows.free();
++        for (&p.mods) |*m| m.unload();
++        p.gpa.free(p.spans);
++        p.* = undefined;
++    }
++
++    /// Site `site` of layer `j` read into L2 on the side stream from this point of `main` on.
++    pub fn fork(p: *const L2pf, main: cuda.Stream, j: usize, site: Site) !void {
++        if (j * 3 >= p.spans.len) return;
++        const sp = p.spans[j * 3 + @backingInt(site)];
++        if (sp.rows == 0) return;
++        try p.fork_ev.record(main);
++        try p.side.wait(p.fork_ev);
++        var a: cuda.Args = .{};
++        a.add(p.rows.ptr + @as(u64, sp.at) * 16);
++        a.add(@as(c_int, @intCast(sp.rows)));
++        a.add(chunk);
++        if (site != .o and p.o.pace_gbps > 0) {
++            a.add(@as(u64, @max(1, (chunk + p.o.pace_gbps / 2) / p.o.pace_gbps))); // GB/s is bytes a ns
++            a.add(@as(u64, 0));
++            return cuda.launch.launch(p.paced, .{ .grid = .{ .x = p.o.ctas }, .block = .{ .x = 32 } }, p.side, &a);
++        }
++        const pieces = std.math.divCeil(u64, sp.bytes, chunk) catch unreachable;
++        const grid: u32 = @intCast(std.math.clamp(std.math.divCeil(u64, pieces, 128) catch unreachable, 1, p.o.ctas));
++        try cuda.launch.launch(p.segments, .{ .grid = .{ .x = grid }, .block = .{ .x = 128 } }, p.side, &a);
++    }
++
++    /// A window's end: `main` waits for every site forked on it, so nothing is in flight past the window.
++    pub fn join(p: *const L2pf, main: cuda.Stream) !void {
++        try p.join_ev.record(p.side);
++        try main.wait(p.join_ev);
++    }
++};
++
++/// Site o's place in a KDA block: between its projections and its chain.
++pub const At = struct {
++    l2: *const L2pf,
++    layer: usize,
++
++    pub fn fork(at: At, main: cuda.Stream) !void {
++        return at.l2.fork(main, at.layer, .o);
++    }
++};
++
++fn Env(comptime pairs: anytype) type {
++    return struct {
++        fn get(key: [:0]const u8) ?[]const u8 {
++            inline for (pairs) |p| if (std.mem.eql(u8, key, p[0])) return p[1];
++            return null;
++        }
++    };
++}
++
++test "TF_GLM_L2PF: off unless 1, DeepSeek's knobs by default, refusals naming a bad value, and unread knobs never differ" {
++    const t = std.testing;
++    var problem: []const u8 = "";
++    try t.expectEqual([4]u32{ 0, 0, 0, 0 }, (try Options.read(Env(.{}).get, &problem)).words());
++    try t.expectEqual([4]u32{ 0, 0, 0, 0 }, (try Options.read(Env(.{ .{ "TF_GLM_L2PF", "0" }, .{ "TF_GLM_L2PF_MB", "0" } }).get, &problem)).words());
++    try t.expectEqual([4]u32{ 1, 12, 2, 150 }, (try Options.read(Env(.{.{ "TF_GLM_L2PF", "1" }}).get, &problem)).words());
++    const set = Env(.{ .{ "TF_GLM_L2PF", "1" }, .{ "TF_GLM_L2PF_MB", "4" }, .{ "TF_GLM_L2PF_CTAS", "4" }, .{ "TF_GLM_L2PF_PACE_GBPS", "0" } });
++    try t.expectEqual([4]u32{ 1, 4, 4, 0 }, (try Options.read(set.get, &problem)).words());
++    const bad = .{
++        .{ Env(.{.{ "TF_GLM_L2PF", "yes" }}), "TF_GLM_L2PF: 0 or 1" },
++        .{ Env(.{ .{ "TF_GLM_L2PF", "1" }, .{ "TF_GLM_L2PF_MB", "0" } }), "TF_GLM_L2PF_MB: a site's budget in MiB, 1 or more" },
++        .{ Env(.{ .{ "TF_GLM_L2PF", "1" }, .{ "TF_GLM_L2PF_CTAS", "x" } }), "TF_GLM_L2PF_CTAS: 1 or more" },
++        .{ Env(.{ .{ "TF_GLM_L2PF", "1" }, .{ "TF_GLM_L2PF_PACE_GBPS", "-1" } }), "TF_GLM_L2PF_PACE_GBPS: GB/s, or 0 for unpaced" },
++    };
++    inline for (bad) |b| {
++        try t.expectError(error.BadSetting, Options.read(b[0].get, &problem));
++        try t.expectEqualStrings(b[1], problem);
++    }
++}
++
++test "take: each size in order within the budget, in 16-byte multiples, the last one's head and nothing past it" {
++    const t = std.testing;
++    var out: [3]u64 = undefined;
++    take(&.{ 1 << 20, 34 << 20, 2 << 20 }, 12 << 20, &out);
++    try t.expectEqual([3]u64{ 1 << 20, 11 << 20, 0 }, out);
++    take(&.{ 1000, 50, 7 }, 4096, &out);
++    try t.expectEqual([3]u64{ 992, 48, 0 }, out);
++    take(&.{ 5 << 20, 1 << 20, 1 << 20 }, (4 << 20) + 8, &out);
++    try t.expectEqual([3]u64{ 4 << 20, 0, 0 }, out);
++}
++
++test "the table: each site's sources in its matmuls' order, site n from the next layer, none past the last; an unknown buffer turns it off" {
++    const t = std.testing;
++    const kda_block = @import("cuda_kda_block.zig");
++    const lane: cuda.qmmf.Weight = .{ .mode = .mxfp8, .codes = 0x2000_0000, .scales = 0x1000_0000, .n = 64, .k = 64, .npad = 64 };
++    var k: kda_block.Layer = undefined;
++    k.proj = .{ .split = .{ .qkv = lane, .rest = 0x3000_0000 } };
++    k.o = .{ .bf16 = 0x4000_0000 };
++    var d: weights.Layer = undefined; // layer 0: DSA and a dense bf16 MLP
++    d.mixer = .{ .mla = undefined };
++    d.mixer.mla.proj = .{ .bf16 = 0x6000_0000 };
++    d.mixer.mla.q_b = .{ .bf16 = 0x7000_0000 };
++    d.ffn = .{ .dense = undefined };
++    d.ffn.dense.w = .{ .bf16 = .{ .gu = 0x9000_0000, .down = 0xa000_0000 } };
++    var e: weights.Layer = undefined; // layer 1: KDA on the lane and MoE
++    e.mixer = .{ .kda = k };
++    e.ffn = .{ .moe = undefined };
++    e.ffn.moe.router = 0x5000_0000;
++    const MiB = 1 << 20;
++    var bufs = [_]cuda.DeviceBuffer{
++        .{ .d = undefined, .ptr = 0x1000_0000, .len = 1 * MiB },
++        .{ .d = undefined, .ptr = 0x2000_0000, .len = 34 * MiB },
++        .{ .d = undefined, .ptr = 0x3000_0000, .len = 2 * MiB },
++        .{ .d = undefined, .ptr = 0x4000_0000, .len = 23 * MiB },
++        .{ .d = undefined, .ptr = 0x5000_0000, .len = 2 * MiB },
++        .{ .d = undefined, .ptr = 0x6000_0000, .len = 16 * MiB },
++        .{ .d = undefined, .ptr = 0x7000_0000, .len = 17 * MiB },
++        .{ .d = undefined, .ptr = 0x9000_0000, .len = 34 * MiB },
++    };
++    var rows: std.ArrayList([2]i64) = .empty;
++    defer rows.deinit(t.allocator);
++    var spans: [6]Span = undefined;
++    try t.expect(try table(t.allocator, &bufs, &.{ d, e }, 12 * MiB, &rows, &spans));
++    const want = [_][2]i64{
++        .{ 0x1000_0000, 1 * MiB }, // layer 0's n: layer 1's qkv scales whole, then its codes' head
++        .{ 0x2000_0000, 11 * MiB },
++        .{ 0x9000_0000, 12 * MiB }, // layer 0's f: its gate and up's head
++        .{ 0x5000_0000, 2 * MiB }, // layer 1's f: its router; its n would be the head's, its o is KDA's o
++        .{ 0x4000_0000, 12 * MiB },
++    };
++    try t.expectEqualSlices([2]i64, &want, rows.items);
++    try t.expectEqualSlices(Span, &.{
++        .{ .at = 0, .rows = 2, .bytes = 12 * MiB },
++        .{ .at = 2, .rows = 1, .bytes = 12 * MiB },
++        .{ .at = 3 }, // DSA: no site o
++        .{ .at = 3 },
++        .{ .at = 3, .rows = 1, .bytes = 2 * MiB },
++        .{ .at = 4, .rows = 1, .bytes = 12 * MiB },
++    }, &spans);
++    rows.clearRetainingCapacity();
++    try t.expect(!try table(t.allocator, bufs[1..], &.{ d, e }, 12 * MiB, &rows, &spans));
++}
+diff --git a/zig/src/families/glm/cuda_ranks.zig b/zig/src/families/glm/cuda_ranks.zig
+index 93faf5c77..4aab4a32b 100644
+--- a/zig/src/families/glm/cuda_ranks.zig
++++ b/zig/src/families/glm/cuda_ranks.zig
+@@ -3,6 +3,7 @@
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const heat = @import("heat");
++const l2pf = @import("cuda_l2pf.zig");
+ const Sha256 = std.crypto.hash.sha2.Sha256;
+ const kv_shard = @import("cuda_kv_shard.zig");
+ 
+@@ -24,6 +25,7 @@ pub const Settings = struct {
+     head_bits: u8 = 16, // TF_GLM_HEAD_BITS: the head, likewise
+     numerics: Numerics = .{}, // opt-in prompt kernels that round differently (each off by default)
+     kv_shard: kv_shard.Switches = .{}, // TF_GLM_KV_SHARD and its knobs: each stream's latent rows on one rank
++    l2pf: l2pf.Options = .{}, // TF_GLM_L2PF and its knobs: a decode window's next weights read into L2 beside it
+ 
+     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
+     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
+@@ -61,6 +63,7 @@ pub const Settings = struct {
+                 return error.BadSetting;
+             }
+         }
++        s.l2pf = try l2pf.Options.read(get, problem);
+         if (get("TF_GLM_OVERLAP_PIECES")) |v| {
+             s.pieces = std.fmt.parseInt(u32, v, 10) catch 0;
+             if (s.pieces < 1 or s.pieces > 8) {
+@@ -148,7 +151,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
+ 
+ /// What every rank must agree on, as bytes the communicator carries.
+ pub const Fingerprint = extern struct {
+-    layout: u32 = 15, // this struct's version (14 had no kv_shard words; 13 was num3's numerics or prefill3's pair alone)
++    layout: u32 = 16, // this struct's version (15 had no l2pf words; 14 had no kv_shard words; 13 was num3's numerics or prefill3's pair alone)
+     world: u32,
+     rank: u32,
+     kv8: u32 = 0,
+@@ -166,6 +169,7 @@ pub const Fingerprint = extern struct {
+     max_images: u32 = 0,
+     max_videos: u32 = 0,
+     max_frames: u32 = 0,
++    l2pf: [4]u32 = @splat(0), // TF_GLM_L2PF's words: every rank prefetches alike, so none waits on a slower one's windows
+     bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
+     numerics: u32 = 0, // Settings.numerics: every rank's prompt kernels round alike
+     kv_shard: u32 = 0, // TF_GLM_KV_SHARD and _CARRY, _TWINS (kv_shard.Switches.word; 0: off)
+@@ -196,6 +200,7 @@ pub const Fingerprint = extern struct {
+         max_images,
+         max_videos,
+         max_frames,
++        l2pf,
+         bits,
+         numerics,
+         kv_shard,
+@@ -231,6 +236,7 @@ pub const Fingerprint = extern struct {
+             .pair = @intFromBool(s.pair),
+             .layers = s.layers,
+             .mtp = @intFromBool(mtp),
++            .l2pf = s.l2pf.words(),
+             .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
+             .numerics = s.numerics.bits(),
+             .kv_shard = s.kv_shard.word(),
+@@ -270,6 +276,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
+             "max_images",
+             "max_videos",
+             "max_frames",
++            "l2pf",
+             "bits",
+             "numerics",
+             "kv_shard",
+@@ -382,6 +389,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
+         .max_images => "the image count limit",
+         .max_videos => "the video count limit",
+         .max_frames => "the frame limit",
++        .l2pf => "TF_GLM_L2PF, _MB, _CTAS or _PACE_GBPS",
+         .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
+         .numerics => "TF_GLM_ABSORB_MMA or TF_GLM_W8A8",
+         .kv_shard => "TF_GLM_KV_SHARD, TF_GLM_KV_SHARD_CARRY or TF_GLM_KV_SHARD_TWINS",
+diff --git a/zig/src/families/glm/cuda_ranks_test.zig b/zig/src/families/glm/cuda_ranks_test.zig
+index 0f4aa0ecd..3644aaa0a 100644
+--- a/zig/src/families/glm/cuda_ranks_test.zig
++++ b/zig/src/families/glm/cuda_ranks_test.zig
+@@ -394,3 +394,25 @@ test "TF_GLM_KV_SHARD: read with its knobs, refused by name on a typo, and in th
+     all[1] = Fingerprint.of(2, 1, other, 8192, true, h0, h0, hashBytes("/c"));
+     try std.testing.expectEqual(Mismatch{ .field = .kv_shard, .rank = 1 }, mismatch(&all).?);
+ }
++
++test "TF_GLM_L2PF: read with the settings, carried in the fingerprint, and ranks that prefetch differently disagree" {
++    const Reader = struct {
++        fn on(key: [:0]const u8) ?[]const u8 {
++            return if (std.mem.eql(u8, key, "TF_GLM_L2PF")) "1" else null;
++        }
++        fn bad(key: [:0]const u8) ?[]const u8 {
++            return if (std.mem.eql(u8, key, "TF_GLM_L2PF")) "2" else null;
++        }
++    };
++    var problem: []const u8 = "";
++    const s = try Settings.read(Reader.on, &problem);
++    try std.testing.expect(s.l2pf.on);
++    try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
++    try std.testing.expectEqualStrings("TF_GLM_L2PF: 0 or 1", problem);
++    const h: [32]u8 = @splat(0);
++    var all = [_]Fingerprint{ Fingerprint.of(2, 0, s, 8192, true, h, h, h), Fingerprint.of(2, 1, s, 8192, true, h, h, h) };
++    try std.testing.expectEqual([4]u32{ 1, 12, 2, 150 }, all[0].l2pf);
++    try std.testing.expectEqual(@as(?Mismatch, null), mismatch(&all));
++    all[1].l2pf[3] = 0; // rank 1 unpaced
++    try std.testing.expectEqual(Mismatch{ .field = .l2pf, .rank = 1 }, mismatch(&all).?);
++}
+diff --git a/zig/src/families/glm/cuda_shared.zig b/zig/src/families/glm/cuda_shared.zig
+index d609ddc8a..0b5ae8a2b 100644
+--- a/zig/src/families/glm/cuda_shared.zig
++++ b/zig/src/families/glm/cuda_shared.zig
+@@ -69,6 +69,7 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di:
+             var s = b.kda;
+             s.p = b.kproj;
+             try kda_block.project(f.set(), f.stream, k, s, b.normed, c.hidden, rows);
++            if (f.prefetch()) |p| try p.fork(f.stream, l.index, .o); // TF_GLM_L2PF: o read into L2 while the chains run
+             // a decode window on the three-kernel chain: every segment's chain in one launch each (kda.chainSegs),
+             // their q and y scratch rows at the segment's own offset; the same blocks, so the same bits
+             const batched = !b.prefill and f.kda_wide and f.m.shared_segs and r.segs.len <= kda.max_segs;
+diff --git a/zig/tests/cuda/contract_limits.zig b/zig/tests/cuda/contract_limits.zig
+index 03dcb6ede..8362aa814 100644
+--- a/zig/tests/cuda/contract_limits.zig
++++ b/zig/tests/cuda/contract_limits.zig
+@@ -21,6 +21,8 @@ const h3_image = struct {
+ /// The named embedded image; only contract_controls may select the planted controls.
+ pub fn image(name: []const u8) error{UnknownContractImage}![]const u8 {
+     if (@import("contract_deepseek_images.zig").image(name)) |bytes| return bytes;
++    inline for (.{ "l2pf", "l2pace" }) |n|
++        if (std.mem.eql(u8, name, n)) return @field(kk, n);
+     if (std.mem.eql(u8, name, "window_rows")) return kk.window_rows;
+     if (std.mem.eql(u8, name, "fp8_experts")) return kk.fp8_experts;
+     if (std.mem.eql(u8, name, "h3")) return &h3_image.bytes;
+-- 
+2.43.0
+

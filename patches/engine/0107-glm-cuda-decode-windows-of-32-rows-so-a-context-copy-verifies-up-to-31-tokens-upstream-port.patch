@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Wed, 11 Nov 2026 12:00:00 +0200
+Subject: [PATCH] glm cuda: decode windows of 32 rows, so a context copy
+ verifies up to 31 tokens a round (upstream #2257 port)
+
+From upstream ashhart/TensorFold 6d4191a95 "glm cuda: windows to 32 rows, priced by rounds timed at load" (#2257),
+the window width and the faults a wider window exposes, adapted to this stack (patch 0039 had set 16):
+
+- window_rows 16 -> 32. DFlash2 still drafts 7 a block, so rows past 8 serve context copies (file rewrites, quoted
+  context); the GB10 window and shared cost tables (0096) extend to the new widths by their measured fits.
+- Buffers.make takes `shared` outright. It told a shared window's scratch apart by `seg < rows`, which is false once
+  a stream's window is as wide as the shared window (32 and 32): the KDA projection buffer would shrink to 4 bytes
+  (upstream's fix), and, on this stack, part_chunks would fall to 0, quietly sending shared rounds off 0075/0088's
+  one-launch segment attention.
+- The follower's Scratch.sampled holds window_rows draws (was a fixed 16; a 32-row lone verify would overrun it).
+- --learn-conversations: window_rows joins the disk store's identity, since an image's head rows run a window past
+  its position; states kept at 16 rows are another store, not misread.
+
+Not taken: the load-time window pricing and NVFP4 expert race (upstream keeps DFlash2's shared prices, and 0096's
+are measured on this pair), 15-deep MTP chains (this recipe drafts with DFlash2), inline step ids (0031 already sends
+a step in one broadcast), TF_GLM_KV_HOST's list invalidation (not in this stack). Upstream #1779's shared reservation
+is not taken either: upstream turned it off for DFlash2 (cc2fa8d23, #2720), where a cut chance leaves a stream at
+no drafts while its peers decode.
+
+Co-authored-by: ashhart <71890694+ashhart@users.noreply.github.com>
+---
+ zig/src/families/glm/cuda_follow.zig |  2 +-
+ zig/src/families/glm/cuda_state.zig  | 20 +++++++++++---------
+ zig/src/native/cuda_glm_disk.zig     |  2 ++
+ 3 files changed, 14 insertions(+), 10 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_follow.zig b/zig/src/families/glm/cuda_follow.zig
+index 55bb9b44c..ff9825e5a 100644
+--- a/zig/src/families/glm/cuda_follow.zig
++++ b/zig/src/families/glm/cuda_follow.zig
+@@ -406,7 +406,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
+ pub const Scratch = struct {
+     drafts: [engine.max_drafts]u32 = undefined,
+     chances: [engine.max_drafts]f64 = undefined,
+-    sampled: [16]u32 = undefined,
++    sampled: [@import("cuda_state.zig").window_rows]u32 = undefined, // a lone verify window's draws (upstream #2257)
+ };
+ 
+ /// One of rank 0's steps on this rank (`ids` its ids); false at the end step.
+diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
+index 7c750ba6a..10d16cb42 100644
+--- a/zig/src/families/glm/cuda_state.zig
++++ b/zig/src/families/glm/cuda_state.zig
+@@ -17,8 +17,9 @@ const kda_block = @import("cuda_kda_block.zig");
+ 
+ /// A prompt chunk's rows (decode.PREFILL_ROWS).
+ pub const prefill_rows = 4096;
+-/// A decode window's rows (Engine's max_rows).
+-pub const window_rows = 16;
++/// A decode window's rows (Engine's max_rows): the pending token and up to 31 drafts or copied tokens (upstream #2257's
++/// width; DFlash2 still drafts 7 a block, so the rows past 8 serve context copies).
++pub const window_rows = 32;
+ /// Prompts one prompt pass takes together (cuda_prompts): a prompt buffer's logits rows, one a prompt.
+ pub const prompt_heads = 16;
+ /// The context the buffers' dense attention partials reach (Buffers' min(capacity, 2560)).
+@@ -224,18 +225,18 @@ pub const Buffers = struct {
+     part: u64, // fp32 [rows][dims]: this rank's partial rows a split exchange sends from
+ 
+     pub fn init(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize) !Buffers {
+-        return make(d, w, rows, prefill, capacity, rows, null);
++        return make(d, w, rows, prefill, capacity, rows, false, null);
+     }
+ 
+     /// A shared window's scratch: `rows` rows of several streams, each one's attention and KDA chain on `window_rows`.
+     pub fn initShared(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, capacity: usize) !Buffers {
+-        return make(d, w, rows, false, capacity, window_rows, null);
++        return make(d, w, rows, false, capacity, window_rows, true, null);
+     }
+ 
+     /// A paired step's second chunk: its own rows across sites and streams, and `of`'s scratch for one site's work.
+     /// Without `own_room` it exchanges into `of`'s gathered rooms too (split exchanges touch them on the side stream only).
+     pub fn initTwin(d: *const cuda.Driver, w: *const weights.Weights, of: *const Buffers, capacity: usize, own_room: bool) !Buffers {
+-        return make(d, w, of.rows, of.prefill, capacity, of.rows, .{ .of = of, .own_room = own_room });
++        return make(d, w, of.rows, of.prefill, capacity, of.rows, false, .{ .of = of, .own_room = own_room });
+     }
+ 
+     /// The buffers a twin is made beside, and whether it takes rooms of its own.
+@@ -253,8 +254,9 @@ pub const Buffers = struct {
+         return false;
+     }
+ 
+-    /// `seg`: the most rows one stream's attention takes (a decode window's rows, or a shared window's segment).
+-    fn make(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize, twin: ?Twin) !Buffers {
++    /// `seg`: the most rows one stream's attention takes (a decode window's rows, or a shared window's segment);
++    /// `shared`: a shared window's scratch, said outright (a segment as wide as the window no longer tells it apart).
++    fn make(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize, shared: bool, twin: ?Twin) !Buffers {
+         const c = &w.config;
+         const s = &w.share;
+         const D: usize = c.hidden;
+@@ -274,7 +276,7 @@ pub const Buffers = struct {
+         const nch = latent.chunksFor(@min(capacity, dense_reach) + seg);
+         // dense calls, or one sparse; a prompt chunk's sparse calls past them merge in the kernel (latent.fuses), and a
+         // shared decode window holds every segment's chunks apart (one attention launch)
+-        const shared_decode = !prefill and seg < rows;
++        const shared_decode = !prefill and shared;
+         const part_chunks = @max(nch, latent.chunksFor(sparse.width));
+         const partial_rows = if (prefill) nch * part_rows else if (shared_decode) part_chunks * rows else @max(nch * part_rows, latent.chunksFor(sparse.width) * seg);
+         const np_max = capacity / sparse.pool;
+@@ -294,7 +296,7 @@ pub const Buffers = struct {
+         const sizes: [twin_checked]usize = .{
+             rows * 4,     rows * S * D * 2, rows * D * 2,           rows * (D / 64) * 4,
+             rows * S * 4, rows * S * S * 4, glue.hcPartBytes(rows), s.world * rows * D * 4,
+-            if (prefill or seg < rows) rows * kw * 2 else 4, rows * n * 2, rows * n * 2, // kproj, ka, kg
++            if (prefill or shared) rows * kw * 2 else 4, rows * n * 2, rows * n * 2, // kproj, ka, kg (a lone window's: the state's)
+             rows * n * 2, rows * n * 4, rows * n * 2, rows * n * 4, // saves out, k, v, g
+             rows * LL * 4,                    rows * n * 4,               rows * n * 2, // saves b, wide q, y
+             rows * (c.q_lora + lw) * 2,       rows * c.q_lora * 2,        rows * (c.q_lora / 64) * 4,
+diff --git a/zig/src/native/cuda_glm_disk.zig b/zig/src/native/cuda_glm_disk.zig
+index 61f8f7e1a..b84e78e90 100644
+--- a/zig/src/native/cuda_glm_disk.zig
++++ b/zig/src/native/cuda_glm_disk.zig
+@@ -169,6 +169,8 @@ pub fn attach(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, r
+     const sh = try ranks.shape(e);
+     var facts: std.ArrayList(u64) = .empty;
+     try facts.appendSlice(a, &.{ e.share.world, sh.capacity, sh.ring_rows, sh.tail, @intFromBool(sh.head), @intFromBool(sh.scales), @intFromBool(e.drafter != null) });
++    // an image's head rows run a verify window past its position: states kept at another window width are another store
++    try facts.append(a, glm.forward.window_rows);
+     try facts.appendSlice(a, prefixes);
+     const p = try probe(a, io, loaded.backend, e);
+     const id = try cuda_disk.identityOf(a, io, ctx, o.dir, kernels, facts.items, p.hash);
+-- 
+2.43.0
+
