@@ -321,9 +321,15 @@ funded_cache_gib() {
     python3 -c 'import sys; print(round(float(sys.argv[1]) + float(sys.argv[2]), 1))' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
     return 0
   fi
-  line=$(grep -h 'streams at once' "$1" 2>/dev/null | tail -1) || true
+  line=$(grep -hE ' streams? at once' "$1" 2>/dev/null | tail -1) || true  # one stream: "1 stream at once"
   [[ -n "$line" ]] || return 0
   if [[ "$line" =~ ,\ a\ ([0-9][0-9.]*)\ GiB\ prompt\ cache ]]; then printf '%s\n' "${BASH_REMATCH[1]}"; else printf '0\n'; fi
+}
+# The newest log archive stop.sh wrote (it removes the run directory once archived): the names carry a UTC stamp, so
+# the last in glob order is the newest.
+last_archive() {
+  local a=("$LOG_DIR"/glm53-zig-*.tar.gz)
+  if [[ -e "${a[-1]}" ]]; then printf '%s\n' "${a[-1]}"; else printf 'none written (see %s)\n' "$LOG_DIR"; fi
 }
 # PROMPT_CACHE_MIN_GIB: the server is stopped before LIVE when rank 0 funds less (PROMPT_CACHE_GIB is a cap, not a
 # floor). Rank 0 alone prints these lines; the other ranks follow its plan.
@@ -333,11 +339,11 @@ check_cache_min() {
   got=$(funded_cache_gib "$f")
   if [[ -z "$got" ]]; then
     GLM_STOP_LOCK_HELD=1 "$REPO_ROOT/stop.sh"
-    fail E_CACHE "PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB: rank 0's log has no prompt cache line, so the start cannot be checked; the server is stopped. See $f."
+    fail E_CACHE "PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB: rank 0's log has no prompt cache line, so the start cannot be checked; the server is stopped. Logs: $(last_archive)."
   fi
   if ! python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) >= float(sys.argv[2]) else 1)' "$got" "$PROMPT_CACHE_MIN_GIB"; then
     GLM_STOP_LOCK_HELD=1 "$REPO_ROOT/stop.sh"
-    fail E_CACHE "Rank 0 funds a $got GiB prompt cache a rank, under PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB; the server is stopped. The cache is what this start's room leaves (device pages after the KV pool, a host tier from the available memory), capped by PROMPT_CACHE_GIB: lower PARALLEL or CONTEXT, free host memory, or set TF_GLM_HOST_CACHE_GIB. See $f."
+    fail E_CACHE "Rank 0 funds a $got GiB prompt cache a rank, under PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB; the server is stopped. The cache is what this start's room leaves (device pages after the KV pool, a host tier from the available memory), capped by PROMPT_CACHE_GIB: lower PARALLEL or CONTEXT, free host memory, or set TF_GLM_HOST_CACHE_GIB. Logs: $(last_archive)."
   fi
   log "Prompt cache: rank 0 funds $got GiB a rank (PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB)."
 }
