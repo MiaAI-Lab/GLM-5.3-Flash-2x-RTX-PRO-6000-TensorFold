@@ -9,7 +9,10 @@ if command -v shellcheck >/dev/null; then
 else
   echo 'shellcheck: not installed, skipped'
 fi
-python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' scripts/cache-replay.py && echo 'python: pass'
+for f in scripts/*.py; do
+  python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f"
+done
+echo 'python: pass'
 for t in scripts/tests/*.sh; do
   [[ "$t" != scripts/tests/run.sh ]] || continue
   bash "$t"
