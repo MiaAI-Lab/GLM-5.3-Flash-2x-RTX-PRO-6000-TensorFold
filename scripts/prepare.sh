@@ -61,8 +61,8 @@ validate_config() {
   is_number "$LEARN_GIB" || fail E_CONFIG 'LEARN_GIB must be a number of GiB (0: off).'
   is_number "$LEARN_MIN_FREE_GIB" || fail E_CONFIG 'LEARN_MIN_FREE_GIB must be a number of GiB.'
   [[ "$KV_SHARD" =~ ^[01]$ ]] || fail E_CONFIG 'KV_SHARD must be 0 or 1 (TF_GLM_KV_SHARD).'
-  [[ "$KV_SHARD" == 0 || ( "$KV" == fp8 && "$KV_PAGES" == on && "$DRAFTER" != mtp && "$GPUS" =~ ^[0-9]+,[0-9]+$ ) ]] \
-    || fail E_CONFIG 'KV_SHARD=1 needs two GPUs in GPUS, KV=fp8, KV_PAGES=on and DRAFTER=dflash2 or none.'
+  [[ "$KV_SHARD" == 0 || ( "$KV" == fp8 && "$KV_PAGES" == on && "$DRAFTER" != mtp && "$PARALLEL" != 1 && "$GPUS" =~ ^[0-9]+,[0-9]+$ ) ]] \
+    || fail E_CONFIG 'KV_SHARD=1 needs two GPUs in GPUS, KV=fp8, KV_PAGES=on, DRAFTER=dflash2 or none, and PARALLEL=auto or above 1.'
   [[ "$WITH_VIDEO" =~ ^[01]$ ]] || fail E_CONFIG 'WITH_VIDEO must be 0 or 1.'
   [[ "$CONFIG_OVERLAY" =~ ^(auto|0)$ ]] || fail E_CONFIG 'CONFIG_OVERLAY must be auto or 0.'
   # An NCCL exclusion list (^lo,docker,...), often exported for the whole box from /etc/profile.d, outranks
