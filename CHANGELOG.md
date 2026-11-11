@@ -1,5 +1,29 @@
 # Changelog
 
+- **2026-11-11** -- Ported from the 2x DGX Spark recipe's 2026-11-10/11 round (its main 74cf93c). Not yet run on
+  this host: the patches apply to `f350cd3e` with the Dockerfile's loop and the scripts pass `scripts/tests/run.sh`.
+  - Engine patches 0105-0107 from upstream TensorFold main, regenerated against this recipe's 0001-0104:
+    `L2PF=1` (`TF_GLM_L2PF`, opt-in; on the Spark pair +2% at one stream, flat under load), a JSON `<tool_call>`
+    that `max_tokens` cuts is returned as the reply's cut call (with two local fixes), and 32-row decode windows
+    (upstream #2257, adapted: on the Spark pair a one-stream file rewrite decoded 151 to 201-205 tok/s, prose
+    unchanged, token hashes identical). Upstream #1779's shared draft reservation is not taken: upstream turned it
+    off for DFlash2 itself (cc2fa8d23).
+  - Engine patch 0108, `EXTRA_EOS` (default `<|assistant|>`): a reply ends at `<|assistant|>`, which GLM-5.3's
+    `generation_config.json` leaves out (thanks @wagzee). Engine patch 0109, `THINK_OFF_SPLIT`, **opt-in** (off by
+    default; 1024 is the measured hold): a thinking-off draft closed by `</think>` goes to `reasoning_content`
+    (thanks @wagzee).
+  - `start.sh`: a one-stream startup line is read by the `PROMPT_CACHE_MIN_GIB` fallback, and `E_CACHE` names the
+    log archive `stop.sh` wrote rather than the run directory it removed (thanks @laidick); a `CONTEXT=auto` start
+    with KV windows no longer exits 1 after LIVE, and `W_STREAMS` is quiet for `PARALLEL=auto` and matches
+    "1 stream at once"; `VISION=0` with `EFFORT_LINE=thinking` writes the template after the first download
+    (thanks @travellingsoldier85).
+  - `validate_config`: `KV_SHARD=1` also needs `PARALLEL` above 1, which patch 0104 refuses only after the serving
+    container is stopped (thanks @travellingsoldier85).
+  - `scripts/graft.py`, a partial Ablit overlay (thanks @mjjjjaazing), with a guard that refuses an output that
+    resolves to either input.
+  - Tests: `cache-min.sh` gains the one-stream and log-archive cases, `kv-shard-config.sh` (10 cases) and
+    `graft.sh` are new; each fails without its fix.
+
 - **2026-11-07** -- Ported from the 2x DGX Spark recipe's 2026-11-07 round, checked on this host (2x RTX PRO 6000,
   `PARALLEL=4`, `CONTEXT=auto`, DFlash2, `DENSE=q8 HEAD=q8`, a 2.8 GiB reserve, the published weights):
   - Engine patch `0103` (that recipe's 0109, upstream #1411 backported by Robert Wojciechowski): `LEARN_GIB`

@@ -164,10 +164,13 @@ Settings are layered: `scripts/config.sh` defaults, then `.env` (literal `KEY=va
 | `PROMPT_CACHE_GIB` | empty | `--prompt-cache-gib` for kept prompt states. Empty: up to 16 GiB of what the streams leave. `0`: none |
 | `PROMPT_CACHE_MIN_GIB` | empty | The smallest prompt cache a start may serve with, in GiB a rank (device pages plus the pinned host tier, as rank 0's `prompt cache: ... a rank` line counts them). `start.sh` stops the server before LIVE (`E_CACHE`) when that start funds less: the cache is what the room leaves, so `PROMPT_CACHE_GIB` caps it but does not guarantee it. Empty: no check |
 | `LEARN_GIB`, `LEARN_MIN_FREE_GIB` | `0`, `15` | `LEARN_GIB` > 0 keeps the prompt states on disk too, up to that many GiB (`--learn-conversations`, patch 0103); see [Memory](#memory-on-96-gb-discrete-cards-with-a-desktop-on-gpu-1) |
-| `KV_SHARD` | `0` | `1` keeps each stream's latent rows on one GPU (`TF_GLM_KV_SHARD`, patch 0104): about 1.8x the tokens in the same memory; see [Memory](#memory-on-96-gb-discrete-cards-with-a-desktop-on-gpu-1). Needs two GPUs, `KV=fp8`, `KV_PAGES=on`, DFlash2 or no drafter |
+| `KV_SHARD` | `0` | `1` keeps each stream's latent rows on one GPU (`TF_GLM_KV_SHARD`, patch 0104): about 1.8x the tokens in the same memory; see [Memory](#memory-on-96-gb-discrete-cards-with-a-desktop-on-gpu-1). Needs two GPUs, `KV=fp8`, `KV_PAGES=on`, DFlash2 or no drafter, `PARALLEL` auto or above 1 |
+| `L2PF` | `0` | `1` prefetches each decode window's next weights into L2 on a side stream (`TF_GLM_L2PF`, patch 0105, from upstream): the next layer's mixer input, this layer's router and KDA's `o_proj`, not the EXL3 routed experts. Upstream turns it on at TP>=2 on GB10 only; on the 2x DGX Spark pair it gave +2% at one stream and nothing measurable at four or eight. Not measured on RTX PRO 6000, so opt-in |
 | `VISION` | `1` | `--vision`: image input (rank 0's tower); `video_url` parts too with `WITH_VIDEO=1` (otherwise HTTP 500); audio parts are unsupported |
 | `WITH_VIDEO` | `0` | `1` builds `libtfvideo.so` (FFmpeg 9.0.2, static, LGPL; h264/hevc/vp8/vp9/mpeg4 in mp4/mkv) into its own image tag, so `VISION=1` serves `video_url` parts; a few minutes more at build |
 | `THINKING` | `0` | `--thinking` or `--no-thinking` as the default. A request can override it with `chat_template_kwargs.enable_thinking` |
+| `EXTRA_EOS` | `<\|assistant\|>` | Tokens that end a reply besides the checkpoint's EOS ids, comma-separated (`TF_EXTRA_EOS`, patch 0108). GLM-5.3 can close a reply with `<\|assistant\|>`, which its `generation_config.json` leaves out, and then writes its reply again until the length cap. `none`: the checkpoint's list only |
+| `THINK_OFF_SPLIT` | `0` | With thinking off, a chat reply that writes `</think>` within its first this-many tokens gets the text before it as `reasoning_content` and the rest as `content` (`TF_THINK_OFF_SPLIT`, patch 0109). A streamed reply's content waits up to that many tokens, so it is off by default; 1024 is the hold its author measured |
 | `REASONING_EFFORT` | `high` | `--reasoning-effort`: `low`, `medium`, `high` or `xhigh`. Empty omits the flag |
 | `EFFORT_LINE` | `thinking` | The template's `<|system|>Reasoning Effort: Max` line with thinking on only, as TensorFold v0.6.0's recipe wrote it (the served template is written to `.state/chat_template.jinja`); `always` serves the template as it is, which writes the line into every prompt and makes a thinking-off reply reason in its answer. See [The effort line](#the-effort-line) |
 | `MAX_TOKENS` | `32768` | `--max-tokens`, the default reply limit |
@@ -263,6 +266,24 @@ schema-constrained JSON, the Ablit weights drop a digit, with drafting on or off
 on the same engine and request, and the Ablit weights do too with thinking on. For replies that must copy ids, hashes
 or numbers exactly, serve `ABLIT=0` or turn thinking on for those requests.
 
+### A partial overlay
+
+`ABLIT=1` serves the whole transplant. `scripts/graft.py` builds a tree of your own: it copies `self_attn.o_proj` for
+the layers you name out of the Ablit repository into a copy of the published weights, byte for byte and at the offsets
+each safetensors header gives, so neither tree is loaded, no framework is needed and nothing but the grafted shards is
+copied (the rest are hardlinks to the parent). It refuses an output that resolves to either input.
+
+```
+scripts/graft.py ~/.cache/aevonix-glm53/model ~/.cache/aevonix-glm53/model-ablit \
+    ~/.cache/aevonix-glm53/model-partial1529 --layers 15-29 --verify
+# then: MODEL_SOURCE=local MODEL_DIR=~/.cache/aevonix-glm53/model-partial1529
+```
+
+The Ablit repository replaces `self_attn.o_proj` on layers 15-43 and the MTP head, so a subset is a subset of that
+transplant. Measured on the 2x DGX Spark pair (that recipe's PR #26): 15 of 30 layers (15-29) passed all 32 prompts
+of a published refusal suite, kept the exact-copy case above byte-exact, and decoded at the parent's rate, where the
+full overlay measured about 15% below the parent on code. Not measured on this host.
+
 ## Memory on 96 GB discrete cards with a desktop on GPU 1
 
 - VRAM and system RAM are separate pools: this is not a GB10 with unified memory. Every weight must fit on the GPUs,
@@ -306,7 +327,7 @@ or numbers exactly, serve `ABLIT=0` or turn thinking on for those requests.
 
 ## Engine patches
 
-`patches/engine/` holds 101 patches on TensorFold `f350cd3e`, applied in order at image build. Grouped by purpose:
+`patches/engine/` holds 106 patches on TensorFold `f350cd3e`, applied in order at image build. Grouped by purpose:
 
 | Patches | What they do |
 | --- | --- |
@@ -336,6 +357,11 @@ or numbers exactly, serve `ABLIT=0` or turn thinking on for those requests.
 | 0097 | Warm turns for GLM: after a reply the server prefills the next turn's prompt in the background, so a user message after an agent loop resumes past the loop instead of re-reading it (GLM's template drops the loop's reasoning once the next message comes); the pass yields to real work at its next chunk gate, and (every family) to a request admitted ahead of it into the fill queue; each pass's outcome is logged (`next turn: background prefill of N tokens done` / `stepped aside` / `failed: ...`) |
 | 0103 | `--learn-conversations` for GLM on CUDA (`LEARN_GIB`, off by default), a backport of upstream [#1411](https://github.com/ashhart/TensorFold/pull/1411) by its author (the 2x DGX Spark recipe's 0109): kept prompt states on disk, every rank's part, written behind the request and read back after an eviction or a restart. `--spill-gib` and `--checkpoint-slots` are refused for GLM. Off: replies byte-identical |
 | 0104 | KV sharding (`KV_SHARD=1`, `TF_GLM_KV_SHARD`, off by default) at TP=2, toward upstream [#1431](https://github.com/ashhart/TensorFold/issues/1431) (the Spark recipe's 0110, one hunk moved): each stream's FP8 latent rows on its owner GPU, owner-computed decode and verify, prompts on a borrowed twin, kept states carried between owners, and 0103's disk image under it. Refused by name with the MTP drafter, `--parallel 1`, other KV caches, or a part under 131k tokens. `tf-cuda-test glm-kv-shard-check` checks it against an unsharded twin byte for byte. Off: replies byte-identical |
+| 0105 | From upstream (8cc6ac420, a0ddae24d; opt-in): `TF_GLM_L2PF=1` (`L2PF=1`) reads a decode window's next weights into L2 on a side stream while the gathers and chains run, with DeepSeek V4.1's `l2pf` / `l2pace` kernels and their contract records; the ranks' fingerprint carries it (layout 16). Off: no change |
+| 0106 | From upstream (b10fda39f, 1b5ac18bb, 7faa962a0): a reply `max_tokens` cuts inside a JSON `<tool_call>` that has named an offered tool returns that call with its arguments as far as written, as XML and GLM calls already did, and a whole `/v1/messages` reply closes the cut call's input instead of answering 500. Two local fixes: a key with no value no longer indexes an empty slice, and offered names match in any case |
+| 0107 | From upstream (6d4191a95, #2257, adapted): decode windows of 32 rows (16 before), so a context copy verifies up to 31 tokens a round; DFlash2 still drafts 7. Shared-window scratch is flagged outright (a 32-row segment no longer shrinks the KDA projection buffer or drops 0075/0088's one-launch segment attention), the follower's draws hold 32 rows, and the window width joins `--learn-conversations`' store identity. On the 2x DGX Spark pair a one-stream file rewrite went from 151 to 201-205 tok/s decode, prose unchanged, token hashes identical; not measured here |
+| 0108 | `TF_EXTRA_EOS=<token>[,<token>...]` (`EXTRA_EOS`, on by default with `<\|assistant\|>`): the named tokens end a reply like the checkpoint's EOS ids. A name the tokenizer does not hold refuses the start |
+| 0109 | `TF_THINK_OFF_SPLIT=<tokens>` (`THINK_OFF_SPLIT`, opt-in, off by default): a thinking-off chat reply that writes the think close token within the hold is split like a thinking reply, its draft as `reasoning_content` |
 | 0076, 0079, 0085, 0087 | Test and contract-record changes |
 
 Every default-on patch was A/B tested against the image before it: greedy (T=0) replies identical, plus a measured
@@ -379,6 +405,8 @@ Thinking-on prompts are unchanged (same greedy replies). `EFFORT_LINE=always` se
 | `libtfvideo.so is required for video inputs` (HTTP 500 on a `video_url` part) | The default image builds no video runtime. Set `WITH_VIDEO=1` and restart (it builds its own image tag); a server that already refused one video request keeps refusing until restarted |
 | An exact value (an id, a hash) copied wrong in a JSON reply on `ABLIT=1` | The Ablit weights' own error: see [Ablit weights](#ablit-weights) |
 | `[E_HF_TOKEN]` | `ABLIT=1` and the gated weights can't be fetched: see [Ablit weights](#ablit-weights), or set `ABLIT=0` |
+| A reply ends with `<\|assistant\|>` followed by the same answer again, `finish_reason: length` | The checkpoint's EOS list leaves out `<\|assistant\|>`. Keep `EXTRA_EOS` at its default (`<\|assistant\|>`) |
+| With thinking off, `content` starts with a draft ("We need ...") and holds `</think>` | The model reasoned anyway. Set `THINK_OFF_SPLIT=1024` (off by default) so the draft goes to `reasoning_content` |
 | `[E_DOWNLOAD]` | The download failed: check free space and your connection, and run `./start.sh` again to resume |
 | `--parallel N needs ... GiB` / `fits no stream` | The window or stream count does not fit. `CONTEXT=auto` retries once by itself. Otherwise lower `CONTEXT` or `PARALLEL` (see Memory) |
 | `the ranks' settings differ` / `RankMismatch` | The ranks were started differently. Both run from the same container with the same flags, so check for a hand-edited `runner.sh` |
