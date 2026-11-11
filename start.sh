@@ -118,8 +118,14 @@ esac
 # set from reasoning_effort, which the engine passes with thinking on only (null with thinking off: prompt.zig), so a
 # thinking-off prompt no longer carries `<|system|>Reasoning Effort: Max`. Written to STATE_DIR every start; the base
 # line must be the one the checkpoint ships, else the start stops rather than serve a template it did not understand.
-if [[ "$CHAT_TEMPLATE" == auto && "$EFFORT_LINE" == thinking ]]; then
-  EFFORT_BASE=${TEMPLATE_FILE:-$MODEL_DIR/chat_template.jinja}
+# With VISION=0 the base is the checkpoint's own file, which the default MODEL_SOURCE=download fetches in step 3: until
+# that download is complete (weights_ready), step 3 writes the template after it (EFFORT_AFTER_DOWNLOAD). Every other
+# start checks and writes it here, before anything runs or a serving pair is stopped.
+effort_template() {
+  if [[ "$DRY_RUN" == 1 && "$EFFORT_AFTER_DOWNLOAD" == 1 && ! -f "$EFFORT_BASE" ]]; then
+    log "Then write $STATE_DIR/chat_template.jinja: the downloaded $EFFORT_BASE with its effort line taken from reasoning_effort (EFFORT_LINE=thinking)."
+    return 0
+  fi
   [[ -f "$EFFORT_BASE" ]] || fail E_CONFIG "Chat template not found: $EFFORT_BASE (EFFORT_LINE=thinking rewrites its effort line)."
   [[ "$DRY_RUN" == 1 ]] || mkdir -p "$STATE_DIR"
   python3 - "$EFFORT_BASE" "$STATE_DIR/chat_template.jinja" "$DRY_RUN" <<'PY' || fail E_CONFIG "EFFORT_LINE=thinking: $EFFORT_BASE has no effort line this recipe knows; set EFFORT_LINE=always or CHAT_TEMPLATE to a file."
@@ -132,6 +138,15 @@ if src.count(base) != 1:
 if sys.argv[3] != "1":  # DRY_RUN=1 checks the base and writes nothing
     open(sys.argv[2], "w", encoding="utf-8").write(src.replace(base, line))
 PY
+}
+EFFORT_AFTER_DOWNLOAD=0
+if [[ "$CHAT_TEMPLATE" == auto && "$EFFORT_LINE" == thinking ]]; then
+  EFFORT_BASE=${TEMPLATE_FILE:-$MODEL_DIR/chat_template.jinja}
+  if [[ -z "$TEMPLATE_FILE" && "$MODEL_SOURCE" == download ]] && ! weights_ready "$MODEL_DIR" "$MODEL_REVISION"; then
+    EFFORT_AFTER_DOWNLOAD=1
+  else
+    effort_template
+  fi
   TEMPLATE_FILE="$STATE_DIR/chat_template.jinja"
 fi
 
@@ -456,6 +471,7 @@ prepare_image
 step 3 'Download or check the checkpoint and the drafter weights'
 prepare_weights
 model_overlay
+[[ "$EFFORT_AFTER_DOWNLOAD" == 0 ]] || effort_template
 
 step 4 'Check CUDA peer-to-peer between the selected GPUs'
 check_p2p
