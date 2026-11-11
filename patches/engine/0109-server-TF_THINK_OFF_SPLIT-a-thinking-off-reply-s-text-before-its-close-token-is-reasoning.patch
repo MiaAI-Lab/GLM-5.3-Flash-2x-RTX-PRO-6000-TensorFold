@@ -1,0 +1,471 @@
+From 6d193c3f01f9472da75a9612c33bfc878f6c41db Mon Sep 17 00:00:00 2001
+From: wagzee <jurik17@gmail.com>
+Date: Sun, 8 Nov 2026 19:33:17 +0100
+Subject: [PATCH] server: TF_THINK_OFF_SPLIT=<tokens>, an opt-in: a
+ thinking-off chat reply that writes the think close token within its first
+ <tokens> tokens has the text before it as reasoning_content and the text
+ after it as content, as a thinking reply does; while it streams, its content
+ is held until the close token, the hold or the end, so streamed and whole
+ replies split alike. A close after the hold stays text; raw completions, the
+ JSON channel and logprobs requests are never split. Tests:
+ think_off_split.zig (the decision) and think_off_split_test.zig (the chat
+ route whole and streamed, token by token and batched), zig build
+ test-think-off-split-host
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QBwDo8BJMNvBwCYRxE5Gyt
+---
+ zig/build/cuda.zig                      |   1 +
+ zig/src/server/chat.zig                 |  28 +++-
+ zig/src/server/root.zig                 |   2 +
+ zig/src/server/server.zig               |   1 +
+ zig/src/server/think_off_split.zig      |  79 +++++++++
+ zig/src/server/think_off_split_test.zig | 211 ++++++++++++++++++++++++
+ 6 files changed, 316 insertions(+), 6 deletions(-)
+ create mode 100644 zig/src/server/think_off_split.zig
+ create mode 100644 zig/src/server/think_off_split_test.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 054d85922..e2ba56e87 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -385,6 +385,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     eos_policy.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mods.tokenizer, .filters = &.{"EOS policy:"} })).step);
+     const eos_family = kolibri1Module(b, host, .debug, cuda, mods.core, mods.lanes);
+     eos_policy.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = eos_family, .filters = &.{"EOS policy:"} })).step);
++    b.step("test-think-off-split-host", "TF_THINK_OFF_SPLIT: a thinking-off reply that closes a think block, whole and streamed, without a GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"think off split:"} })).step);
+     b.step("test-dory-cli-host", "Dory CUDA loop option forwarding and invalid-value refusals").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"--device and --segments:"} })).step);
+     b.step("test-dory-chat-host", "Dory chat template, EOS, reasoning split and qwen3_coder call on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"Dory chat:"} })).step);
+     b.step("test-embeddings-protocol-host", "Embedding request and response contracts without an admitted model or GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"embeddings protocol:"} })).step);
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index c4c9dc2b5..2835e2460 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -4,6 +4,7 @@ const api = @import("engine_api");
+ const json = @import("json");
+ const errors = @import("errors.zig");
+ const fields_mod = @import("fields.zig");
++const think_off_split = @import("think_off_split.zig");
+ const reply_text = @import("reply_text.zig");
+ const tool_stream = @import("tool_stream.zig");
+ const tool_parse = @import("tool_parse.zig");
+@@ -252,7 +253,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+     };
+     srv.release(preparing, null); // a background request waits only while a foreground one prepares
+     preparing = false;
+-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .response_channel = prepared.response_channel, .tools = if (prepared.response_channel == .structured_json) &.{} else input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop };
++    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .think_off_split = if (!thinking and !reply_text.isChannel(srv.markers) and input.prompt == null and prepared.response_channel != .structured_json and request.logprobs == null) think_off_split.hold() else 0, .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .response_channel = prepared.response_channel, .tools = if (prepared.response_channel == .structured_json) &.{} else input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop };
+     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
+     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
+     const result: Failure!Reply = blk: {
+@@ -292,6 +293,7 @@ const Generation = struct {
+     seed: ?u64 = null,
+     sink: ?Sink,
+     thinking: bool,
++    think_off_split: u32 = 0, // TF_THINK_OFF_SPLIT's hold for this thinking-off chat reply; 0: not split
+     stops: reply_text.Stops,
+     ignore_eos: bool,
+     max_tokens: u32,
+@@ -315,6 +317,12 @@ const Generation = struct {
+     lp: ?@import("logprobs.zig").Stream = null, // the request asked for logprobs: its rows, copied with each round
+     loop_stop: bool = false, // --loop-guard-stop: the engine ends the reply where the loop guard fires
+ 
++    /// TF_THINK_OFF_SPLIT: whether a thinking-off reply's text before its close token is its reasoning, so far.
++    fn strayClose(g: *const Generation, finished: bool) think_off_split.Decision {
++        if (g.thinking) return .off;
++        return think_off_split.decide(g.collected.items, g.srv.close_id, g.think_off_split, finished);
++    }
++
+     fn eos(g: *const Generation, t: u32) bool {
+         return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
+     }
+@@ -367,8 +375,14 @@ const Generation = struct {
+         const all = try g.visible.extend(g.a, g.srv.text, reply_text.decodeText, fresh.items);
+         const text = g.stops.visible(all, true);
+         if (g.visible.pending()) return; // a character still split across tokens
++        var think_now = g.thinking;
++        switch (g.strayClose(false)) {
++            .hold => return, // TF_THINK_OFF_SPLIT: held until the close token, the hold's end or the reply's
++            .split => think_now = true,
++            .off, .release => {},
++        }
+         var answer = text;
+-        if (g.thinking) {
++        if (think_now) {
+             const close = try g.visible.closeOf(g.a, reply_text.decodeText, g.srv.text, g.srv.close_id);
+             const split = try reply_text.splitThinkingAt(g.a, text, false, g.srv.markers, close);
+             const piece = g.streamed_reasoning.after(split.reasoning, true);
+@@ -493,7 +507,9 @@ const Generation = struct {
+         const text = if (close.len > 0) try std.mem.concat(a, u8, &.{ visible, close }) else visible;
+         var content: []const u8 = text;
+         var reasoning: ?[]const u8 = null;
+-        if (g.thinking) {
++        const stray = g.strayClose(true) == .split; // TF_THINK_OFF_SPLIT: a thinking-off reply that closed a think block
++        const think = g.thinking or stray;
++        if (think) {
+             const split = try reply_text.splitThinkingTokens(a, reply_text.decodeText, g.srv.text, text, true, g.srv.markers, content_tokens, g.srv.close_id);
+             const r = reply_text.pyStrip(split.reasoning);
+             reasoning = if (r.len > 0) r else null;
+@@ -508,14 +524,14 @@ const Generation = struct {
+             const thought = g.streamed_reasoning.text.items;
+             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
+                 try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
+-            const shown = if (g.calls != null) try tool_stream.endProse(a, content, if (g.thinking) content else text, g.tools, reason) else content;
++            const shown = if (g.calls != null) try tool_stream.endProse(a, content, if (think) content else text, g.tools, reason) else content;
+             const sent = g.streamed.text.items;
+             const rest = if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) shown[sent.len..] else "";
+             if (g.lp) |*l| (if (try l.delta(g.srv, a, g.thinking, g.ignore_eos, g.collected.items, rest, shown.len, true)) |d| try g.emit(sink, d)) else if (rest.len > 0) try g.emit(sink, .{ .string = rest });
+             if (g.calls) |*c| if (close.len > 0 or std.mem.eql(u8, reason, "length")) {
+                 // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas
+                 var out: std.ArrayList(Value) = .empty;
+-                try c.finishCut(if (g.thinking) content else text, &out); // a cut value sends its held bytes
++                try c.finishCut(if (think) content else text, &out); // a cut value sends its held bytes
+                 for (out.items) |d| try g.emit(sink, d);
+             };
+         }
+@@ -568,7 +584,7 @@ const Generation = struct {
+             .ok => |v| try spec.put(a, "proposer", v),
+             .err => {},
+         };
+-        const think_end: ?u32 = if (thinking) g.srv.text.tokenId(g.srv.markers.close) else null;
++        const think_end: ?u32 = if (thinking or stray) g.srv.text.tokenId(g.srv.markers.close) else null;
+         const reply: Reply = .{
+             .response_channel = g.response_channel,
+             .content = content,
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index 0138614ff..c29cea810 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -18,6 +18,7 @@ pub const Config = server.Config;
+ 
+ test {
+     _ = @import("extra_eos.zig");
++    _ = @import("think_off_split.zig");
+     _ = @import("auth_scope_test.zig");
+     _ = @import("auth_scope_http_test.zig");
+     _ = @import("admission_cli.zig");
+@@ -96,6 +97,7 @@ test {
+     _ = @import("think_split_test.zig");
+     _ = @import("thinking_reserve_test.zig");
+     _ = @import("loop_stop_test.zig");
++    _ = @import("think_off_split_test.zig");
+     _ = @import("late_system_test.zig");
+     _ = @import("compact_test.zig");
+     _ = @import("compact_auto_test.zig");
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index aceddeebc..ea841d520 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -205,6 +205,7 @@ pub const Server = struct {
+         }
+         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
+         srv.close_id = text.tokenId(srv.markers.close);
++        if (@import("think_off_split.zig").hold() > 0) log.line("TF_THINK_OFF_SPLIT: a thinking-off reply that writes {s} in its first {d} tokens has its text before it as reasoning{s}", .{ srv.markers.close, @import("think_off_split.zig").hold(), if (srv.close_id == null) " (off: the tokenizer has no such token)" else "" });
+         const source = text.templateSource();
+         srv.effort_levels = try fields.effortLevels(a, source);
+         srv.thinking_switch = std.mem.indexOf(u8, source, "enable_thinking") != null or
+diff --git a/zig/src/server/think_off_split.zig b/zig/src/server/think_off_split.zig
+new file mode 100644
+index 000000000..c5b5ea7c8
+--- /dev/null
++++ b/zig/src/server/think_off_split.zig
+@@ -0,0 +1,79 @@
++//! TF_THINK_OFF_SPLIT=<tokens>: a chat reply served with thinking off that writes the think block's close token anyway,
++//! within its first <tokens> tokens, has the text before that token as its reasoning and the text after it as its
++//! answer, as a thinking reply does. GLM-5.3 does this on some list-heavy prompts: it drafts in its hidden-reasoning
++//! voice, writes `</think>`, then answers. Without the split, the draft and the stray marker are the reply's content.
++//! While a reply streams, its content is held until the close token arrives, the hold's tokens pass or the reply ends,
++//! so a streamed reply and the same reply unstreamed split alike. A close token after the hold stays text. Unset or 0:
++//! off. Raw completions, the JSON channel and replies that ask for logprobs are never split.
++const std = @import("std");
++
++var cached: std.atomic.Value(u64) = .init(std.math.maxInt(u64)); // maxInt: unread
++
++/// Tests set the hold here instead of the environment, which is read once per process.
++pub var test_hold: ?u32 = null;
++
++/// The hold in tokens TF_THINK_OFF_SPLIT asks for (read once); 0 when unset, empty, 0 or not a number.
++pub fn hold() u32 {
++    if (test_hold) |h| return h;
++    const v = cached.load(.monotonic);
++    if (v != std.math.maxInt(u64)) return @intCast(v);
++    const n = parse(if (std.c.getenv("TF_THINK_OFF_SPLIT")) |s| std.mem.span(s) else "");
++    cached.store(n, .monotonic);
++    return n;
++}
++
++pub fn parse(s: []const u8) u32 {
++    return std.fmt.parseInt(u32, std.mem.trim(u8, s, " \t"), 10) catch 0;
++}
++
++pub const Decision = enum {
++    /// Not split: the hold is off or the tokenizer has no close token.
++    off,
++    /// The reply has not written the close token and may still: its content waits.
++    hold,
++    /// The close token is among the reply's first `limit` tokens: the text before it is reasoning.
++    split,
++    /// The hold passed (or the reply ended) without the close token: the reply is all content, as without the hold.
++    release,
++};
++
++/// What a thinking-off reply does with its text so far: its tokens, the close token's id, the hold, and whether it ended.
++pub fn decide(tokens: []const u32, close_id: ?u32, limit: u32, finished: bool) Decision {
++    if (limit == 0) return .off;
++    const id = close_id orelse return .off;
++    if (std.mem.indexOfScalar(u32, tokens[0..@min(tokens.len, limit)], id) != null) return .split;
++    if (finished or tokens.len >= limit) return .release;
++    return .hold;
++}
++
++const close: u32 = 154842; // GLM-5.3's </think>
++
++test "think off split: the close token within the hold splits, held until then, released after the hold or at the end" {
++    try std.testing.expectEqual(Decision.off, decide(&.{ 1, close, 2 }, close, 0, true));
++    try std.testing.expectEqual(Decision.off, decide(&.{ 1, close, 2 }, null, 1024, true));
++    // streaming: held while the reply may still close, split the moment it does
++    try std.testing.expectEqual(Decision.hold, decide(&.{ 1, 2, 3 }, close, 8, false));
++    try std.testing.expectEqual(Decision.split, decide(&.{ 1, 2, 3, close }, close, 8, false));
++    try std.testing.expectEqual(Decision.split, decide(&.{ 1, 2, 3, close, 4, 5, 6, 7, 8, 9 }, close, 8, false));
++    // an ordinary reply: released at its end, or when the hold passes while it is still writing
++    try std.testing.expectEqual(Decision.release, decide(&.{ 1, 2, 3 }, close, 8, true));
++    try std.testing.expectEqual(Decision.release, decide(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }, close, 8, false));
++    // a close token after the hold stays text, before and after the reply ends: the decision never flips back
++    const late = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, close, 9 };
++    try std.testing.expectEqual(Decision.release, decide(&late, close, 8, false));
++    try std.testing.expectEqual(Decision.release, decide(&late, close, 8, true));
++    // streamed and unstreamed agree: every prefix's decision ends where the whole reply's does
++    const draft = [_]u32{ 5, 6, 7, close, 9, 10 };
++    var last: Decision = .hold;
++    for (1..draft.len + 1) |k| last = decide(draft[0..k], close, 8, k == draft.len);
++    try std.testing.expectEqual(decide(&draft, close, 8, true), last);
++}
++
++test "think off split: the hold parses as a token count, anything else is off" {
++    try std.testing.expectEqual(@as(u32, 1024), parse("1024"));
++    try std.testing.expectEqual(@as(u32, 1024), parse(" 1024 "));
++    try std.testing.expectEqual(@as(u32, 0), parse(""));
++    try std.testing.expectEqual(@as(u32, 0), parse("0"));
++    try std.testing.expectEqual(@as(u32, 0), parse("on"));
++    try std.testing.expectEqual(@as(u32, 0), parse("-5"));
++}
+diff --git a/zig/src/server/think_off_split_test.zig b/zig/src/server/think_off_split_test.zig
+new file mode 100644
+index 000000000..c28b6c003
+--- /dev/null
++++ b/zig/src/server/think_off_split_test.zig
+@@ -0,0 +1,211 @@
++//! TF_THINK_OFF_SPLIT on the chat route: a thinking-off reply that writes `</think>` within the hold has its text before
++//! it as reasoning_content, whole and streamed alike; an ordinary reply, a late close and the setting off are unchanged.
++const std = @import("std");
++const api = @import("engine_api");
++const server = @import("root.zig");
++const json = server.json;
++const model_text = @import("model_text.zig");
++const openai = @import("openai.zig");
++const think_off_split = @import("think_off_split.zig");
++const Conn = @import("http_conn.zig").Conn;
++const t = std.testing;
++
++const think_end: u32 = 300;
++
++/// Bytes as tokens and `</think>` as token 300; every prompt renders as "prompt".
++const Text = struct {
++    fn text(x: *@This()) model_text.Text {
++        return .{ .ctx = x, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocabSize, .eos_ids = eosIds, .render = render, .template_source = templateSource } };
++    }
++    fn encode(_: *anyopaque, a: std.mem.Allocator, input: []const u8, _: bool) model_text.Error![]u32 {
++        const ids = try a.alloc(u32, input.len);
++        for (input, ids) |byte, *id| id.* = byte;
++        return ids;
++    }
++    fn decode(_: *anyopaque, a: std.mem.Allocator, ids: []const u32) std.mem.Allocator.Error![]u8 {
++        var out: std.ArrayList(u8) = .empty;
++        for (ids) |id| if (id == think_end) try out.appendSlice(a, "</think>") else try out.append(a, @intCast(id));
++        return out.items;
++    }
++    fn tokenId(_: *anyopaque, p: []const u8) ?u32 {
++        return if (std.mem.eql(u8, p, "</think>")) think_end else null;
++    }
++    fn tokenString(_: *anyopaque, a: std.mem.Allocator, id: u32) std.mem.Allocator.Error![]u8 {
++        return std.fmt.allocPrint(a, "{d}", .{id});
++    }
++    fn vocabSize(_: *anyopaque) u32 {
++        return 301;
++    }
++    fn eosIds(_: *anyopaque) []const u32 {
++        return &.{};
++    }
++    fn render(_: *anyopaque, a: std.mem.Allocator, _: json.Value, _: model_text.RenderOptions, _: *[]const u8) model_text.Error!model_text.Rendered {
++        return .{ .text = try (a.dupe(u8, "prompt")) };
++    }
++    fn templateSource(_: *anyopaque) []const u8 {
++        return "";
++    }
++};
++
++/// Writes `reply` (bytes, with "|" as the `</think>` token), one token an event or all at once.
++const Writer = struct {
++    reply: []const u8,
++    batched: bool = false,
++
++    fn engine(e: *@This()) api.Engine {
++        return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
++    }
++    fn info(_: *anyopaque) api.Info {
++        return api.Info.ofLanes(.{ .context_window = 4096 });
++    }
++    fn submit(ctx: *anyopaque, id: api.Id, _: *const api.Request, sink: api.Sink) api.SubmitError!void {
++        const e: *@This() = @ptrCast(@alignCast(ctx));
++        var ids: [256]u32 = undefined;
++        for (e.reply, 0..) |b, i| ids[i] = if (b == '|') think_end else b;
++        const all = ids[0..e.reply.len];
++        sink.event(sink.ctx, id, &.{ .prefilled = 0 });
++        if (e.batched) sink.event(sink.ctx, id, &.{ .tokens = all }) else for (all) |*tok| sink.event(sink.ctx, id, &.{ .tokens = tok[0..1] });
++        sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop, .stats = .{} } });
++    }
++    fn cancel(_: *anyopaque, _: api.Id) void {}
++    fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
++        out.* = .{};
++    }
++    fn memory(_: *anyopaque, _: bool) ?api.Memory {
++        return null;
++    }
++};
++
++const Wire = struct {
++    a: std.mem.Allocator,
++    status: ?u16 = null,
++    whole: json.Value = .null,
++    events: std.ArrayList(json.Value) = .empty,
++    done: bool = false,
++
++    fn out(w: *Wire) openai.Out {
++        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = reply } };
++    }
++    fn copy(w: *Wire, v: json.Value) !json.Value {
++        return (try json.parse(w.a, try json.stringify(w.a, v, .{}))).ok;
++    }
++    fn open(_: *anyopaque, _: usize) error{Closed}!void {}
++    fn event(ctx: *anyopaque, payload: ?json.Value) error{Closed}!void {
++        const w: *Wire = @ptrCast(@alignCast(ctx));
++        const p = payload orelse {
++            w.done = true;
++            return;
++        };
++        w.events.append(w.a, w.copy(p) catch return error.Closed) catch return error.Closed;
++    }
++    fn reply(ctx: *anyopaque, code: u16, payload: json.Value) void {
++        const w: *Wire = @ptrCast(@alignCast(ctx));
++        w.status = code;
++        w.whole = w.copy(payload) catch .null;
++    }
++};
++
++const View = struct { reasoning: []const u8 = "", content: []const u8 = "", reasoning_tokens: ?i64 = null };
++
++fn view(a: std.mem.Allocator, w: *const Wire) !View {
++    var v: View = .{};
++    if (w.status) |code| {
++        try t.expectEqual(@as(u16, 200), code);
++        const message = w.whole.get("choices").?.array[0].get("message").?;
++        v.reasoning = message.strField("reasoning_content") orelse "";
++        v.content = message.strField("content") orelse "";
++        if (w.whole.get("usage")) |u| if (u.get("completion_tokens_details")) |d| if (d.get("reasoning_tokens")) |r| {
++            v.reasoning_tokens = r.int64();
++        };
++        return v;
++    }
++    try t.expect(w.done);
++    var thought: std.ArrayList(u8) = .empty;
++    var text: std.ArrayList(u8) = .empty;
++    for (w.events.items) |e| {
++        const choices = (e.get("choices") orelse continue).array;
++        if (choices.len == 0) continue;
++        const d = choices[0].get("delta") orelse continue;
++        try thought.appendSlice(a, d.strField("reasoning_content") orelse "");
++        try text.appendSlice(a, d.strField("content") orelse "");
++    }
++    v.reasoning = thought.items;
++    v.content = text.items;
++    return v;
++}
++
++/// One chat completion on a server that serves thinking off by default (or on), with this hold.
++fn chat(a: std.mem.Allocator, e: *Writer, hold: u32, thinking: bool, stream: bool) !View {
++    think_off_split.test_hold = hold;
++    defer think_off_split.test_hold = null;
++    var text: Text = .{};
++    const cfg: server.Config = .{ .served_name = "m", .model_ids = &.{"m"}, .use_drafts = false, .enable_thinking = thinking };
++    var srv = try server.Server.init(t.allocator, t.io, e.engine(), text.text(), cfg, null);
++    defer srv.deinit();
++    const body = try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"max_tokens\":200,\"stream\":{},\"messages\":[{{\"role\":\"user\",\"content\":\"x\"}}]}}", .{stream});
++    var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
++    var wire: Wire = .{ .a = a };
++    openai.run(srv, a, wire.out(), .{ .conn = &conn }, true, (try json.parse(a, body)).ok);
++    return view(a, &wire);
++}
++
++/// Every way a client reads the reply: whole and streamed, one token an event and all at once.
++fn each(a: std.mem.Allocator, reply: []const u8, hold: u32, thinking: bool) ![4]View {
++    var out: [4]View = undefined;
++    var i: usize = 0;
++    for ([_]bool{ false, true }) |batched| for ([_]bool{ false, true }) |stream| {
++        var e: Writer = .{ .reply = reply, .batched = batched };
++        out[i] = try chat(a, &e, hold, thinking, stream);
++        i += 1;
++    };
++    return out;
++}
++
++test "think off split: a thinking-off draft closed within the hold is reasoning, its answer the content, every way" {
++    var arena: std.heap.ArenaAllocator = .init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    for (try each(a, "We need the codes. Draft.|badger: 41318", 64, false)) |v| {
++        try t.expectEqualStrings("We need the codes. Draft.", std.mem.trimEnd(u8, v.reasoning, "\n"));
++        try t.expectEqualStrings("badger: 41318", v.content);
++    }
++}
++
++test "think off split: an ordinary thinking-off reply is all content, every way, with the hold on" {
++    var arena: std.heap.ArenaAllocator = .init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    for (try each(a, "badger: 41318", 64, false)) |v| {
++        try t.expectEqualStrings("", v.reasoning);
++        try t.expectEqualStrings("badger: 41318", v.content);
++    }
++    // longer than the hold: the stream lets it go when the hold passes, and it is the same reply
++    for (try each(a, "a reply longer than eight tokens", 8, false)) |v| {
++        try t.expectEqualStrings("", v.reasoning);
++        try t.expectEqualStrings("a reply longer than eight tokens", v.content);
++    }
++}
++
++test "think off split: a close after the hold, or the hold off, leaves the reply as it was" {
++    var arena: std.heap.ArenaAllocator = .init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    for (try each(a, "a draft past the hold|answer", 8, false)) |v| {
++        try t.expectEqualStrings("", v.reasoning);
++        try t.expectEqualStrings("a draft past the hold</think>answer", v.content);
++    }
++    for (try each(a, "draft|answer", 0, false)) |v| {
++        try t.expectEqualStrings("", v.reasoning);
++        try t.expectEqualStrings("draft</think>answer", v.content);
++    }
++}
++
++test "think off split: a thinking reply splits as before, with the hold on or off" {
++    var arena: std.heap.ArenaAllocator = .init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    for ([_]u32{ 0, 64 }) |hold| for (try each(a, "thinking|answer", hold, true)) |v| {
++        try t.expectEqualStrings("thinking", std.mem.trimEnd(u8, v.reasoning, "\n"));
++        try t.expectEqualStrings("answer", v.content);
++    };
++}
+-- 
+2.43.0
+

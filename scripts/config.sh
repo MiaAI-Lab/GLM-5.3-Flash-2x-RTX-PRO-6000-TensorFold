@@ -156,6 +156,13 @@ EFFORT_LINE="${EFFORT_LINE:-thinking}"
 # its generation_config leaves out: the token then reaches the reply as text and the model writes a second turn of
 # its own until MAX_TOKENS. none: the checkpoint's list only.
 EXTRA_EOS="${EXTRA_EOS:-<|assistant|>}"
+# THINK_OFF_SPLIT (engine patch 0109, TF_THINK_OFF_SPLIT): with thinking off, GLM-5.3 sometimes drafts in its reasoning
+# voice anyway and writes </think> before its answer. A chat reply that writes that token within its first
+# THINK_OFF_SPLIT tokens gets the text before it as reasoning_content and the rest as content, as a thinking reply
+# does. While a reply streams, its content waits until the token, the end or THINK_OFF_SPLIT tokens (whichever comes
+# first), so a long thinking-off reply's first content arrives up to that many tokens later. 0 (default): off, since
+# that hold delays every streamed thinking-off reply; 1024 is the hold its author measured.
+THINK_OFF_SPLIT="${THINK_OFF_SPLIT:-0}"
 THINKING="${THINKING:-0}"                        # --thinking / --no-thinking default; requests override
 REASONING_EFFORT="${REASONING_EFFORT:-high}"     # --reasoning-effort low|medium|high|xhigh (empty: omit)
 MAX_TOKENS="${MAX_TOKENS:-32768}"                # --max-tokens default reply limit
