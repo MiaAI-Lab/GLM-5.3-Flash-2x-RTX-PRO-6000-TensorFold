@@ -1,5 +1,20 @@
 # Changelog
 
+- **2026-11-12** -- Engine patch 0113: a long chat no longer dies at its first turn with `PoolTooSmall`. The KV pool's
+  pages are what the memory budget leaves, often fewer rows than the context window names, and a request whose prompt
+  plus reply needed more pages than the whole pool holds was admitted only to be refused at its opening
+  (`error.PoolTooSmall: shorten the prompt or lower max_tokens`) — with the server clamping the reply to the context
+  window, no shorter `max_tokens` saved it, so every turn of such a chat failed the same way. Such a request now
+  opens with the longest reply the pool holds for its prompt (its verify window and run included): the stream's reply
+  is capped to match, one `kv pool: ... opens with N` line says so, and the reply ends at the length limit like any
+  other long reply. Sharded (`TF_GLM_KV_SHARD=1`) the budget is one part's pages, the cap the same.
+  `error.PoolTooSmall` remains for a prompt that can never fit the pool even alone, and its words now name
+  `TENSORFOLD_MEMORY_RESERVE_GIB` and `--context` as the ways to give the pool more room. The patch also corrects two
+  test constants patch 0107 (32-row decode windows) left stale, which had kept `test-glm-kv-pages-host` red:
+  `capacity(330529)` is 330624, and the rank fingerprint's layout is 16. Built and tested without devices on the
+  engine tree at `.src/tf` (branch `fidelity113`: `f350cd3e` plus all 110 patches), host suite 973 of 977 — the three
+  fails predate this patch (the draft-sources head check and the exl3 scan-fault nondeterminism from the old tree,
+  and the FP8 pages store's resume miss, present on the bare 0112 stack).
 - **2026-11-12** -- Ported from the 2x DGX Spark recipe's tool-call-guard round. Not yet built on this host: all 109
   patches apply to `f350cd3e` with the Dockerfile's loop, and `scripts/tests/run.sh` passes.
   - Engine patch 0101, `TF_TOOL_CALL_GUARD=1` (opt-in, off by default; that recipe's 0107, ported here 2026-11-05
