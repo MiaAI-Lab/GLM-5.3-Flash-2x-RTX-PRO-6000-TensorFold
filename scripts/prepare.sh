@@ -124,7 +124,14 @@ set_image() {
   } | sha256sum | cut -c1-12)
   IMAGE=${IMAGE:-$IMAGE_REPO:$PATCHES_HASH}
 }
-image_ready() { [[ "$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)" == "$PATCHES_HASH" ]]; }
+image_ready() {
+  # An immutable image ID explicitly pins a saved deployment; never retag or rebuild it.
+  if [[ "$IMAGE" == sha256:* ]]; then
+    [[ "$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || true)" == "$IMAGE" ]]
+  else
+    [[ "$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)" == "$PATCHES_HASH" ]]
+  fi
+}
 
 check_platform() {
   local cmd
@@ -210,7 +217,12 @@ prepare_image() {
     warn W_DOCKERFILE 'docker/Dockerfile is missing; the plan shows the build it would run.'
   fi
   if [[ "$DRY_RUN" != 1 ]]; then
-    if image_ready; then log "Image is ready: $IMAGE (tf.patches=$PATCHES_HASH)"; return; fi
+    if image_ready; then
+      if [[ "$IMAGE" == sha256:* ]]; then log "Pinned deployment image is ready: $IMAGE"
+      else log "Image is ready: $IMAGE (tf.patches=$PATCHES_HASH)"; fi
+      return
+    fi
+    [[ "$IMAGE" != sha256:* ]] || fail E_IMAGE "Pinned deployment image is missing: $IMAGE. Restore that image before starting."
     local other
     other=$(docker images -q --filter "label=tf.patches=$PATCHES_HASH" | head -n1)
     if [[ -n "$other" ]]; then
