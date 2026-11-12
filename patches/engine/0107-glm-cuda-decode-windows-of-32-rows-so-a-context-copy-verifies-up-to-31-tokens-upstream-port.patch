@@ -1,29 +1,9 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: MiaAI-Lab <mia.ailab1@gmail.com>
-Date: Wed, 11 Nov 2026 12:00:00 +0200
-Subject: [PATCH] glm cuda: decode windows of 32 rows, so a context copy
- verifies up to 31 tokens a round (upstream #2257 port)
+From 3d2c5eeff5c81874dad6c4e130ff023db0fc2603 Mon Sep 17 00:00:00 2001
+From: MiaAI_Lab <mia.ailab1@gmail.com>
+Date: Thu, 12 Nov 2026 18:07:02 +0200
+Subject: [PATCH] glm cuda: 0107 (32-row decode windows) rebased onto the stack
+ without 0094/0095
 
-From upstream ashhart/TensorFold 6d4191a95 "glm cuda: windows to 32 rows, priced by rounds timed at load" (#2257),
-the window width and the faults a wider window exposes, adapted to this stack (patch 0039 had set 16):
-
-- window_rows 16 -> 32. DFlash2 still drafts 7 a block, so rows past 8 serve context copies (file rewrites, quoted
-  context); the GB10 window and shared cost tables (0096) extend to the new widths by their measured fits.
-- Buffers.make takes `shared` outright. It told a shared window's scratch apart by `seg < rows`, which is false once
-  a stream's window is as wide as the shared window (32 and 32): the KDA projection buffer would shrink to 4 bytes
-  (upstream's fix), and, on this stack, part_chunks would fall to 0, quietly sending shared rounds off 0075/0088's
-  one-launch segment attention.
-- The follower's Scratch.sampled holds window_rows draws (was a fixed 16; a 32-row lone verify would overrun it).
-- --learn-conversations: window_rows joins the disk store's identity, since an image's head rows run a window past
-  its position; states kept at 16 rows are another store, not misread.
-
-Not taken: the load-time window pricing and NVFP4 expert race (upstream keeps DFlash2's shared prices, and 0096's
-are measured on this pair), 15-deep MTP chains (this recipe drafts with DFlash2), inline step ids (0031 already sends
-a step in one broadcast), TF_GLM_KV_HOST's list invalidation (not in this stack). Upstream #1779's shared reservation
-is not taken either: upstream turned it off for DFlash2 (cc2fa8d23, #2720), where a cut chance leaves a stream at
-no drafts while its peers decode.
-
-Co-authored-by: ashhart <71890694+ashhart@users.noreply.github.com>
 ---
  zig/src/families/glm/cuda_follow.zig |  2 +-
  zig/src/families/glm/cuda_state.zig  | 20 +++++++++++---------
@@ -44,13 +24,13 @@ index 55bb9b44c..ff9825e5a 100644
  
  /// One of rank 0's steps on this rank (`ids` its ids); false at the end step.
 diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
-index 7c750ba6a..10d16cb42 100644
+index 97b701bcf..ddd8a2bf9 100644
 --- a/zig/src/families/glm/cuda_state.zig
 +++ b/zig/src/families/glm/cuda_state.zig
 @@ -17,8 +17,9 @@ const kda_block = @import("cuda_kda_block.zig");
  
  /// A prompt chunk's rows (decode.PREFILL_ROWS).
- pub const prefill_rows = 4096;
+ pub const prefill_rows = 2048;
 -/// A decode window's rows (Engine's max_rows).
 -pub const window_rows = 16;
 +/// A decode window's rows (Engine's max_rows): the pending token and up to 31 drafts or copied tokens (upstream #2257's
@@ -125,5 +105,5 @@ index 61f8f7e1a..b84e78e90 100644
      const p = try probe(a, io, loaded.backend, e);
      const id = try cuda_disk.identityOf(a, io, ctx, o.dir, kernels, facts.items, p.hash);
 -- 
-2.43.0
+2.53.0
 

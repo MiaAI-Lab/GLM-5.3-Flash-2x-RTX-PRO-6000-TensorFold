@@ -1,5 +1,12 @@
 # Changelog
 
+- **2026-11-12** -- The stack on main now matches what this host's deployment has served since 2026-11-05: engine
+  patches 0094 (a prompt chunk takes 4096 rows) and 0095 (the drafter ingests a 4096-row chunk) are out — the running
+  images dropped both (98 patches at `de97bf59db4d`, 100 at today's tree), so prefill stays at 2,048-row chunks.
+  Patch 0107 (32-row decode windows) is rebased onto the stack without them: its `cuda_state.zig` hunk sat on 0094's
+  `prefill_rows = 4096` context line, and nothing else in the stack needed a change (107 of the remaining patches
+  apply untouched). Host suite green on the rebased engine tree (`.src/tf`, branch `deploy113`): 3,883 of 3,885, the
+  two fails predate all of this (the draft-sources head check and the exl3 scan-fault nondeterminism).
 - **2026-11-12** -- Engine patch 0113: a long chat no longer dies at its first turn with `PoolTooSmall`. The KV pool's
   pages are what the memory budget leaves, often fewer rows than the context window names, and a request whose prompt
   plus reply needed more pages than the whole pool holds was admitted only to be refused at its opening
