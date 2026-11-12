@@ -107,6 +107,44 @@
   unchanged), so `VISION=1` serves `video_url` parts instead of HTTP 500. README: the Ablit weights drop a digit when
   copying an id into schema-constrained JSON where the published weights do not (that recipe's issue 9), with the
   workaround (`ABLIT=0`, or thinking on for those requests).
+- **2026-11-05** -- Engine patch `0115` (first shipped that day as local patch `0100`, rebased onto the current stack;
+  it was `0099`'s companion on image `de97bf59db4d`), three defects of `0114` found on the live server, plus a rank
+  amendment: (1) a logprob-row take outside a prompt step (a verify, a shared round, the first token) gathered whole
+  rows through every rank, but only prompt steps told the other rank a collective was due, so it read logits as a
+  step header and both ranks stopped (`TooManyIds`); every take now goes out as a `logprob` step the ranks join (its
+  step kind lands after `disk`/`layout` in the rebased enum). (2) every requested id of a row scored the row's first
+  id's logprob and rank (the kernel indexed the id words by a stride the caller had already applied) and the last row
+  read past its buffer; each id takes its own word, slots past the row's width read as none. (3) `/v1/models`
+  `tokenizer_sha256` was 32 raw bytes inside the JSON string; hex now, and the build also names `engine_version`,
+  `git_commit`, `patches` (the Dockerfile's hash of `patches/engine`, passed to the engine as `-Dgit-commit` and
+  `-Dpatches`), `backend`, `compute_dtype`, the rope fields when the checkpoint config has them, and
+  `tokenizer_name`. Amendment (same day): a requested id's rank follows the best list's order (value desc, ties by
+  the lower id first), so an id inside the top-K reports the same rank as its top-K entry; before, two ids at one
+  position read 26 vs 24 and 93 vs 91. Kernel tests `topk-extras` (100 rows) and `topk` (1,008 rows, regression)
+  passed on GPU 0 from the `compile-cuda-tests` build; the host references in `sample_tests.zig` follow the same
+  rule. Verified live on image `de97bf59db4d` (the three acceptance bodies agree on every id inside the top-128 in
+  logprob and rank, pos2's four values are distinct, 154822 is scored at pos9 (rank 130420),
+  `prompt_logprobs_missing` is `[]`; regressions: a plain completion, `prompt_logprobs` alone, `echo` prefixing the
+  text, streamed chat with thinking on and off ending in `[DONE]`, a repeated 6,740-token chat request cached 6,144
+  with a byte-identical reply, and `/v1/models` `patches` `19c01c48633b3158` equal to the Dockerfile's hash). Two
+  findings on the side: raw `/v1/completions` prompts are never kept by the prompt cache (`kept 0` at 9,005 tokens,
+  with or without chat markers in the text) while chat prompts are, and neither patch touches the cache or the chunk
+  plan, so that predates them; `rope_original_context` stays absent because this checkpoint's config has no rope
+  scaling. The rebase onto the current stack merged two hunks additively (`cuda_native.zig`'s `kv_parts` beside
+  `checkpoint_digest`, `chat.zig`'s `think_off_split` beside the lp fields); the host suite is green on the rebased
+  tree. Engine tree: `.src/tf`, branch `deploy113`.
+- **2026-11-05** -- Engine patch `0114` (first shipped that day as local patch `0099`), prompt logprobs at fidelity
+  scale, for sparkDash's corpus scoring of a quantised build against its reference: the `prompt_logprobs` cap is 128
+  (was 20; `--prompt-logprobs-cap`), `prompt_logprobs_token_ids` (one flat list, or one list a position) scores the
+  request's own ids with logprob and rank beside the top-K (vLLM's `token_ids_logprob`),
+  `prompt_logprobs_format: "compact"` answers `{ids, logprobs, actual}` a position, the reply carries
+  `prompt_token_ids` and a top-level `prompt_logprobs_missing`, and `logprobs` or `echo` beside `prompt_logprobs`
+  are honored instead of refusing the whole call (`echo` repeats the prompt, streamed too). A `prompt_logprobs`
+  request keeps its full re-prefill, so a cached prefix cannot stale a row. `GET /v1/models` names the build to score
+  against: checkpoint path and content sha256, the checkpoint's own quantization and rope facts, kv dtype, tensor
+  parallel, speculative drafting, tokenizer sha256, whether a raw completion gets a BOS, and the effective cap;
+  `docker/Dockerfile` passes `-Dgit-commit` and `-Dpatches` so the image records the tree it built (this commit). The
+  API is documented in `docs/api.md`. Its live defects are fixed by `0115`.
 - **2026-11-04** -- CREDITS and NOTICE, the Aevonix entry corrected. The four serving scripts are that recipe's rework, which
   stands - but the entry now records where Aevonix's own scripts came from: their NOTICE takes `scripts/config.sh` and
   `start-tp4.sh` of this lab's GLM-5.3-Flash-EXL3-4x-DGX-Sparks-TensorFold (created 2026-10-01, the day before Aevonix's

@@ -1,0 +1,789 @@
+From 1b4c342989d8d9cf7a373c49d971922b18c0b9b2 Mon Sep 17 00:00:00 2001
+From: MiaAI_Lab <mia.ailab1@gmail.com>
+Date: Thu, 5 Nov 2026 16:30:55 +0200
+Subject: [PATCH] server: the lane's logprob takes on every rank, each
+ requested id its own logprob, and the build's own fields
+
+Three defects of 0099's prompt logprobs, found on the live 2x RTX PRO 6000 server on 2026-11-05:
+
+- glm cuda: a verify's, shared round's or first token's logprob-row take gathered whole rows through
+  every rank, but only prompt steps told the other ranks a collective was due - their next receive read
+  logits as the step header and both ranks stopped (TooManyIds). Every take now goes out as a logprob
+  step (kind, the rows or, shared, each part's) the other ranks join gather for gather.
+- lanes/kernels: a row's requested ids all scored the row's first id's logprob and rank: the kernel
+  indexed the id words by the stride the caller had already advanced past. Each id takes its own word
+  now; slots past the row's width read as none, so the last row no longer reads past the buffer.
+- server: /v1/models' tokenizer_sha256 was 32 raw bytes inside the JSON string; it is hex now, and the
+  build names its release, commit, patch stack and backend, the checkpoint's compute dtype (the model
+  config's own field first), rope theta, scaling and original context, and the tokenizer's class.
+
+Tests: the two-rank glm-lanes-logprobs runner command (the combined call, a word-for-word repeat, and
+logprob streams beside plain ones in shared rounds, picks as the plain run's); topk-extras on the
+sample runner (each requested id its own logprob and rank, an id inside the best the best entry's own
+word less the normalizer, gaps and ids past the vocabulary none); the build facts' host test.
+---
+ zig/kernels/cuda/logprob_rows.cuh    |  37 ++++--
+ zig/src/families/glm/cuda_follow.zig |  29 ++++-
+ zig/src/families/glm/cuda_lanes.zig  |  48 +++++---
+ zig/src/server/health_test.zig       |  41 +++++++
+ zig/src/server/server.zig            |  56 ++++++++-
+ zig/tests/cuda/glm_lanes_tests.zig   | 167 +++++++++++++++++++++++++--
+ zig/tests/cuda/main.zig              |   4 +
+ zig/tests/cuda/sample_tests.zig      | 112 +++++++++++++++++-
+ 8 files changed, 450 insertions(+), 44 deletions(-)
+
+diff --git a/zig/kernels/cuda/logprob_rows.cuh b/zig/kernels/cuda/logprob_rows.cuh
+index ae2179697..2fa64b38c 100644
+--- a/zig/kernels/cuda/logprob_rows.cuh
++++ b/zig/kernels/cuda/logprob_rows.cuh
+@@ -32,7 +32,7 @@ __device__ __forceinline__ void lse_merge(float& m, float& s, float m2, float s2
+ __device__ __forceinline__ bool better(float v, unsigned i, float bv, unsigned bi) { return v > bv || (v == bv && i < bi); }
+ 
+ // One row: a fixed reduction tree (lane tree, then warp 0 over the warps), so a row's words never depend on timing.
+-// EX (null: none) holds the row's requested ids, one word each at EXEX j of EXTRA_STRIDE; each gets its logprob under
++// EX (null: none) holds the row's requested ids, `extra_stride` of them, one word each; each gets its logprob under
+ // the row's distribution and its vLLM rank; a gap or an out-of-range id writes nan and rank 0.
+ __device__ void logprob_row(const __nv_bfloat16* L, unsigned V, unsigned pick, unsigned k, bool rank, unsigned* out,
+                             const unsigned* ex, unsigned extra_stride) {
+@@ -102,11 +102,12 @@ __device__ void logprob_row(const __nv_bfloat16* L, unsigned V, unsigned pick, u
+         out[2 + 2 * LP_TOP] = 0;
+     }
+     if (ex != nullptr) {
+-        // Each requested id: its logprob under the row's distribution and the entries at or above it, one reduction
+-        // a id, the same fixed tree as the rank above, so the words never depend on timing.
++        // Each of the row's `extra_stride` requested ids: its logprob under the row's distribution and the entries at
++        // or above it, one reduction a id, the same fixed tree as the rank above, so the words never depend on
++        // timing; the row words' remaining slots read as none, their ids past the row's width.
+         const float lse = lse_val;
+         for (unsigned j = 0; j < LP_EXTRA; ++j) {
+-            const unsigned id = ex[static_cast<size_t>(j) * extra_stride];
++            const unsigned id = j < extra_stride ? ex[j] : LP_NONE;
+             unsigned* slot = out + LP_EXTRA_AT + 2 * j;
+             if (id == LP_NONE || id >= V) {
+                 if (t == 0) {
+@@ -116,19 +117,35 @@ __device__ void logprob_row(const __nv_bfloat16* L, unsigned V, unsigned pick, u
+                 continue;
+             }
+             const float v = __bfloat162float(L[id]);
+-            unsigned above = 0;
+-            for (unsigned i = t; i < V; i += TG) above += __bfloat162float(L[i]) >= v ? 1u : 0u;
++            // the id's rank as the best list below orders them (value desc, ties by the lower id first, the id
++            // itself counted): the entries at or above it less the equal-valued ones after it
++            unsigned above = 0, after = 0;
++            for (unsigned i = t; i < V; i += TG) {
++                const float x = __bfloat162float(L[i]);
++                above += x >= v ? 1u : 0u;
++                after += (x == v && i > id) ? 1u : 0u;
++            }
+ #pragma unroll
+-            for (int off = 16; off > 0; off >>= 1) above += __shfl_down_sync(FULL, above, off);
+-            if (lane == 0) part_i[warp] = above;
++            for (int off = 16; off > 0; off >>= 1) {
++                above += __shfl_down_sync(FULL, above, off);
++                after += __shfl_down_sync(FULL, after, off);
++            }
++            if (lane == 0) {
++                part_i[warp] = above;
++                part_s[warp] = __int_as_float((int)after);  // the lse's scratch, free since it was read
++            }
+             __syncthreads();
+             if (warp == 0) {
+                 above = part_i[lane];
++                unsigned after = (unsigned)__float_as_int(part_s[lane]);
+ #pragma unroll
+-                for (int off = 16; off > 0; off >>= 1) above += __shfl_down_sync(FULL, above, off);
++                for (int off = 16; off > 0; off >>= 1) {
++                    above += __shfl_down_sync(FULL, above, off);
++                    after += __shfl_down_sync(FULL, after, off);
++                }
+                 if (lane == 0) {
+                     slot[0] = __float_as_uint(v - lse);
+-                    slot[1] = above;
++                    slot[1] = above - after;
+                 }
+             }
+             __syncthreads();  // part_i is the selection rounds' scratch below
+diff --git a/zig/src/families/glm/cuda_follow.zig b/zig/src/families/glm/cuda_follow.zig
+index ff9825e5a..77d33f607 100644
+--- a/zig/src/families/glm/cuda_follow.zig
++++ b/zig/src/families/glm/cuda_follow.zig
+@@ -12,7 +12,7 @@ const pages_mod = @import("cuda_pages.zig");
+ const sparse = @import("cuda_sparse.zig");
+ const Engine = engine.Engine;
+ 
+-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, disk, layout };
++pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, disk, layout, logprob };
+ 
+ /// One step as it crosses: 64 bytes, then `n` u32 ids.
+ pub const Header = extern struct {
+@@ -316,6 +316,15 @@ pub const Leader = struct {
+         try x.e.prefillMany(parts, firsts);
+     }
+ 
++    /// The lane's logprob-row take (cuda_lanes takeRows) on every rank: the whole rows its kernels score are
++    /// gathered again, so the other ranks join each gather in the same order. `kind` 0 gathers the verify block's
++    /// first `rows` rows, 1 the shared block's parts (`parts` rows each, in part order), 2 the prompt's last row.
++    /// Rank 0 alone reads the words.
++    pub fn logprobTake(x: Leader, kind: u32, n: u32, parts: []const u32) !void {
++        try x.flush();
++        try x.send(.{ .kind = @backingInt(Kind.logprob), .flags = kind, .a = n }, parts);
++    }
++
+     /// The other ranks hear the keep with rank 0's next step (Link.keep_flag), or alone before any other step.
+     pub fn keep(x: Leader, n: usize) !void {
+         try x.flush();
+@@ -418,7 +427,7 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
+         try e.keep((h.flags >> 16) & 0xff);
+         h.flags &= 0xffff;
+     }
+-    if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many and kind != .idle and kind != .snapshots and kind != .pool and kind != .disk and kind != .layout) try e.bind(h.slot);
++    if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many and kind != .idle and kind != .snapshots and kind != .pool and kind != .disk and kind != .layout and kind != .logprob) try e.bind(h.slot);
+     e.prompt_logprobs = if (promptRows(h)) .{} else null;
+     e.structured = structuredStep(h); // rank 0 alone masks them
+     switch (kind) {
+@@ -502,6 +511,22 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
+         .snapshots => _ = try @import("cuda_snapshots.zig").agreeTiers(e, h.a, h.seed),
+         .disk => try @import("cuda_disk_ranks.zig").step(e, link, h, ids_in),
+         .layout => try checkLayout(e, h.a),
++        .logprob => { // the lane's logprob-row take: this rank's columns join its gathers, rank 0 alone reads them
++            const local = e.share.vocab.len();
++            switch (h.flags) {
++                0 => try e.smp.gather(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = e.bd.logits }}, @intCast(h.a), e.smp.full.ptr),
++                1 => {
++                    const b = e.bs orelse return error.NoSharedWindows;
++                    var at: usize = 0;
++                    for (ids_in) |rows| {
++                        try e.smp.gather(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = b.logits + at * local * 2 }}, @intCast(rows), e.smp.full.ptr);
++                        at += rows;
++                    }
++                },
++                2 => try e.smp.gather(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = e.bp.logits }}, 1, e.smp.full.ptr),
++                else => return error.BadStep,
++            }
++        },
+         .drop => for (ids_in) |id| e.dropState(id),
+         .release => e.release(h.slot),
+         .idle => cuda.tp_watch.sleep(e.io),
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index 42842547d..dd7c5806e 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -76,14 +76,25 @@ pub const Lanes = struct {
+         self.lanes.deinit(self.x.e.gpa);
+     }
+     /// A verify's or the first token's logprob rows: each part's rows gathered whole, their words read on the host,
+-    /// the rows made; the requested ids score prompt rows only, so these parts carry none.
+-    fn takeRows(self: *Lanes, parts: []const RowsPart) !void {
++    /// the rows made; the requested ids score prompt rows only, so these parts carry none. `src` says where the
++    /// rows lie, as the step to the other ranks names it (cuda_follow's logprob kind): they join every gather.
++    const TakeSrc = enum(u8) { verify = 0, shared = 1, first = 2 };
++    fn takeRows(self: *Lanes, src: TakeSrc, parts: []const RowsPart) !void {
+         const e = self.x.e;
+         if (self.rows_buf == null) {
+             self.rows_buf = try cuda.HostBuffer.allocMapped(e.d, engine.shared_rows * lanes.logprob.words * 4);
+             errdefer self.rows_buf = null;
+             self.rows_dev = try self.rows_buf.?.device();
+         }
++        switch (src) {
++            .shared => {
++                var rows: [engine.max_shared]u32 = undefined;
++                for (parts, 0..) |p, i| rows[i] = @intCast(p.rows);
++                try self.x.logprobTake(@intFromEnum(src), 0, rows[0..parts.len]);
++            },
++            .verify => try self.x.logprobTake(@intFromEnum(src), @intCast(parts[0].rows), &.{}),
++            .first => try self.x.logprobTake(@intFromEnum(src), 1, &.{}),
++        }
+         const words = lanes.logprob.words;
+         for (parts) |p| {
+             if (p.rows == 0) continue;
+@@ -103,7 +114,7 @@ pub const Lanes = struct {
+     /// The first token's row, from the prompt's last row still in bp (the next prompt pass would clobber it).
+     fn keepFirstRow(self: *Lanes, s: *lanes.Stream, l: *Lane, first: u32) !void {
+         var rows: [1]lanes.LogprobRow = undefined;
+-        try self.takeRows(&.{.{ .logits = self.x.e.bp.logits, .rows = 1, .sampled = &.{first}, .out = &rows, .k = s.logprobs.? }});
++        try self.takeRows(.first, &.{.{ .logits = self.x.e.bp.logits, .rows = 1, .sampled = &.{first}, .out = &rows, .k = s.logprobs.? }});
+         l.first_row = rows[0];
+     }
+ 
+@@ -554,7 +565,7 @@ pub const Lanes = struct {
+             const t0 = self.now();
+             try self.x.verify(ids[0..rows], sampled[0..rows], bits);
+             self.observe(l, w, ids[1..rows], sampled[0..rows], self.since(t0), true);
+-            if (o.rows.len > 0) try self.takeRows(&.{.{ .logits = self.x.e.bd.logits, .rows = rows, .sampled = sampled[0..rows], .out = o.rows, .k = w.stream.logprobs.? }});
++            if (o.rows.len > 0) try self.takeRows(.verify, &.{.{ .logits = self.x.e.bd.logits, .rows = rows, .sampled = sampled[0..rows], .out = o.rows, .k = w.stream.logprobs.? }});
+             @memcpy(o.sampled[0..rows], sampled[0..rows]);
+             @memcpy(o.drafts[0..drafts.len], drafts);
+             l.pending_rows = rows;
+@@ -592,28 +603,29 @@ pub const Lanes = struct {
+         const t0 = self.now();
+         try self.x.verifyShared(parts[0..windows.len]);
+         const ms = self.since(t0);
+-        if (self.x.e.bs != null) { // the asking streams' rows, each part's at its rows' offset in the shared words
+-            var row_parts: [engine.max_shared]RowsPart = undefined;
+-            var n: usize = 0;
+-            var at: usize = 0;
+-            const base = self.x.e.bs.?.logits;
+-            const local: u64 = self.x.e.share.vocab.len();
+-            for (windows, 0..) |w, k| {
+-                const rows = windows[k].rows();
+-                if (out[k].rows.len > 0) {
+-                    row_parts[n] = .{
++        if (self.x.e.bs != null) { // the asking streams' rows: every part's gathered, whichever asked, so the
++            // other ranks join the same gathers (cuda_follow's logprob step); the words of the rest are wasted
++            var asking = false;
++            for (out[0..windows.len]) |*o| asking = asking or o.rows.len > 0;
++            if (asking) {
++                var row_parts: [engine.max_shared]RowsPart = undefined;
++                var at: usize = 0;
++                const base = self.x.e.bs.?.logits;
++                const local: u64 = self.x.e.share.vocab.len();
++                for (windows, 0..) |w, k| {
++                    const rows = windows[k].rows();
++                    row_parts[k] = .{
+                         .logits = base + @as(u64, at) * local * 2,
+                         .rows = rows,
+                         .sampled = sampled[k][0..rows],
+                         .out = out[k].rows,
+-                        .k = w.stream.logprobs.?,
++                        .k = w.stream.logprobs orelse 0,
+                         .at = at,
+                     };
+-                    n += 1;
++                    at += rows;
+                 }
+-                at += rows;
++                try self.takeRows(.shared, row_parts[0..windows.len]);
+             }
+-            if (n > 0) try self.takeRows(row_parts[0..n]);
+         }
+         self.shared += 1;
+         for (windows, parts[0..windows.len], lane[0..windows.len]) |w, p, l| self.observe(l, w, p.ids[1..], p.out, ms, false);
+diff --git a/zig/src/server/health_test.zig b/zig/src/server/health_test.zig
+index 7b823bd39..2222a2f3d 100644
+--- a/zig/src/server/health_test.zig
++++ b/zig/src/server/health_test.zig
+@@ -539,3 +539,44 @@ fn responseLength(reply: []const u8) !usize {
+     while (lines.next()) |line| if (std.mem.startsWith(u8, line, "Content-Length: ")) return std.fmt.parseInt(usize, line[16..], 10);
+     return error.MissingContentLength;
+ }
++
++test "the build facts name the release and backend, hex the tokenizer digest and take the model's dtype and rope" {
++    const io = std.testing.io;
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data =
++        \\{"text_config":{"dtype":"bfloat16","rope_theta":10000,"rope_scaling":{"rope_type":"yarn","factor":16,"original_max_position_embeddings":65536}},"quantization_config":{"quant_method":"exl3","bits":4}}
++    });
++    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "[]" });
++    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data =
++        \\{"tokenizer_class":"TokenizersBackend","model_max_length":8}
++    });
++    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
++    var engine: Idle = .{};
++    var text: Bytes = .{};
++    const identity = build_identity.of(WithGpu, a, "9.8.7", 1);
++    const srv = try server.Server.init(std.testing.allocator, io, engine.engine(), text.text(), .{
++        .served_name = "m",
++        .model_ids = &.{"m"},
++        .model_dir = dir,
++        .identity = identity,
++        .kv_cache = "fp8",
++        .tensor_parallel = 2,
++    }, null);
++    defer srv.deinit();
++    const b = srv.build.?.object;
++    try std.testing.expectEqualStrings("9.8.7", b.get("engine_version").?.string);
++    try std.testing.expectEqualStrings("cuda", b.get("backend").?.string);
++    try std.testing.expect(b.get("git_commit") == null and b.get("patches") == null); // a plain build records neither
++    try std.testing.expectEqualStrings("bfloat16", b.get("compute_dtype").?.string);
++    try std.testing.expectEqual(@as(i64, 10000), b.get("rope_theta").?.int64().?);
++    try std.testing.expectEqual(@as(i64, 65536), b.get("rope_scaling").?.object.get("original_max_position_embeddings").?.int64().?);
++    try std.testing.expectEqual(@as(i64, 65536), b.get("rope_original_context").?.int64().?);
++    try std.testing.expectEqualStrings("TokenizersBackend", b.get("tokenizer_name").?.string);
++    const sha = b.get("tokenizer_sha256").?.string;
++    try std.testing.expectEqual(@as(usize, 64), sha.len);
++    for (sha) |c| try std.testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
++}
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index a822995d8..40821bd9c 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -252,10 +252,19 @@ pub const Server = struct {
+             .err => return null,
+         };
+         const o = json.newObject(a) catch return null;
++        const id = srv.config.identity;
++        for ([_][2][]const u8{
++            .{ "engine_version", id.version },
++            .{ "git_commit", id.commit },
++            .{ "patches", id.patches },
++            .{ "backend", id.backend },
++        }) |field| if (field[1].len > 0) o.put(a, field[0], .{ .string = field[1] }) catch return null;
+         if (cfg.get("quantization_config")) |q| if (q == .object) o.put(a, "quantization", q) catch return null; // format and bit/group settings as the checkpoint states them
+-        if (cfg.get("torch_dtype")) |t| if (t == .string) o.put(a, "compute_dtype", t) catch return null;
+-        if (cfg.get("rope_theta")) |t| if (t == .int or t == .float) o.put(a, "rope_theta", t) catch return null;
+-        if (cfg.get("rope_scaling")) |t| if (t == .object) o.put(a, "rope_scaling", t) catch return null;
++        if (dtypeOf(cfg)) |t| if (t == .string) o.put(a, "compute_dtype", t) catch return null;
++        const model = modelConfig(cfg);
++        if (model.get("rope_theta")) |t| if (t == .int or t == .float) o.put(a, "rope_theta", t) catch return null;
++        if (model.get("rope_scaling")) |t| if (t == .object) o.put(a, "rope_scaling", t) catch return null;
++        if (originalContext(model)) |t| o.put(a, "rope_original_context", t) catch return null;
+         o.put(a, "checkpoint", .{ .string = srv.config.model_dir }) catch return null;
+         if (srv.info.checkpoint_digest[0] != 0) o.put(a, "checkpoint_sha256", .{ .string = &srv.info.checkpoint_digest }) catch return null;
+         if (srv.config.kv_cache.len > 0) o.put(a, "kv_cache_dtype", .{ .string = srv.config.kv_cache }) catch return null;
+@@ -269,12 +278,51 @@ pub const Server = struct {
+             if (d.name.len > 0) spec.put(a, "name", .{ .string = d.name }) catch return null;
+         }
+         o.put(a, "speculative", .{ .object = spec }) catch return null;
+-        if (tokHash(srv, a)) |sha| o.put(a, "tokenizer_sha256", .{ .string = a.dupe(u8, &sha) catch return null }) catch return null;
++        if (tokHash(srv, a)) |sha| {
++            const hex = std.fmt.bytesToHex(sha, .lower);
++            o.put(a, "tokenizer_sha256", .{ .string = a.dupe(u8, &hex) catch return null }) catch return null;
++        }
++        if (tokenizerName(srv, a)) |name| o.put(a, "tokenizer_name", .{ .string = name }) catch return null;
+         o.put(a, "prompt_bos", .{ .bool = promptBos(srv, a) }) catch return null;
+         o.put(a, "prompt_logprobs_cap", json.intValue(a, @min(srv.config.prompt_logprobs_cap, api.logprob_max)) catch return null) catch return null;
+         return .{ .object = o };
+     }
+ 
++    /// The checkpoint's own config beside its `text_config`/`llm_config` wrapper, where the model's fields live.
++    fn modelConfig(cfg: Value) Value {
++        for ([_]?Value{ cfg.get("text_config"), cfg.get("llm_config") }) |part| if (part) |p| if (p == .object) return p;
++        return cfg;
++    }
++
++    /// The checkpoint's compute dtype: `torch_dtype` or `dtype`, the model's config first, the wrapper's next.
++    fn dtypeOf(cfg: Value) ?Value {
++        const model = modelConfig(cfg);
++        for ([_][]const u8{ "torch_dtype", "dtype" }) |name| {
++            if (model.get(name)) |t| if (t == .string) return t;
++            if (cfg.get(name)) |t| if (t == .string) return t;
++        }
++        return null;
++    }
++
++    /// The context a rope scaling scales from: the config's `original_max_position_embeddings`, or the scaling's own.
++    fn originalContext(model: Value) ?Value {
++        if (model.get("original_max_position_embeddings")) |t| if (t == .int or t == .float) return t;
++        if (model.get("rope_scaling")) |scaling| if (scaling == .object) if (scaling.get("original_max_position_embeddings")) |t| if (t == .int or t == .float) return t;
++        return null;
++    }
++
++    /// The tokenizer class the checkpoint's `tokenizer_config.json` names; null without the file or the field.
++    fn tokenizerName(srv: *Server, a: Allocator) ?[]const u8 {
++        const path = std.fs.path.join(a, &.{ srv.config.model_dir, "tokenizer_config.json" }) catch return null;
++        const text = std.Io.Dir.cwd().readFileAlloc(srv.io, path, a, .limited(4 << 20)) catch return null;
++        const cfg = switch (json.parse(a, text) catch return null) {
++            .ok => |v| v,
++            .err => return null,
++        };
++        const name = cfg.get("tokenizer_class") orelse return null;
++        return if (name == .string and name.string.len > 0) name.string else null;
++    }
++
+     /// sha256 of the checkpoint's tokenizer.json, the vocabulary's own bytes; null without the file.
+     fn tokHash(srv: *Server, a: Allocator) ?[32]u8 {
+         const path = std.fs.path.join(a, &.{ srv.config.model_dir, "tokenizer.json" }) catch return null;
+diff --git a/zig/tests/cuda/glm_lanes_tests.zig b/zig/tests/cuda/glm_lanes_tests.zig
+index 07bac919a..367931bfc 100644
+--- a/zig/tests/cuda/glm_lanes_tests.zig
++++ b/zig/tests/cuda/glm_lanes_tests.zig
+@@ -119,7 +119,7 @@ pub fn coverCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c
+             try c.same(try std.fmt.allocPrint(a, "resumed at {d}, against the fresh pass", .{at}), got, fresh.ids, .length);
+             const plain = try c.run(.{ .prompt = copy_prompt, .max_new = 64, .drafts = false, .reuse = .{ .saved = kept, .at = at } });
+             try c.same("cached drafted against cached plain", got, plain.ids, .length);
+-            const cached = try c.together(&.{ .{ .p = 0, .reuse = .{ .saved = kept, .at = at } }, .{ .p = 0, .reuse = .{ .saved = kept, .at = at } } }, &.{copy_prompt}, &.{.{ .seed = 1234 }}, 64);
++            const cached = try c.together(&.{ .{ .p = 0, .reuse = .{ .saved = kept, .at = at } }, .{ .p = 0, .reuse = .{ .saved = kept, .at = at } } }, &.{copy_prompt}, &.{.{ .seed = 1234 }}, 64, null);
+             for (cached.ids) |ids| try c.expect(std.mem.eql(u32, ids, fresh.ids), "cached concurrent equals fresh solo at {d}", .{at});
+         }
+         const other = try std.mem.concat(a, u32, &.{ copy_prompt[0..4096], p[0..300] });
+@@ -198,7 +198,7 @@ pub fn concurrentCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, ra
+         .{ .name = "sampled, prompts a chunk at a time", .joins = &.{ .{ .p = 0, .sampled = true }, .{ .p = 1, .at = 2, .sampled = true, .filled = true }, .{ .p = 2, .at = 4, .sampled = true, .filled = true } } },
+     };
+     for (cases) |cs| {
+-        const got = try c.together(cs.joins, ps, seeds[0..], n);
++        const got = try c.together(cs.joins, ps, seeds[0..], n, null);
+         most = @max(most, got.most);
+         for (cs.joins, got.ids, 0..) |j, ids, i| {
+             if (j.discard_at != null or j.p >= P) continue;
+@@ -367,7 +367,10 @@ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank:
+ }
+ 
+ /// A concurrent case's stream: prompt `p` joining at round `at`; `filled`: its prompt a chunk at a time between rounds.
+-const Join = struct { p: usize, at: u32 = 0, sampled: bool = false, discard_at: ?u32 = null, filled: bool = false, reuse: lanes.stream.Reuse = .{} };
++const Join = struct { p: usize, at: u32 = 0, sampled: bool = false, discard_at: ?u32 = null, filled: bool = false, reuse: lanes.stream.Reuse = .{}, lp: bool = false };
++
++/// The padded ids the together streams score beside their prompt rows, when their Join asks (`lp`).
++const LpIds = struct { ids: []const u32, stride: u32 };
+ 
+ /// A mark hook that keeps the state as the lane host's prompt cache does (cuda_native's snap_save).
+ const Keeper = struct {
+@@ -413,24 +416,73 @@ const Cover = struct {
+         copies: bool = false, // the server's proposer
+         cancel: ?*Cut = null,
+         reuse: lanes.stream.Reuse = .{},
++        logprobs: u8 = 0, // with the prompt side: the row takes the follower must join (cuda_follow's logprob step)
++        prompt_logprobs: u8 = 0,
++        prompt_ids: []const u32 = &.{}, // the padded per-position ids; entry 0 of row r scores prompt token r + 1
++        prompt_ids_stride: u32 = 0,
++    };
++
++    /// The run's logprob rows, as the stream's own arrays hold them: logprobs as bits, ranks plain.
++    const Lp = struct {
++        reply: []const u32,
++        prompt: []const u32,
++        prompt_ranks: []const u32,
++        extra: []const u32,
++        extra_ranks: []const u32,
++        stride: u32,
+     };
+-    const Got = struct { ids: []const u32, reason: lanes.stream.Reason, rounds: u64, judged: i64, copied: i64, cached: u32 };
++
++    const Got = struct { ids: []const u32, reason: lanes.stream.Reason, rounds: u64, judged: i64, copied: i64, cached: u32, lp: ?Lp = null };
++
++    fn bitsOf(a: std.mem.Allocator, rows: []const lanes.logprob.Row) ![]u32 {
++        const out = try a.alloc(u32, rows.len);
++        for (rows, out) |r, *o| o.* = @bitCast(r.logprob);
++        return out;
++    }
+ 
+     /// One request through the shared lanes.Engine, as the server's lane host runs it.
+     fn run(c: *Cover, ask: Ask) !Got {
+         var lookup = try lanes.SuffixLookup.init(c.gpa, .{ .min_match = 4 });
+         defer lookup.deinit();
+-        var s = try lanes.Stream.init(c.gpa, .{ .id = "cover", .prompt = ask.prompt, .max_new = ask.max_new, .eos = ask.eos, .drafts = ask.drafts, .sampling = ask.sampling, .proposer = if (ask.copies) lookup.proposer() else null, .cancel_check = if (ask.cancel) |cut| .{ .ptr = cut, .check = Cut.check } else null, .reuse = ask.reuse });
++        var s = try lanes.Stream.init(c.gpa, .{
++            .id = "cover",
++            .prompt = ask.prompt,
++            .max_new = ask.max_new,
++            .eos = ask.eos,
++            .drafts = ask.drafts,
++            .sampling = ask.sampling,
++            .proposer = if (ask.copies) lookup.proposer() else null,
++            .cancel_check = if (ask.cancel) |cut| .{ .ptr = cut, .check = Cut.check } else null,
++            .reuse = ask.reuse,
++            .logprobs = if (ask.logprobs > 0) ask.logprobs else null,
++            .prompt_logprobs = if (ask.prompt_logprobs > 0) ask.prompt_logprobs else null,
++            .prompt_ids = ask.prompt_ids,
++            .prompt_ids_stride = ask.prompt_ids_stride,
++        });
+         defer s.deinit(c.gpa);
+         try c.le.addStream(&s);
+         while (c.le.activeCount() > 0) try c.le.step();
+-        return .{ .ids = try c.a.dupe(u32, s.emitted()), .reason = s.reason, .rounds = s.rounds, .judged = lookup.judged_tokens, .copied = lookup.accepted_tokens, .cached = s.cached };
++        const lp: ?Lp = if (ask.logprobs > 0 or ask.prompt_logprobs > 0) blk: {
++            const extra = try c.a.alloc(u32, s.prompt_extra_logprobs.items.len);
++            for (s.prompt_extra_logprobs.items, extra) |x, *o| o.* = @bitCast(x);
++            const ranks = try c.a.alloc(u32, s.prompt_rows.items.len);
++            for (s.prompt_rows.items, ranks) |row, *o| o.* = row.rank;
++            break :blk .{
++                .reply = try bitsOf(c.a, s.rows.items),
++                .prompt = try bitsOf(c.a, s.prompt_rows.items),
++                .prompt_ranks = ranks,
++                .extra = extra,
++                .extra_ranks = try c.a.dupe(u32, s.prompt_extra_ranks.items),
++                .stride = s.prompt_ids_stride,
++            };
++        } else null;
++        return .{ .ids = try c.a.dupe(u32, s.emitted()), .reason = s.reason, .rounds = s.rounds, .judged = lookup.judged_tokens, .copied = lookup.accepted_tokens, .cached = s.cached, .lp = lp };
+     }
+ 
+     const Together = struct { ids: []const []const u32, rounds: []const u64, most: usize, shared: u32, between: u32 };
+ 
+     /// The streams of `joins` through the rounds together, each joining at its round; how many were live at once.
+-    fn together(c: *Cover, joins: []const Join, ps: []const []const u32, seeds: []const lanes.Sampling, max_new: u32) !Together {
++    fn together(c: *Cover, joins: []const Join, ps: []const []const u32, seeds: []const lanes.Sampling, max_new: u32, lp: ?LpIds) !Together {
+         const ss = try c.a.alloc(lanes.Stream, joins.len);
+         const made = try c.a.alloc(bool, joins.len);
+         @memset(made, false);
+@@ -444,7 +496,17 @@ const Cover = struct {
+         var began = false;
+         while (true) : (round += 1) {
+             for (joins, ss, made) |j, *s, *m| if (!m.* and j.at <= round) {
+-                s.* = try lanes.Stream.init(c.gpa, .{ .id = "joined", .prompt = ps[j.p], .max_new = max_new, .reuse = j.reuse, .sampling = if (j.sampled) seeds[j.p % seeds.len] else null });
++                s.* = try lanes.Stream.init(c.gpa, .{
++                    .id = "joined",
++                    .prompt = ps[j.p],
++                    .max_new = max_new,
++                    .reuse = j.reuse,
++                    .sampling = if (j.sampled) seeds[j.p % seeds.len] else null,
++                    .logprobs = if (j.lp) 2 else null,
++                    .prompt_logprobs = if (j.lp) 2 else null,
++                    .prompt_ids = if (j.lp) (if (lp) |x| x.ids else &.{}) else &.{},
++                    .prompt_ids_stride = if (j.lp) (if (lp) |x| x.stride else 0) else 0,
++                });
+                 m.* = true;
+                 if (j.filled) try filling.append(c.gpa, s) else try c.le.addStream(s);
+             };
+@@ -522,3 +584,92 @@ fn sharedEnvIs(name: [*:0]const u8, want: []const u8) bool {
+     const v = std.c.getenv(name) orelse return false;
+     return std.mem.eql(u8, std.mem.span(v), want);
+ }
++/// `glm-lanes-logprobs`: reply and prompt logprobs beside requested ids on one lanes.Engine across the ranks. The
++/// follower joins every row-take gather (cuda_follow's logprob step) in the verify, shared and first-row takes; the
++/// picks match the plain run, a requested id that is the row's own token scores the row's own words, and a repeat,
++/// and shared rounds beside plain streams, hold word for word.
++pub fn logprobsCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_int, world: c_int, id_path: []const u8) !void {
++    const glm = @import("glm_cuda");
++    var arena = std.heap.ArenaAllocator.init(gpu.gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const dc = try std.json.parseFromSliceLeaky(struct { capacity: usize = 8192 }, a, try std.Io.Dir.cwd().readFileAlloc(gpu.io, dc_path, a, .limited(1 << 26)), .{ .ignore_unknown_fields = true });
++    var lib = try cuda.nccl.Library.open();
++    defer lib.close();
++    const comm = try openComm(gpu, &lib, rank, world, id_path);
++    defer _ = lib.api.ncclCommDestroy(comm);
++    var problem: []const u8 = "";
++    const set = glm.ranks.Settings.read(&glm.ranks.environment, &problem) catch |err| {
++        std.debug.print("REFUSE {s}\n", .{problem});
++        return err;
++    };
++    const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = dc.capacity, .drafts = true, .settings = set });
++    defer e.deinit();
++    var link = try glm.follow.Link.init(gpu.gpa, gpu.d, &lib, comm, e.stream, dc.capacity);
++    defer link.deinit();
++    if (rank != 0) {
++        try glm.follow.follow(e, &link);
++        check.pass("rank {d} followed rank 0's logprob takes to the end, verify, shared and first-row alike", .{rank});
++        return;
++    }
++    var gl: glm.lanes.Lanes = .{ .x = .{ .e = e, .link = &link } };
++    defer gl.deinit();
++    var cfg = try lanes.Config.init(gpu.gpa, gl.facts(), glm.lanes.max_rows, glm.lanes.max_rows - 1);
++    defer cfg.deinit(gpu.gpa);
++    var wall: lanes.backend.WallClock = .{ .io = gpu.io };
++    var le = lanes.Engine.init(gpu.gpa, &cfg, gl.backend(), wall.clock());
++    defer le.deinit();
++    defer gl.x.end() catch {};
++    var c: Cover = .{ .gpa = gpu.gpa, .a = a, .le = &le };
++
++    const len = 1025;
++    const far: u32 = 4096; // a second id every prompt row scores beside its own token
++    const p = try a.alloc(u32, len);
++    for (p, 0..) |*u, i| u.* = @intCast(i % e.c.vocab);
++    const stride: u32 = 2;
++    const ids = try a.alloc(u32, (len - 1) * @as(usize, stride));
++    for (0..len - 1) |r| {
++        ids[2 * r] = p[r + 1];
++        ids[2 * r + 1] = far;
++    }
++    const finite = struct {
++        fn go(bits: u32) bool {
++            return (bits >> 23) & 0xFF != 0xFF; // f32: an all-ones exponent is infinite or nan
++        }
++    }.go;
++
++    const solo = try c.run(.{ .prompt = p, .max_new = 8 });
++    const ask: Cover.Ask = .{ .prompt = p, .max_new = 8, .logprobs = 2, .prompt_logprobs = 2, .prompt_ids = ids, .prompt_ids_stride = stride };
++    const once = try c.run(ask);
++    try c.expect(std.mem.eql(u32, once.ids, solo.ids), "the logprob takes change no pick ({d} vs {d} ids)", .{ once.ids.len, solo.ids.len });
++    const lp = once.lp.?;
++    try c.expect(lp.reply.len == once.ids.len, "every reply token has a row ({d} of {d})", .{ lp.reply.len, once.ids.len });
++    try c.expect(lp.prompt.len == len - 1, "every prompt token past the first has a row ({d} of {d})", .{ lp.prompt.len, len - 1 });
++    try c.expect(lp.extra.len == 2 * (len - 1) and lp.stride == 2, "the requested ids' words follow the stride ({d} entries, stride {d})", .{ lp.extra.len, lp.stride });
++    for (lp.reply, 0..) |bits, i| try c.expect(finite(bits), "reply row {d}'s logprob is finite ({x})", .{ i, bits });
++    for (lp.prompt, 0..) |bits, r| {
++        try c.expect(finite(bits), "prompt row {d}'s logprob is finite ({x})", .{ r, bits });
++        try c.expect(bits == lp.extra[2 * r], "prompt row {d}: its own token's extra logprob {x} equals the row's {x}", .{ r, lp.extra[2 * r], bits });
++        try c.expect(finite(lp.extra[2 * r + 1]), "prompt row {d}: the far id's logprob is finite ({x})", .{ r, lp.extra[2 * r + 1] });
++    }
++
++    // the repeat: the same request again, word for word (the prompt pass starts afresh beside prompt_logprobs)
++    const twice = try c.run(ask);
++    try c.expect(std.mem.eql(u32, twice.ids, once.ids), "the repeat picks the same tokens", .{});
++    const lp2 = twice.lp.?;
++    try c.expect(std.mem.eql(u32, lp2.reply, lp.reply) and std.mem.eql(u32, lp2.prompt, lp.prompt) and
++        std.mem.eql(u32, lp2.extra, lp.extra) and std.mem.eql(u32, lp2.extra_ranks, lp.extra_ranks), "the repeat's rows are word for word", .{});
++
++    // shared rounds: logprob streams beside plain ones, then every stream asking, each against the solo picks
++    const lpid: LpIds = .{ .ids = ids, .stride = stride };
++    for ([_]struct { name: []const u8, joins: [3]Join }{
++        .{ .name = "two asking beside a plain one", .joins = .{ .{ .p = 0, .lp = true }, .{ .p = 0 }, .{ .p = 0, .lp = true } } },
++        .{ .name = "every stream asking", .joins = .{ .{ .p = 0, .lp = true }, .{ .p = 0, .lp = true }, .{ .p = 0, .lp = true } } },
++    }) |case| {
++        const got = try c.together(&case.joins, &.{p}, &.{}, 8, lpid);
++        try c.expect(got.most >= 2 and got.shared > 0, "{s}: the round shared windows ({d} at once, {d} shared rounds)", .{ case.name, got.most, got.shared });
++        for (got.ids) |one| try c.expect(std.mem.eql(u32, one, solo.ids), "{s}: the shared stream's picks equal the solo run's", .{case.name});
++    }
++    try c.expect(!c.failed, "the logprob takes held on every rank", .{});
++    check.pass("logprobs across {d} ranks: the combined call's rows, the shared takes and the repeat hold, picks as the plain run's", .{world});
++}
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index 0860b1de9..6dffd0f3c 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -168,6 +168,7 @@ const usage =
+     \\  gdn-prep                  Gated DeltaNet conv, norms, g and beta against float64 (synthetic)
+     \\  qk-rows                   QK norm, RoPE and the cache write against float64 references (synthetic)
+     \\  sample                    sample.cu's keyed draws against the Metal rule's host references (synthetic rows)
++    \\  topk-extras               tf_logprob_rows' requested ids: each its own logprob and rank, beside the best
+     \\  glue                      Nemotron's glue kernels against their host references at its shapes (synthetic rows)
+     \\  lfm2-kernels              LFM2's glue kernels against their host references at d1's shapes (synthetic rows)
+     \\  pocket [reps]             the pocket's two kernels against tf_pocket_rows byte for byte; reps > 0 times them too
+@@ -247,6 +248,7 @@ const usage =
+     \\  glm-index-check           GLM's indexer with glm_index against tf_glm_scores and tf_glm_select_rows, byte for byte (one GPU)
+     \\  glm-ref                   GLM projections (matmuls, router, attention, indexer, hc) against float64 (synthetic)
+     \\  glm-lanes-cover <ckpt> <dc.json> <rank> <world> <idfile>  copy drafts, cancels, discards, eos and max_new on one lanes.Engine across requests
++    \\  glm-lanes-logprobs <ckpt> <dc.json> <rank> <world> <idfile>  reply and prompt logprobs beside requested ids on one lanes.Engine, both ranks
+     \\  glm-lanes-concurrent <ckpt> <dc.json> <rank> <world> <idfile>  concurrent streams on one lanes.Engine, each against its solo run
+     \\  glm-shared-check <ckpt> <dc.json> <rank> <world> <idfile>  shared verify windows against lone twins, logits and states byte for byte
+     \\  glm-pair-check <ckpt> <dc.json> <rank> <world> <idfile>  paired prompt steps against twins a chunk a step, logits and states byte for byte
+@@ -403,6 +405,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "exl3-tp2")) return exl3_tp2_tests.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) rest[2] else "none");
+     if (std.mem.eql(u8, cmd, "sample")) return sample_tests.draws(gpu);
+     if (std.mem.eql(u8, cmd, "topk")) return sample_tests.topk(gpu);
++    if (std.mem.eql(u8, cmd, "topk-extras")) return sample_tests.extras(gpu);
+     if (std.mem.eql(u8, cmd, "q35-argmax")) return sample_tests.q35Argmax(gpu);
+     if (std.mem.eql(u8, cmd, "norms")) return norms_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "norm-rows")) return norm_rows_tests.run(gpu);
+@@ -474,6 +477,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "dense-rows")) return dense_rows_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "train-pack")) return train_pack.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) try std.fmt.parseInt(usize, rest[2], 10) else 24);
+     if (std.mem.eql(u8, cmd, "glm-lanes-cover")) return glm_lanes_tests.coverCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
++    if (std.mem.eql(u8, cmd, "glm-lanes-logprobs")) return glm_lanes_tests.logprobsCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
+     if (std.mem.eql(u8, cmd, "glm-paged-check")) return glm_paged_tests.pagedCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
+     if (std.mem.eql(u8, cmd, "glm-kv-shard-check")) return glm_kv_shard_check.shardCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
+     if (std.mem.eql(u8, cmd, "glm-shared-check")) return glm_lanes_tests.sharedCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
+diff --git a/zig/tests/cuda/sample_tests.zig b/zig/tests/cuda/sample_tests.zig
+index a260b213d..ea4e16625 100644
+--- a/zig/tests/cuda/sample_tests.zig
++++ b/zig/tests/cuda/sample_tests.zig
+@@ -169,7 +169,8 @@ pub fn topk(gpu: Gpu) !void {
+     var stream = try cuda.Stream.init(gpu.d, true);
+     defer stream.deinit();
+     const n_rows = 7;
+-    const lp_words = 3 + 2 * 20;
++    const lp_words = lanes.logprob.words;
++    const lp_top = lanes.logprob.max_top;
+     const widths = [_]usize{ 248320, 131072, 4097, 4096, 100, 10 };
+     const ks = [_]u8{ 1, 16, 20 };
+     const most = widths[0];
+@@ -212,7 +213,7 @@ pub fn topk(gpu: Gpu) !void {
+                 const w = want[r * lp_words ..][0..lp_words];
+                 const g = got[r * lp_words ..][0..lp_words];
+                 cases += 1;
+-                if (!std.mem.eql(u32, w[2..][0..k], g[2..][0..k]) or !std.mem.eql(u32, w[22..][0..k], g[22..][0..k])) {
++                if (!std.mem.eql(u32, w[2..][0..k], g[2..][0..k]) or !std.mem.eql(u32, w[2 + lp_top..][0..k], g[2 + lp_top..][0..k])) {
+                     differ += 1;
+                     std.debug.print("DIFFER {s}{s} width {d} k {d} row {d}: first ids {d} / {d}\n", .{ @tagName(kind), if (odd) " inf+nan" else "", n, k, r, w[2], g[2] });
+                 }
+@@ -224,6 +225,113 @@ pub fn topk(gpu: Gpu) !void {
+     check.pass("topk: {d} rows equal tf_logprob_rows' k best", .{cases});
+ }
+ 
++/// tf_logprob_rows' requested ids (the server's prompt_logprobs_token_ids): an id inside the row's best carries the
++/// best entry's logprob word for word and the rank the host counts, ids past the best their own, two of them never
++/// the same, a gap and an id past the vocabulary read as none, and every row its own ids.
++pub fn extras(gpu: Gpu) !void {
++    const gpa = gpu.gpa;
++    var m = try cuda.Module.load(gpu.d, cuda.kernels.sample);
++    defer m.unload();
++    const d = try cuda.sample.Draws.resolve(m);
++    var stream = try cuda.Stream.init(gpu.d, true);
++    defer stream.deinit();
++    const words = lanes.logprob.words;
++    const none = lanes.logprob.extra_none;
++    const stride = 6; // the row's best two, two past them, a gap, an id past the vocabulary
++    const n_rows = 5;
++    const widths = [_]usize{ 4096, 1009, 128 };
++    const k = 8;
++    const most = widths[0];
++    const host = try gpa.alloc(u16, n_rows * most);
++    defer gpa.free(host);
++    const wide = try gpa.alloc(f32, n_rows * most);
++    defer gpa.free(wide);
++    var logits = try cuda.DeviceBuffer.alloc(gpu.d, n_rows * most * 2);
++    defer logits.free();
++    var picks = try cuda.DeviceBuffer.alloc(gpu.d, n_rows * 4);
++    defer picks.free();
++    var ids = try cuda.DeviceBuffer.alloc(gpu.d, n_rows * stride * 4);
++    defer ids.free();
++    var want_dev = try cuda.DeviceBuffer.alloc(gpu.d, n_rows * words * 4);
++    defer want_dev.free();
++    var got_dev = try cuda.DeviceBuffer.alloc(gpu.d, n_rows * words * 4);
++    defer got_dev.free();
++    var cases: usize = 0;
++    for (widths) |n| for (std.enums.values(Kind), 0..) |kind, ki| for ([_]bool{ false, true }) |odd| {
++        for (0..n_rows) |r| {
++            const row = host[r * n ..][0..n];
++            fill(kind, ki * 41 + r + n, row, wide[r * n ..][0..n]);
++            if (odd) for (row, 0..) |*h, i| {
++                if (i % 5 == 1) h.* = 0xFF80 else if (i % 13 == 3) h.* = 0x7FC0;
++            };
++        }
++        try logits.uploadAsync(0, std.mem.sliceAsBytes(host[0 .. n_rows * n]), stream.handle);
++        // a first pass names each row's best: the ids the second pass must score beside its own
++        const pick = try gpa.alloc(u32, n_rows);
++        defer gpa.free(pick);
++        for (0..n_rows) |r| pick[r] = @intCast((r * 7 + 3) % n);
++        try picks.uploadAsync(0, std.mem.sliceAsBytes(pick), stream.handle);
++        try d.logprobRows(stream, logits.ptr, n, picks.ptr, k, true, want_dev.ptr, n_rows, 0, 0);
++        try stream.synchronize();
++        var want: [n_rows * words]u32 = undefined;
++        try want_dev.download(0, std.mem.sliceAsBytes(&want));
++        const matrix = try gpa.alloc(u32, n_rows * stride);
++        defer gpa.free(matrix);
++        for (0..n_rows) |r| {
++            const row = host[r * n ..][0..n];
++            const best = want[r * words + 2 ..][0..k];
++            const at = r * stride;
++            matrix[at] = best[0];
++            matrix[at + 1] = best[1];
++            var got: usize = 2;
++            for (0..n) |i| { // two ids past the best, their values finite (a flat row's own logprobs tie, as they must)
++                const v = widen(row[i]);
++                if (v != v or v == -std.math.inf(f32)) continue;
++                if (std.mem.indexOfScalar(u32, best, @intCast(i)) != null) continue;
++                matrix[at + got] = @intCast(i);
++                got += 1;
++                if (got == 4) break;
++            }
++            try check.expect(got == 4, "row {d} of width {d}: no two finite ids past the best", .{ r, n });
++            matrix[at + 4] = none;
++            matrix[at + 5] = @intCast(n);
++        }
++        try ids.uploadAsync(0, std.mem.sliceAsBytes(matrix), stream.handle);
++        try d.logprobRows(stream, logits.ptr, n, picks.ptr, k, true, got_dev.ptr, n_rows, ids.ptr, stride);
++        try stream.synchronize();
++        var got_words: [n_rows * words]u32 = undefined;
++        try got_dev.download(0, std.mem.sliceAsBytes(&got_words));
++        for (0..n_rows) |r| {
++            const row = host[r * n ..][0..n]; // the kernel's view: bf16, widened on comparison
++            const lse: f32 = @bitCast(got_words[r * words]);
++            if (!std.math.isFinite(lse)) continue; // a NaN entry's row: its normalizer is NaN, only the ids are checked
++            const w = got_words[r * words ..][0..words];
++            for (0..stride) |j| {
++                const id = matrix[r * stride + j];
++                const lp_bits = w[lanes.logprob.extra_at + 2 * j];
++                const rank = w[lanes.logprob.extra_at + 2 * j + 1];
++                if (j >= 4) { // the gap and the id past the vocabulary: no rank, either quiet or plain nan
++                    try check.expect(rank == 0 and (lp_bits == 0x7FC00000 or lp_bits == 0xFFC00000), "row {d} slot {d}: a gap reads rank 0 and nan, got {x}/{d}", .{ r, j, lp_bits, rank });
++                    continue;
++                }
++                const v = widen(row[id]);
++                var count: u32 = 0;
++                for (row, 0..) |x, q| count += if (widen(x) >= v and !(widen(x) == v and q > id)) 1 else 0;
++                const want_lp: f32 = v - lse;
++                try check.expect(lp_bits == @as(u32, @bitCast(want_lp)), "row {d} slot {d} id {d}: logprob {x} not the host's {x}", .{ r, j, id, lp_bits, @as(u32, @bitCast(want_lp)) });
++                try check.expect(rank == count, "row {d} slot {d} id {d}: rank {d} not the host's {d}", .{ r, j, id, rank, count });
++                if (j < 2) { // inside the best: the row's own logprob for that id, the best word less the normalizer
++                    const at: usize = std.mem.indexOfScalarPos(u32, want[r * words + 2 ..][0..k], 0, id).?;
++                    const best: f32 = @bitCast(want[r * words + 2 + lanes.logprob.max_top + at]);
++                    try check.expect(@as(f32, @bitCast(lp_bits)) == best - lse, "row {d} slot {d}: the best entry's logprob differs", .{ r, j });
++                }
++            }
++            cases += 1;
++        }
++    };
++    check.pass("extras: {d} rows' requested ids score their own logprob and rank", .{cases});
++}
++
+ /// qwen35.cu's two-stage greedy argmax against the host rule: the highest logit, ties to the lower id, no NaN or -inf.
+ pub fn q35Argmax(gpu: Gpu) !void {
+     const gpa = gpu.gpa;
+-- 
+2.53.0
+

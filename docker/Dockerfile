@@ -117,6 +117,7 @@ RUN --mount=type=cache,id=tensorfold-zig-global,target=/root/.cache/zig \
  && zig build ${steps} --prefix "${PREFIX}" --summary failures \
       ${ZIG_JOBS:+-j${ZIG_JOBS}} -Doptimize=fast -Dcpu="${ZIG_CPU}" -Dstrip="${STRIP}" \
       -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm="${SM}" -Dxgrammar=/src/xgrammar \
+      -Dgit-commit="${TF_REF}" -Dpatches="$(cd /opt/tf-patches/engine && sha256sum *.patch | sha256sum | cut -c1-16)" \
  && echo "zig build ${steps}: $((SECONDS - start)) s" \
  && rm -f "${PREFIX}"/bin/tf-qwen35-* \
  && "${PREFIX}/native/bin/tensorfold-native" --version

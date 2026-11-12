@@ -1,0 +1,1800 @@
+From 48db047a40f6ea1c4e3b440b08ba3aabd7bc9915 Mon Sep 17 00:00:00 2001
+From: MiaAI_Lab <mia.ailab1@gmail.com>
+Date: Thu, 5 Nov 2026 14:43:19 +0200
+Subject: [PATCH] server: prompt logprobs at fidelity scale, and the build
+ identity to score by
+
+sparkDash scores a corpus through the model and compares a quantised build against
+the reference by per-token logprobs. Three things stood in the way, found on the
+live 2x RTX PRO 6000 server on 2026-11-05: the prompt_logprobs cap of 20, a
+combined request (logprobs or echo beside prompt_logprobs) refused as a whole, and
+no way to learn the build a run scored against.
+
+- lanes/logprob: a row carries 128 best tokens (was 20) and, beside them, the
+  request's own ids per position with their logprob and rank (vLLM's
+  token_ids_logprob); the kernel gains the id scan, the words' stride shared by
+  host and device.
+- server: the cap is --prompt-logprobs-cap (default 128), prompt_logprobs_token_ids
+  takes one flat list or one list a position, prompt_logprobs_format=compact
+  answers {ids, logprobs, actual} a position, the reply carries prompt_token_ids
+  and a top-level prompt_logprobs_missing, and logprobs/echo beside
+  prompt_logprobs no longer refuse the call (unsupported logprobs alone still
+  refuses, naming the field; echo repeats the prompt, streamed too).
+- glm cuda: reply logprobs (first row and verify rows, single and shared windows)
+  through the same sampler path the prompt rows use, so the combined call is
+  honored rather than ignored; the requested ids ride the lane as a device
+  buffer, scored by the prompt pass; prompt_logprobs requests keep their full
+  re-prefill, so a cached prefix cannot stale a row.
+- server: /v1/models names the build - checkpoint path and content sha256, the
+  checkpoint's own quantization and rope facts, kv dtype, tensor parallel rank,
+  speculative drafting, tokenizer sha256, whether a raw completion gets a BOS,
+  and the effective prompt_logprobs cap (-Dgit-commit/-Dpatches record the tree
+  the image built).
+- tests: the combined call, both id shapes and their refusals, the missing
+  positions, the compact form, prompt_token_ids, the cap; the lane slot test's
+  buffer follows the row's growth.
+---
+ build.zig                                     |   4 +
+ zig/kernels/cuda/logprob_rows.cuh             |  50 ++++++-
+ zig/kernels/cuda/sample.cu                    |  10 +-
+ zig/src/core/engine_api.zig                   |  28 +++-
+ zig/src/core/lane_host.zig                    |   7 +-
+ zig/src/core/lane_stream.zig                  |   2 +
+ zig/src/core/lanes/backend.zig                |   2 +
+ zig/src/core/lanes/logprob.zig                |  20 ++-
+ zig/src/core/lanes/stream.zig                 |  12 ++
+ zig/src/cuda/sample.zig                       |   4 +-
+ zig/src/families/glm/cuda_engine.zig          |   2 +-
+ zig/src/families/glm/cuda_lanes.zig           | 101 ++++++++++++-
+ zig/src/families/glm/cuda_lanes_test.zig      |   2 +-
+ zig/src/families/glm/cuda_native.zig          |   2 +
+ zig/src/families/glm/cuda_prompt_logprobs.zig |  11 +-
+ zig/src/families/glm/cuda_prompt_sink.zig     |  39 ++++-
+ zig/src/families/glm/cuda_sampler.zig         |   7 +-
+ zig/src/families/nemotron/cuda_kernels.zig    |   4 +-
+ zig/src/families/nemotron/cuda_lanes.zig      |   6 +-
+ zig/src/families/nemotron/cuda_lone.zig       |   2 +-
+ .../families/nemotron/cuda_prompt_rows.zig    |   2 +-
+ zig/src/families/qwen3_5/cuda_mtp.zig         |   2 +-
+ zig/src/native/cuda.zig                       |   5 +
+ zig/src/server/chat.zig                       |  52 ++++++-
+ zig/src/server/cli.zig                        |   3 +-
+ zig/src/server/engines.zig                    |   6 +-
+ zig/src/server/fields.zig                     |  63 +++++++-
+ zig/src/server/identity.zig                   |   8 +-
+ zig/src/server/logprobs.zig                   |  88 ++++++++++--
+ zig/src/server/logprobs_test.zig              | 134 +++++++++++++++++-
+ zig/src/server/mailbox.zig                    |  17 ++-
+ zig/src/server/main.zig                       |   2 +-
+ zig/src/server/openai.zig                     |  58 +++++++-
+ zig/src/server/serve.zig                      |   9 ++
+ zig/src/server/server.zig                     |  61 ++++++++
+ zig/src/server/status_routes.zig              |  15 +-
+ zig/tests/cuda/sample_tests.zig               |   2 +-
+ 37 files changed, 762 insertions(+), 80 deletions(-)
+
+diff --git a/build.zig b/build.zig
+index 09ae88e09..1a4dcb9ce 100644
+--- a/build.zig
++++ b/build.zig
+@@ -76,6 +76,10 @@ pub fn build(b: *std.Build) void {
+     // Keep the existing manifest version for developer builds; releases require an explicit override.
+     const manifest = @import("build.zig.zon");
+     build_options.addOption([]const u8, "version", release_version orelse manifest.version);
++    // The served source's identity, for /v1/models' build facts: the image build passes both; a plain `zig build`
++    // leaves them empty and the server omits the keys.
++    build_options.addOption([]const u8, "git_commit", b.option([]const u8, "git-commit", "The engine tree's commit") orelse "");
++    build_options.addOption([]const u8, "patches", b.option([]const u8, "patches", "The applied patch stack's hash") orelse "");
+     const slide_test_hooks = b.option(bool, "slide-test-hooks", "Living Weights test hooks, such as TF_SLIDE_FORGET_FAIL (never in a release)") orelse false;
+     if (slide_test_hooks and release_version != null) @panic("-Dslide-test-hooks is for test builds: a -Dversion release never carries it");
+     build_options.addOption(bool, "slide_test_hooks", slide_test_hooks);
+diff --git a/zig/kernels/cuda/logprob_rows.cuh b/zig/kernels/cuda/logprob_rows.cuh
+index a50760819..ae2179697 100644
+--- a/zig/kernels/cuda/logprob_rows.cuh
++++ b/zig/kernels/cuda/logprob_rows.cuh
+@@ -9,8 +9,11 @@ namespace tf_logprob {
+ constexpr unsigned TG = 1024;  // one block a row, as tf_logprob_rows launches it
+ constexpr unsigned NSG = TG / 32;
+ constexpr unsigned FULL = 0xFFFFFFFFu;
+-constexpr unsigned LP_TOP = 20;
+-constexpr unsigned LP_WORDS = 3 + 2 * LP_TOP;
++constexpr unsigned LP_TOP = 128;  // lanes/logprob.zig's max_top: the row words' stride is shared with the host
++constexpr unsigned LP_EXTRA = 128;  // lanes/logprob.zig's extra_max: requested ids' logprob/rank pairs a row
++constexpr unsigned LP_WORDS = 3 + 2 * LP_TOP + 2 * LP_EXTRA;
++constexpr unsigned LP_EXTRA_AT = 3 + 2 * LP_TOP;  // the first pair's word offset
++constexpr unsigned LP_NONE = 0xFFFFFFFFu;  // a gap in the row's requested ids: its logprob reads as nan
+ 
+ // (m, s): a running max and the sum of exp(x - m) under it, merged with another part's
+ __device__ __forceinline__ void lse_merge(float& m, float& s, float m2, float s2) {
+@@ -29,11 +32,15 @@ __device__ __forceinline__ void lse_merge(float& m, float& s, float m2, float s2
+ __device__ __forceinline__ bool better(float v, unsigned i, float bv, unsigned bi) { return v > bv || (v == bv && i < bi); }
+ 
+ // One row: a fixed reduction tree (lane tree, then warp 0 over the warps), so a row's words never depend on timing.
+-__device__ void logprob_row(const __nv_bfloat16* L, unsigned V, unsigned pick, unsigned k, bool rank, unsigned* out) {
++// EX (null: none) holds the row's requested ids, one word each at EXEX j of EXTRA_STRIDE; each gets its logprob under
++// the row's distribution and its vLLM rank; a gap or an out-of-range id writes nan and rank 0.
++__device__ void logprob_row(const __nv_bfloat16* L, unsigned V, unsigned pick, unsigned k, bool rank, unsigned* out,
++                            const unsigned* ex, unsigned extra_stride) {
+     __shared__ float part_m[NSG], part_s[NSG], part_v[NSG];
+     __shared__ unsigned part_i[NSG];
+     __shared__ float prev_v;
+     __shared__ unsigned prev_i;
++    __shared__ float lse_val;
+     const unsigned t = threadIdx.x, lane = t & 31u, warp = t >> 5;
+     float m = -INFINITY, s = 0.0f;
+     for (unsigned i = t; i < V; i += TG) {
+@@ -69,10 +76,12 @@ __device__ void logprob_row(const __nv_bfloat16* L, unsigned V, unsigned pick, u
+             lse_merge(m, s, m2, s2);
+         }
+         if (lane == 0) {
+-            out[0] = __float_as_uint(m + logf(s));
++            lse_val = m + logf(s);
++            out[0] = __float_as_uint(lse_val);
+             out[1] = __float_as_uint(pick < V ? __bfloat162float(L[pick]) : NAN);
+         }
+     }
++    __syncthreads();  // lse_val visible to every thread for the requested ids' logprobs below
+     if (rank) {
+         // vLLM's rank: the entries whose logit is at or above the pick's, the pick itself included
+         const float pk = pick < V ? __bfloat162float(L[pick]) : INFINITY;
+@@ -92,6 +101,39 @@ __device__ void logprob_row(const __nv_bfloat16* L, unsigned V, unsigned pick, u
+     } else if (t == 0) {
+         out[2 + 2 * LP_TOP] = 0;
+     }
++    if (ex != nullptr) {
++        // Each requested id: its logprob under the row's distribution and the entries at or above it, one reduction
++        // a id, the same fixed tree as the rank above, so the words never depend on timing.
++        const float lse = lse_val;
++        for (unsigned j = 0; j < LP_EXTRA; ++j) {
++            const unsigned id = ex[static_cast<size_t>(j) * extra_stride];
++            unsigned* slot = out + LP_EXTRA_AT + 2 * j;
++            if (id == LP_NONE || id >= V) {
++                if (t == 0) {
++                    slot[0] = 0x7FC00000u;  // quiet nan: a gap, the server omits the id
++                    slot[1] = 0;
++                }
++                continue;
++            }
++            const float v = __bfloat162float(L[id]);
++            unsigned above = 0;
++            for (unsigned i = t; i < V; i += TG) above += __bfloat162float(L[i]) >= v ? 1u : 0u;
++#pragma unroll
++            for (int off = 16; off > 0; off >>= 1) above += __shfl_down_sync(FULL, above, off);
++            if (lane == 0) part_i[warp] = above;
++            __syncthreads();
++            if (warp == 0) {
++                above = part_i[lane];
++#pragma unroll
++                for (int off = 16; off > 0; off >>= 1) above += __shfl_down_sync(FULL, above, off);
++                if (lane == 0) {
++                    slot[0] = __float_as_uint(v - lse);
++                    slot[1] = above;
++                }
++            }
++            __syncthreads();  // part_i is the selection rounds' scratch below
++        }
++    }
+     for (unsigned r = 0; r < k; ++r) {
+         // the best entry after the last one taken: a strict total order, so the result is exact
+         const float pv = prev_v;
+diff --git a/zig/kernels/cuda/sample.cu b/zig/kernels/cuda/sample.cu
+index 64192ad2f..cd43d8ea3 100644
+--- a/zig/kernels/cuda/sample.cu
++++ b/zig/kernels/cuda/sample.cu
+@@ -558,11 +558,15 @@ extern "C" __global__ void __launch_bounds__(1024) tf_draw_pitched(const __nv_bf
+     else tf_sample::draw_pitched<false>(L, V, rule, meta, offset, TOK, nullptr, PROB, pitch, s);
+ }
+ 
+-// Rows of bf16 logits [rows, V]: row r's LP_WORDS words at OUT + r * LP_WORDS for PICK[r], k (at most 20) best, rank.
++// Rows of bf16 logits [rows, V]: row r's LP_WORDS words at OUT + r * LP_WORDS for PICK[r], k best, rank; EX+r*EX_STR
++// holds row r's requested ids (null: none), each scored beside the best.
+ extern "C" __global__ void __launch_bounds__(1024) tf_logprob_rows(const __nv_bfloat16* L, unsigned V, const unsigned* PICK,
+-                                                                   unsigned k, unsigned rank, unsigned* OUT) {
++                                                                   unsigned k, unsigned rank, unsigned* OUT,
++                                                                   const unsigned* EX, unsigned EX_STR) {
+     const unsigned row = blockIdx.x;
+-    tf_logprob::logprob_row(L + static_cast<size_t>(row) * V, V, PICK[row], k, rank != 0, OUT + static_cast<size_t>(row) * tf_logprob::LP_WORDS);
++    tf_logprob::logprob_row(L + static_cast<size_t>(row) * V, V, PICK[row], k, rank != 0,
++                            OUT + static_cast<size_t>(row) * tf_logprob::LP_WORDS,
++                            EX ? EX + static_cast<size_t>(row) * EX_STR : nullptr, EX_STR);
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(256) tf_topk_slices(const __nv_bfloat16* L, unsigned V, unsigned k, unsigned slices, float* PV,
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 0f0905212..f57073e60 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -23,6 +23,10 @@ pub const seedFor = lanes.sampling.seedFor;
+ 
+ /// A committed token's log probability under the target's raw distribution, with the best tokens at its position.
+ pub const LogprobRow = lanes.LogprobRow;
++/// The most alternatives (and requested ids) one logprob row carries: the server's caps stay at or below it.
++pub const logprob_max = lanes.logprob.max_top;
++pub const logprob_extra_max = lanes.logprob.extra_max;
++pub const logprob_extra_none = lanes.logprob.extra_none;
+ 
+ /// The request's stop strings, checked on the engine's thread after each committed token (the server decodes the tail).
+ pub const Stop = struct {
+@@ -113,6 +117,11 @@ pub const Request = struct {
+     logprobs: ?u8 = null,
+     /// Rows for each prompt token after the first, with ranks and this many best tokens, when ``Info.prompt_logprobs``.
+     prompt_logprobs: ?u8 = null,
++    /// The ids each prompt row also scores (``Info.prompt_logprobs_ids``): ``prompt_logprobs_stride`` entries a row,
++    /// padded with ``lanes.logprob.extra_none``; entry i of the padded row i scores prompt position i + 1. The slice
++    /// stays valid until ``finished``, like every Request slice.
++    prompt_logprobs_ids: []const u32 = &.{},
++    prompt_logprobs_stride: u32 = 0, // the padding width; 0 with an empty ``prompt_logprobs_ids``
+     /// Images whose rows replace placeholder tokens of ``prompt``, in order; only when ``Info.vision`` is set.
+     images: []const Image = &.{},
+     /// The prompt as the prompt cache matches it (each image's placeholders by its content); empty: ``prompt``.
+@@ -148,6 +157,16 @@ pub const SpeechSubmitError = error{ Closed, Busy, InvalidRequest, Unsupported }
+ pub const Reason = enum { stop, length, cancelled, failed, silence };
+ pub const speech_guard = @import("speech_guard.zig");
+ 
++/// The prompt's logprob rows and, when the request named ids, each row's values for them, rows in prompt order.
++pub const PromptLogprobs = struct {
++    rows: []const LogprobRow = &.{}, // one a prompt token after the first; row i's pick is prompt token i + 1
++    /// The requested ids' logprobs, row-major ``stride`` entries a row (nan where the row's list has a gap), and
++    /// their ranks; empty when the request named none. Valid only during the call, like ``rows``.
++    extra_logprobs: []const f32 = &.{},
++    extra_ranks: []const u32 = &.{},
++    stride: u32 = 0,
++};
++
+ /// What a finished reply's rounds did, for its runtime fields and /metrics.
+ pub const Stats = struct {
+     rounds: u64 = 0,
+@@ -174,8 +193,9 @@ pub const Event = union(enum) {
+     prefilled: u32,
+     /// The next ``tokens`` event's logprob rows, one a token (``logprobs`` requests); valid only during the call.
+     logprobs: []const LogprobRow,
+-    /// The prompt's rows, one a prompt token after the first, right after ``prefilled`` (``prompt_logprobs`` requests).
+-    prompt_logprobs: []const LogprobRow,
++    /// The prompt's rows, one a prompt token after the first, right after ``prefilled`` (``prompt_logprobs``
++    /// requests), with the requested ids' logprobs and ranks when the request had them (``PromptLogprobs``).
++    prompt_logprobs: PromptLogprobs,
+     /// Tokens committed for this request, in order; valid only during the call.
+     tokens: []const u32,
+     audio: usize,
+@@ -214,6 +234,10 @@ pub const Info = struct {
+     penalties: bool = false,
+     /// Requests may ask for ``prompt_logprobs`` (a prompt pass from 0 that reads every row).
+     prompt_logprobs: bool = false,
++    /// Requests may also name ids per prompt row (``Request.prompt_logprobs_ids``) beside the best tokens.
++    prompt_logprobs_ids: bool = false,
++    /// The served checkpoint's content hash (``checkpoint_identity.fullIdentity``), lowercase hex, or all zero.
++    checkpoint_digest: [64]u8 = @splat(0),
+     /// Prompt rows a prefill chunk at most, for the server's chunk starts (0: the engine cuts prompts itself).
+     prefill_step: u32 = 0,
+     /// The engine keeps prompt states between requests, so ``prefilled`` counts the tokens it restored.
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 5ca02b978..c186be55f 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -432,7 +432,12 @@ pub const LaneHost = struct {
+             if (job.request.images.len == 0 and job.request.cache_key.len == 0) store.repeat_log.note(store.gpa, store.rules.repeat_min, job.request.prompt);
+         }
+         emit(job, .{ .prefilled = job.stream.cached });
+-        if (job.stream.prompt_logprobs != null) emit(job, .{ .prompt_logprobs = job.stream.prompt_rows.items });
++        if (job.stream.prompt_logprobs != null) emit(job, .{ .prompt_logprobs = .{
++            .rows = job.stream.prompt_rows.items,
++            .extra_logprobs = job.stream.prompt_extra_logprobs.items,
++            .extra_ranks = job.stream.prompt_extra_ranks.items,
++            .stride = job.stream.prompt_ids_stride,
++        } });
+         recalls.prompted(h, job);
+     }
+ 
+diff --git a/zig/src/core/lane_stream.zig b/zig/src/core/lane_stream.zig
+index cb2b881ba..df676dce6 100644
+--- a/zig/src/core/lane_stream.zig
++++ b/zig/src/core/lane_stream.zig
+@@ -60,6 +60,8 @@ pub fn open(h: *LaneHost, job: *Job) bool {
+         .answer_max = r.answer_max,
+         .logprobs = r.logprobs,
+         .prompt_logprobs = r.prompt_logprobs,
++        .prompt_ids = r.prompt_logprobs_ids,
++        .prompt_ids_stride = r.prompt_logprobs_stride,
+         .loop_guard = r.loop_guard,
+         .loop_stop = r.loop_stop,
+         .chunks = r.chunks,
+diff --git a/zig/src/core/lanes/backend.zig b/zig/src/core/lanes/backend.zig
+index 30264371b..65e71b082 100644
+--- a/zig/src/core/lanes/backend.zig
++++ b/zig/src/core/lanes/backend.zig
+@@ -132,6 +132,8 @@ pub const Backend = struct {
+         held: ?*const fn (ptr: *anyopaque, s: *Stream, out: []u32) anyerror!void = null,
+         /// `prefill` fills `Stream.prompt_rows` for a stream with `prompt_logprobs` (it then starts from 0).
+         prompt_rows: bool = false,
++        /// `prefill` also fills the stream's `prompt_extra_logprobs`/`prompt_extra_ranks` for `prompt_ids` streams.
++        prompt_ids: bool = false,
+         /// The backend stores `Stream.fill_at` as its pass runs: the status reader may count its fill totals.
+         reports_fill: bool = false,
+         /// The stream left the rounds: free its caches and held drafts.
+diff --git a/zig/src/core/lanes/logprob.zig b/zig/src/core/lanes/logprob.zig
+index f96386874..bf93ff669 100644
+--- a/zig/src/core/lanes/logprob.zig
++++ b/zig/src/core/lanes/logprob.zig
+@@ -1,11 +1,23 @@
+ //! A committed token's log probability under the target's raw distribution, with its best tokens (OpenAI logprobs).
+ const std = @import("std");
+ 
+-/// The most alternatives a row carries (OpenAI's `top_logprobs` limit).
+-pub const max_top = 20;
++/// The most alternatives a row carries: OpenAI's `top_logprobs` limit for replies, and the prompt_logprobs cap's
++/// ceiling (the kernel and every buffer size these words; the server's launch cap never exceeds it).
++pub const max_top = 128;
+ 
+-/// The words a backend writes for one row: the log normalizer, the pick's logit, the best ids, their logits, the rank.
+-pub const words = 3 + 2 * max_top;
++/// The most requested ids (`prompt_logprobs_token_ids`) a row scores beside its best tokens, each with its logprob
++/// and rank; a vLLM `token_ids_logprob`. One layout for every row, so the words' stride never depends on the request.
++pub const extra_max = 128;
++
++/// The words a backend writes for one row: the log normalizer, the pick's logit, the best ids, their logits, the
++/// rank, then each requested id's logprob and rank (`extra_max` pairs, `nan`/0 where the row's list has a gap).
++pub const words = 3 + 2 * max_top + 2 * extra_max;
++
++/// The word offset of the requested ids' logprob/rank pairs.
++pub const extra_at = 3 + 2 * max_top;
++
++/// The row words' sentinel for a requested id that is a gap: its logprob reads as nan and the server omits it.
++pub const extra_none = 0xFFFF_FFFF;
+ 
+ pub const Row = struct {
+     token: u32, // the committed token
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index c3e22e786..3e03ac516 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -140,6 +140,10 @@ pub const Spec = struct {
+     untaught: bool = false, // no learned neuron acts on its rows: the model as shipped (Request.untaught)
+     logprobs: ?u8 = null, // the target's log probabilities for each committed token, with this many best tokens
+     prompt_logprobs: ?u8 = null, // and for each prompt token after the first, with ranks (the prompt pass starts at 0)
++    /// `prompt_logprobs` beside the best tokens: the ids each prompt row also scores, padded to `prompt_ids_stride`
++    /// entries a row (`logprob.extra_none` gaps; row i scores the ids for prompt position i + 1). Empty: none.
++    prompt_ids: []const u32 = &.{},
++    prompt_ids_stride: u32 = 0, // the padding width; 0: no extra ids
+     grammar: ?*grammar.Constraint = null, // structured output: the reply stays in it (the creator frees it)
+     decode_spans: []const [2]u32 = &.{}, // prompt rows an earlier reply decoded (Request.decode_spans), for backends that keep their bits
+     images: []const Image = &.{}, // in prompt order; the backend's tower fills their rows
+@@ -178,7 +182,11 @@ pub const Stream = struct {
+     problem: []const u8 = "", // why a stream finished with `error` (static text)
+     rows: std.ArrayList(Row) = .empty, // with `logprobs`: one a token of emitted(), in order
+     prompt_logprobs: ?u8 = null,
++    prompt_ids: []const u32 = &.{}, // with `prompt_logprobs`: the ids each row also scores, padded per row
++    prompt_ids_stride: u32 = 0, // that padding's width; 0: none
+     prompt_rows: std.ArrayList(Row) = .empty, // with `prompt_logprobs`: one a prompt token after the first, in order
++    prompt_extra_logprobs: std.ArrayList(f32) = .empty, // with `prompt_ids`: each row's requested ids' logprobs, rows * stride
++    prompt_extra_ranks: std.ArrayList(u32) = .empty, // and their ranks, the same layout
+     reuse: Reuse = .{},
+     decode_spans: []const [2]u32 = &.{},
+     decide: ?u32 = null,
+@@ -267,6 +275,8 @@ pub const Stream = struct {
+             .untaught = spec.untaught,
+             .logprobs = spec.logprobs,
+             .prompt_logprobs = spec.prompt_logprobs,
++            .prompt_ids = spec.prompt_ids,
++            .prompt_ids_stride = spec.prompt_ids_stride,
+             .grammar = spec.grammar,
+             .decode_spans = spec.decode_spans,
+             .images = spec.images,
+@@ -288,6 +298,8 @@ pub const Stream = struct {
+         s.context.deinit(gpa);
+         s.rows.deinit(gpa);
+         s.prompt_rows.deinit(gpa);
++        s.prompt_extra_logprobs.deinit(gpa);
++        s.prompt_extra_ranks.deinit(gpa);
+         s.force.deinit(gpa);
+         s.long_loop.deinit(gpa);
+         s.dropRoundState(gpa);
+diff --git a/zig/src/cuda/sample.zig b/zig/src/cuda/sample.zig
+index f6544ea01..67b399cab 100644
+--- a/zig/src/cuda/sample.zig
++++ b/zig/src/cuda/sample.zig
+@@ -166,7 +166,7 @@ pub const Draws = struct {
+     }
+ 
+     /// Each bf16 logits row's logprob words at `out`: its pick in `picks`, its `k` best tokens, its rank if `rank`.
+-    pub fn logprobRows(d: *const Draws, s: Stream, logits: u64, vocab: usize, picks: u64, k: u8, rank: bool, out: u64, rows: usize) !void {
++    pub fn logprobRows(d: *const Draws, s: Stream, logits: u64, vocab: usize, picks: u64, k: u8, rank: bool, out: u64, rows: usize, extra: u64, extra_stride: u32) !void {
+         var a: launch_.Args = .{};
+         a.add(logits);
+         a.add(@as(u32, @intCast(vocab)));
+@@ -174,6 +174,8 @@ pub const Draws = struct {
+         a.add(@as(u32, k));
+         a.add(@as(u32, @intFromBool(rank)));
+         a.add(out);
++        a.add(extra);
++        a.add(extra_stride);
+         try launch_.launch(d.logprob_rows_fn, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 1024 } }, s, &a);
+     }
+ 
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 980f9ff2f..e661046d7 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -534,7 +534,7 @@ pub const Engine = struct {
+         try f.run(as_i32[0..rows]);
+         e.index_splits += @intFromBool(split);
+         stamp = prof_mod.span(f.prof, e.stream, .prompt_score);
+-        if (e.prompt_logprobs) |p| if (part.len > 1) try prompt_lp.run(e, p, part[1..]);
++        if (e.prompt_logprobs) |p| if (part.len > 1) try prompt_lp.run(e, p, part[1..], start);
+         stamp.end();
+         stamp = prof_mod.span(f.prof, e.stream, .drafter);
+         if (e.drafter) |dr| try dr.prompt(e, e.slot, start, rows, len);
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index 200f59e1d..42842547d 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -31,6 +31,9 @@ fn costTable(comptime n: usize, comptime one: f64, comptime row: f64) [n]lanes.c
+ }
+ 
+ /// A stream's place in the backend: its sequence's slot, the rows its last verify left uncommitted, its held drafts.
++/// One verify's (or the first token's) logprob rows to take: its rows' logits, the drawn picks, the rows to fill.
++const RowsPart = struct { logits: u64, rows: usize, sampled: []const u32, out: []lanes.LogprobRow, k: u8, at: usize = 0 };
++
+ const Lane = struct {
+     slot: u32,
+     pending_rows: ?usize = null,
+@@ -38,6 +41,9 @@ const Lane = struct {
+     chances: [max_held]f64 = undefined, // each held draft's chance: DFlash2's selector's, or the MTP head's (--mtp-confidence)
+     held_n: usize = 0,
+     first: ?u64 = null,
++    first_row: ?lanes.LogprobRow = null, // with `logprobs`: the first token's row, read at the prompt's end
++    lp_ids: ?cuda.DeviceBuffer = null, // the request's prompt-logprobs ids on the device, until the stream is released
++    lp_ids_dev: u64 = 0, // their device address; rows of `prompt_ids_stride` entries, the row of absolute index r at + r * stride
+     fill: ?usize = null, // a prompt pass going a chunk at a time: where its next chunk starts
+     raw: [max_held]f64 = undefined, // DFlash2's selector chances as drawn (chances may be cut or calibrated)
+     lean: rule.Lean = .{}, // TF_GLM_DRAFT_RULE=tpm: the stream's own lean and tokens a ms
+@@ -51,6 +57,8 @@ pub const Lanes = struct {
+     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
+     mtp_confidence: ?f64 = null, // --mtp-confidence: the MTP head's chains stop where their chance falls under it
+     shared: u64 = 0, // forwards that held several streams' windows (checks read it)
++    rows_buf: ?cuda.HostBuffer = null, // logprob rows' words, host-mapped; made at the first stream that asks
++    rows_dev: u64 = 0, // their device address
+     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
+     drawn: [ring]u32 = undefined,
+     next: u64 = 0,
+@@ -62,8 +70,42 @@ pub const Lanes = struct {
+ 
+     pub fn deinit(self: *Lanes) void {
+         if (self.bits) |*b| b.free();
++        if (self.rows_buf) |*b| b.free();
++        var it = self.lanes.iterator();
++        while (it.next()) |entry| if (entry.value_ptr.lp_ids) |*b| b.free(); // streams the engine closed without a release
+         self.lanes.deinit(self.x.e.gpa);
+     }
++    /// A verify's or the first token's logprob rows: each part's rows gathered whole, their words read on the host,
++    /// the rows made; the requested ids score prompt rows only, so these parts carry none.
++    fn takeRows(self: *Lanes, parts: []const RowsPart) !void {
++        const e = self.x.e;
++        if (self.rows_buf == null) {
++            self.rows_buf = try cuda.HostBuffer.allocMapped(e.d, engine.shared_rows * lanes.logprob.words * 4);
++            errdefer self.rows_buf = null;
++            self.rows_dev = try self.rows_buf.?.device();
++        }
++        const words = lanes.logprob.words;
++        for (parts) |p| {
++            if (p.rows == 0) continue;
++            try e.smp.gather(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = p.logits }}, p.rows, e.smp.full.ptr);
++            try e.smp.tok.uploadAsync(0, std.mem.sliceAsBytes(p.sampled[0..p.rows]), e.stream.handle);
++            try e.smp.logprobRows(e.stream, e.smp.full.ptr, p.rows, e.smp.tok.ptr, p.k, self.rows_dev + p.at * words * 4, 0, 0);
++        }
++        try e.stream.synchronize();
++        const all = self.rows_buf.?.slice(u32);
++        for (parts) |p| {
++            for (p.out, 0..) |*slot, r| {
++                slot.* = lanes.LogprobRow.fromWords(all[(p.at + r) * words ..][0..words], p.sampled[r], p.k);
++            }
++        }
++    }
++
++    /// The first token's row, from the prompt's last row still in bp (the next prompt pass would clobber it).
++    fn keepFirstRow(self: *Lanes, s: *lanes.Stream, l: *Lane, first: u32) !void {
++        var rows: [1]lanes.LogprobRow = undefined;
++        try self.takeRows(&.{.{ .logits = self.x.e.bp.logits, .rows = 1, .sampled = &.{first}, .out = &rows, .k = s.logprobs.? }});
++        l.first_row = rows[0];
++    }
+ 
+     /// A window's grammar rows (rows of the vocabulary's words) at row `row` of the bits, device-read; 0 for none.
+     pub fn putBits(self: *Lanes, row: usize, rows: usize, masks: []const u32) !u64 {
+@@ -88,6 +130,7 @@ pub const Lanes = struct {
+         .prefill = prefillFn,
+         .prefill_many = prefillManyFn,
+         .first = firstFn,
++        .first_row = firstRowFn,
+         .queue = queueFn,
+         .read = readFn,
+         .verify = verifyFn,
+@@ -98,6 +141,7 @@ pub const Lanes = struct {
+         .first_masked = firstMaskedFn,
+         .held = heldFn,
+         .prompt_rows = true,
++        .prompt_ids = true,
+     };
+     const steps_vt: be.Backend.VTable = vt: {
+         var v = whole_vt;
+@@ -219,12 +263,14 @@ pub const Lanes = struct {
+         const self = of(ptr);
+         const from = try self.opening(s);
+         try self.images(s, from);
+-        var sink: Sink = .{ .gpa = self.x.e.gpa, .s = s };
++        var sink: Sink = .{ .gpa = self.x.e.gpa, .s = s, .ids_dev = if (self.lanes.getPtr(s)) |l| l.lp_ids_dev else 0 };
+         try sink.prepare();
+         self.x.e.prompt_logprobs = sink.want();
+         defer self.x.e.prompt_logprobs = null;
+         const first = try self.x.prefill(s.prompt(), from, .{ .ptr = s, .check = cancelled }, marksOf(s));
+-        self.lanes.getPtr(s).?.first = self.take(first);
++        const lane = self.lanes.getPtr(s).?;
++        lane.first = self.take(first);
++        if (s.logprobs != null) try self.keepFirstRow(s, lane, first);
+     }
+ 
+     fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
+@@ -267,13 +313,14 @@ pub const Lanes = struct {
+         if (going != null) try self.x.bind(l.slot);
+         const at = going orelse if (from) |r| r.at else 0;
+         errdefer l.fill = null;
+-        var sink: Sink = .{ .gpa = self.x.e.gpa, .s = s };
++        var sink: Sink = .{ .gpa = self.x.e.gpa, .s = s, .ids_dev = l.lp_ids_dev };
+         try sink.prepare();
+         self.x.e.prompt_logprobs = sink.want();
+         defer self.x.e.prompt_logprobs = null;
+         const step = try self.x.chunk(s.prompt(), at, !self.othersDecode(s), from, .{ .ptr = s, .check = cancelled }, marksOf(s));
+         if (step.first) |first| {
+             l.first = self.take(first);
++            if (s.logprobs != null) try self.keepFirstRow(s, l, first);
+             l.fill = null;
+             return true;
+         }
+@@ -309,13 +356,27 @@ pub const Lanes = struct {
+         };
+         const pages = try self.seat(s, ids.len, s.max_new);
+         errdefer {
++            if (self.lanes.getPtr(s)) |l| if (l.lp_ids) |*b| {
++                b.free();
++                l.lp_ids = null;
++            };
+             self.x.e.release(self.lanes.get(s).?.slot);
+             _ = self.lanes.remove(s);
+         }
+         if (self.x.e.images) |v| v.clear(); // no earlier request's rows splice into this one
+         try self.x.beginOn(s.sampling, pages);
++        if (s.prompt_ids.len > 0) { // the requested ids score every row: the pass starts from 0, them on the device
++            const l = self.lanes.getPtr(s).?;
++            l.lp_ids = try cuda.DeviceBuffer.alloc(self.x.e.d, s.prompt_ids.len * 4);
++            errdefer l.lp_ids.?.free();
++            errdefer l.lp_ids = null;
++            try l.lp_ids.?.uploadAsync(0, std.mem.sliceAsBytes(s.prompt_ids), self.x.e.stream.handle);
++            l.lp_ids_dev = l.lp_ids.?.ptr;
++        } else if (self.lanes.getPtr(s)) |l| l.lp_ids_dev = 0;
+         s.cached = 0;
+         s.prompt_rows.clearRetainingCapacity();
++        s.prompt_extra_logprobs.clearRetainingCapacity();
++        s.prompt_extra_ranks.clearRetainingCapacity();
+         return if (s.prompt_logprobs != null) null else self.resumeFrom(s, ids.len); // prompt rows need every row
+     }
+ 
+@@ -425,6 +486,12 @@ pub const Lanes = struct {
+         s.keepInterruptedPrefill(at);
+     }
+ 
++    /// The first token's logprob row, read when the prompt pass ended (keepFirstRow).
++    fn firstRowFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!lanes.LogprobRow {
++        const l = of(ptr).lanes.getPtr(s) orelse return error.UnknownStream;
++        return l.first_row orelse error.NoFirstRow;
++    }
++
+     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
+         const self = of(ptr);
+         if (position != s.prompt_len) return error.PositionMismatch;
+@@ -487,6 +554,7 @@ pub const Lanes = struct {
+             const t0 = self.now();
+             try self.x.verify(ids[0..rows], sampled[0..rows], bits);
+             self.observe(l, w, ids[1..rows], sampled[0..rows], self.since(t0), true);
++            if (o.rows.len > 0) try self.takeRows(&.{.{ .logits = self.x.e.bd.logits, .rows = rows, .sampled = sampled[0..rows], .out = o.rows, .k = w.stream.logprobs.? }});
+             @memcpy(o.sampled[0..rows], sampled[0..rows]);
+             @memcpy(o.drafts[0..drafts.len], drafts);
+             l.pending_rows = rows;
+@@ -524,6 +592,29 @@ pub const Lanes = struct {
+         const t0 = self.now();
+         try self.x.verifyShared(parts[0..windows.len]);
+         const ms = self.since(t0);
++        if (self.x.e.bs != null) { // the asking streams' rows, each part's at its rows' offset in the shared words
++            var row_parts: [engine.max_shared]RowsPart = undefined;
++            var n: usize = 0;
++            var at: usize = 0;
++            const base = self.x.e.bs.?.logits;
++            const local: u64 = self.x.e.share.vocab.len();
++            for (windows, 0..) |w, k| {
++                const rows = windows[k].rows();
++                if (out[k].rows.len > 0) {
++                    row_parts[n] = .{
++                        .logits = base + @as(u64, at) * local * 2,
++                        .rows = rows,
++                        .sampled = sampled[k][0..rows],
++                        .out = out[k].rows,
++                        .k = w.stream.logprobs.?,
++                        .at = at,
++                    };
++                    n += 1;
++                }
++                at += rows;
++            }
++            if (n > 0) try self.takeRows(row_parts[0..n]);
++        }
+         self.shared += 1;
+         for (windows, parts[0..windows.len], lane[0..windows.len]) |w, p, l| self.observe(l, w, p.ids[1..], p.out, ms, false);
+         for (out[0..windows.len], parts[0..windows.len], lane[0..windows.len]) |*o, p, l| {
+@@ -734,6 +825,8 @@ pub const Lanes = struct {
+     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
+         const self = of(ptr);
+         const kv = self.lanes.fetchRemove(s) orelse return;
++        var buf = kv.value.lp_ids;
++        if (buf) |*b| b.free();
+         self.x.release(kv.value.slot) catch |err| std.log.err("releasing slot {d}: {s}", .{ kv.value.slot, @errorName(err) });
+         if (self.lanes.count() == 0) self.x.idle() catch |err| std.log.err("the other ranks' idle step: {s}", .{@errorName(err)});
+     }
+@@ -745,5 +838,5 @@ comptime {
+ 
+ /// Eligibility for the maintained fresh-prompt batching path.
+ pub fn canBatch(s: anytype) bool {
+-    return s.prompt_logprobs == null and s.images.len == 0 and s.reuse.saved == null and s.prompt_len <= engine.prompt_rows;
++    return s.logprobs == null and s.prompt_logprobs == null and s.images.len == 0 and s.reuse.saved == null and s.prompt_len <= engine.prompt_rows;
+ }
+diff --git a/zig/src/families/glm/cuda_lanes_test.zig b/zig/src/families/glm/cuda_lanes_test.zig
+index b74981384..b7f90c9d2 100644
+--- a/zig/src/families/glm/cuda_lanes_test.zig
++++ b/zig/src/families/glm/cuda_lanes_test.zig
+@@ -6,7 +6,7 @@ const fw = @import("cuda_forward.zig");
+ const Lanes = @import("cuda_lanes.zig").Lanes;
+ 
+ test "a lane's slot is chosen before its map entry exists" {
+-    var storage: [8192]u8 = @splat(0);
++    var storage: [1 << 16]u8 = @splat(0); // the lane carries a full logprob row (128 best ids and their logprobs)
+     var fixed = std.heap.FixedBufferAllocator.init(&storage);
+     var e: engine.Engine = undefined;
+     e.gpa = fixed.allocator();
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index d541e0230..6996f7b52 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -71,6 +71,7 @@ pub const Loaded = struct {
+     layout: ?kv.Layout = null, // every stream's memory as one pool of KV pages (null: a window each, by TF_KV_PAGES)
+     engine_paged: bool = false, // with a layout, the engine's own sequence takes pages too: the plan sets a window aside
+     kv_parts: ?lanes.kv_parts.Source = null, // TF_GLM_KV_SHARD: the pool's parts and counters for /health and /metrics
++    checkpoint_digest: [32]u8 = @splat(0), // the served weights' content hash, for the server's /v1/models
+ };
+ 
+ /// The pool behind every stream: the engine's own sequence and `streams` more on `pages` KV pages, on every rank.
+@@ -341,6 +342,7 @@ fn finishRank(a: OpenArgs) !Loaded {
+         .layout = own.layout,
+         .engine_paged = set.pages,
+         .kv_parts = if (set.kv_shard.on) .{ .ctx = own, .read = readKvParts } else null,
++        .checkpoint_digest = own.e.checkpoint_digest,
+     };
+ }
+ 
+diff --git a/zig/src/families/glm/cuda_prompt_logprobs.zig b/zig/src/families/glm/cuda_prompt_logprobs.zig
+index 3694a1435..a8132311b 100644
+--- a/zig/src/families/glm/cuda_prompt_logprobs.zig
++++ b/zig/src/families/glm/cuda_prompt_logprobs.zig
+@@ -19,6 +19,9 @@ pub const batch_rows = 128;
+ pub const Want = struct {
+     k: u8 = 0,
+     reader: ?Reader = null,
++    /// The rows' requested ids (Stream.prompt_ids): row r's at base + r * stride, 0 when the request had none.
++    ids: u64 = 0,
++    ids_stride: u32 = 0,
+ };
+ 
+ /// Rank 0's: `words` (rows of row_words) for `picks`, the prompt tokens the rows score, in prompt order.
+@@ -63,8 +66,9 @@ pub const Output = struct {
+     }
+ };
+ 
+-/// The chunk's rows in e.bp.fnormed that score `next` (row r scores next[r]), a head pass at a time.
+-pub fn run(e: *Engine, want: Want, next: []const u32) !void {
++/// The chunk's rows in e.bp.fnormed that score `next` (row r scores next[r]), a head pass at a time. `rows_at` is
++/// the absolute row index next[0] scores from: the requested ids' row r sits at ids + (rows_at + r) * stride.
++pub fn run(e: *Engine, want: Want, next: []const u32, rows_at: usize) !void {
+     const own = try buffers(e);
+     const rows: usize = if (own != null) batch_rows else fw.window_rows;
+     const columns = if (own) |b| b.columns.ptr else e.bd.logits;
+@@ -81,7 +85,8 @@ pub fn run(e: *Engine, want: Want, next: []const u32) !void {
+         try e.smp.gather(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = columns }}, n, full);
+         const reader = want.reader orelse continue;
+         @memcpy(picks[0..n], next[r..][0..n]);
+-        try e.smp.logprobRows(e.stream, full, n, out + batch_rows * row_words * 4, want.k, out);
++        const ids = if (want.ids != 0) want.ids + @as(u64, rows_at + r) * want.ids_stride * 4 else 0;
++        try e.smp.logprobRows(e.stream, full, n, out + batch_rows * row_words * 4, want.k, out, ids, want.ids_stride);
+         try e.stream.synchronize();
+         try reader.call(reader.ctx, words[0 .. n * row_words], picks[0..n]);
+     }
+diff --git a/zig/src/families/glm/cuda_prompt_sink.zig b/zig/src/families/glm/cuda_prompt_sink.zig
+index 393da39ce..8ff13795c 100644
+--- a/zig/src/families/glm/cuda_prompt_sink.zig
++++ b/zig/src/families/glm/cuda_prompt_sink.zig
+@@ -1,24 +1,53 @@
+-//! Prompt logprob rows owned by the requesting stream.
++//! Prompt logprob rows owned by the requesting stream, with its requested ids' values beside the best tokens.
+ const std = @import("std");
+ const lanes = @import("lanes");
+ const prompt_lp = @import("cuda_prompt_logprobs.zig");
++
+ /// A stream's prompt rows as rank 0 reads them back, in prompt order.
+ pub const Sink = struct {
+     gpa: std.mem.Allocator,
+     s: *lanes.Stream,
++    ids_dev: u64 = 0, // the stream's requested ids on the device (Lanes opening); 0: the request named none
+ 
+     pub fn prepare(p: *Sink) !void {
+-        if (p.s.prompt_logprobs != null) try p.s.prompt_rows.ensureTotalCapacity(p.gpa, p.s.prompt_len -| 1);
++        if (p.s.prompt_logprobs != null) {
++            const rows = p.s.prompt_len -| 1;
++            try p.s.prompt_rows.ensureTotalCapacity(p.gpa, rows);
++            if (p.ids_dev != 0 and p.s.prompt_ids_stride > 0) {
++                try p.s.prompt_extra_logprobs.ensureTotalCapacity(p.gpa, rows * p.s.prompt_ids_stride);
++                try p.s.prompt_extra_ranks.ensureTotalCapacity(p.gpa, rows * p.s.prompt_ids_stride);
++            }
++        }
+     }
+ 
+     pub fn want(p: *Sink) ?prompt_lp.Want {
+         const k = p.s.prompt_logprobs orelse return null;
+-        return .{ .k = k, .reader = .{ .ctx = p, .call = read } };
++        return .{
++            .k = k,
++            .reader = .{ .ctx = p, .call = read },
++            .ids = p.ids_dev,
++            .ids_stride = if (p.ids_dev != 0) p.s.prompt_ids_stride else 0,
++        };
+     }
+ 
+-    pub fn read(ctx: *anyopaque, words: []const u32, picks: []const u32) anyerror!void {
++    fn read(ctx: *anyopaque, words: []const u32, picks: []const u32) anyerror!void {
+         const p: *Sink = @ptrCast(@alignCast(ctx));
+         const w = prompt_lp.row_words;
+-        for (picks, 0..) |pick, i| p.s.prompt_rows.appendAssumeCapacity(lanes.LogprobRow.fromWords(words[i * w ..][0..w], pick, p.s.prompt_logprobs.?));
++        const extras = p.ids_dev != 0 and p.s.prompt_ids_stride > 0;
++        const stride: usize = p.s.prompt_ids_stride;
++        const at = lanes.logprob.extra_at;
++        for (picks, 0..) |pick, i| {
++            p.s.prompt_rows.appendAssumeCapacity(lanes.LogprobRow.fromWords(words[i * w ..][0..w], pick, p.s.prompt_logprobs.?));
++            if (!extras) continue;
++            const row = words[i * w ..][0..w];
++            const lp = p.s.prompt_extra_logprobs.items.len;
++            const rk = p.s.prompt_extra_ranks.items.len;
++            p.s.prompt_extra_logprobs.items.len = lp + stride;
++            p.s.prompt_extra_ranks.items.len = rk + stride;
++            for (0..stride) |j| { // a gap's nan reads as none; the layout is the kernel's, word for word
++                p.s.prompt_extra_logprobs.items[lp + j] = @bitCast(row[at + 2 * j]);
++                p.s.prompt_extra_ranks.items[rk + j] = row[at + 2 * j + 1];
++            }
++        }
+     }
+ };
+diff --git a/zig/src/families/glm/cuda_sampler.zig b/zig/src/families/glm/cuda_sampler.zig
+index c8f1e33bd..0901c0c72 100644
+--- a/zig/src/families/glm/cuda_sampler.zig
++++ b/zig/src/families/glm/cuda_sampler.zig
+@@ -115,8 +115,9 @@ pub const Sampler = struct {
+         try cuda.launch.launch(s.tf_grammar_mask, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &args);
+     }
+ 
+-    /// sample.cu's logprob words of `rows` whole rows at `full`: each row's pick in `picks`, its `k` best, its rank.
+-    pub fn logprobRows(s: *const Sampler, stream: cuda.Stream, full: u64, rows: usize, picks: u64, k: u8, out: u64) !void {
++    /// sample.cu's logprob words of `rows` whole rows at `full`: each row's pick in `picks`, its `k` best, its rank,
++    /// and each row's requested ids at `extra` + row * `extra_stride` (0: none) with their logprob and rank.
++    pub fn logprobRows(s: *const Sampler, stream: cuda.Stream, full: u64, rows: usize, picks: u64, k: u8, out: u64, extra: u64, extra_stride: u32) !void {
+         var args: cuda.Args = .{};
+         args.add(full);
+         args.add(@as(u32, @intCast(s.vocab)));
+@@ -124,6 +125,8 @@ pub const Sampler = struct {
+         args.add(@as(u32, k));
+         args.add(@as(u32, 1)); // the rank too: vLLM's prompt_logprobs give it
+         args.add(out);
++        args.add(extra);
++        args.add(extra_stride);
+         try cuda.launch.launch(s.tf_logprob_rows, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, stream, &args);
+     }
+ 
+diff --git a/zig/src/families/nemotron/cuda_kernels.zig b/zig/src/families/nemotron/cuda_kernels.zig
+index a5f4b4ed3..48d30b4ca 100644
+--- a/zig/src/families/nemotron/cuda_kernels.zig
++++ b/zig/src/families/nemotron/cuda_kernels.zig
+@@ -248,8 +248,8 @@ pub const Ops = struct {
+     }
+ 
+     /// sample.cu's logprob rows on this stream: each row's words for its pick, `k` best tokens and rank if `rank`.
+-    pub fn logprobRows(o: Ops, logits: u64, vocab: usize, picks: u64, k: u8, rank: bool, out: u64, rows: usize) !void {
+-        return o.k.draws.logprobRows(o.s, logits, vocab, picks, k, rank, out, rows);
++    pub fn logprobRows(o: Ops, logits: u64, vocab: usize, picks: u64, k: u8, rank: bool, out: u64, rows: usize, extra: u64, extra_stride: u32) !void {
++        return o.k.draws.logprobRows(o.s, logits, vocab, picks, k, rank, out, rows, extra, extra_stride);
+     }
+ 
+     /// Every projection format the kernels loaded (cuda/qlinear.zig).
+diff --git a/zig/src/families/nemotron/cuda_lanes.zig b/zig/src/families/nemotron/cuda_lanes.zig
+index 65779d9c3..3e84e454b 100644
+--- a/zig/src/families/nemotron/cuda_lanes.zig
++++ b/zig/src/families/nemotron/cuda_lanes.zig
+@@ -325,7 +325,7 @@ pub const Cuda = struct {
+         _ = self.take(first);
+         if (s.logprobs) |k| {
+             const at = (row_slots - 1) * row_words;
+-            try e.ops().logprobRows(e.b.p_logits, e.c.vocab, e.b.p_sampled, k, false, self.rows_dev + at * 4, 1);
++            try e.ops().logprobRows(e.b.p_logits, e.c.vocab, e.b.p_sampled, k, false, self.rows_dev + at * 4, 1, 0, 0);
+             try e.stream.synchronize();
+             gop.value_ptr.first = LogRow.fromWords(self.rows_out.slice(u32)[at..][0..row_words], first, k);
+         }
+@@ -431,7 +431,7 @@ pub const Cuda = struct {
+         ids[0] = w.pending;
+         @memcpy(ids[1..][0..w.tokens.len], w.tokens);
+         try e.verifyMasked(ids[0 .. 1 + w.tokens.len], rows, null, try self.putBits(0, w.masks));
+-        if (out[0].rows.len > 0) try e.ops().logprobRows(e.b.logits, e.c.vocab, e.b.sampled, w.stream.logprobs.?, false, self.rows_dev, rows);
++        if (out[0].rows.len > 0) try e.ops().logprobRows(e.b.logits, e.c.vocab, e.b.sampled, w.stream.logprobs.?, false, self.rows_dev, rows, 0, 0);
+         const held = self.pinned.slice(u32)[0 .. rows - 1];
+         if (w.held > 0) try e.ops().download(std.mem.sliceAsBytes(held), e.b.ids + 4);
+         try e.stream.synchronize();
+@@ -477,7 +477,7 @@ pub const Cuda = struct {
+             e.bind(parts[k].seq);
+             if (w.held > 0) try e.ops().download(std.mem.sliceAsBytes(held[k * state.max_rows ..][0 .. w.rows() - 1]), e.b.ids + 4);
+             // the shared scratch holds every part's logits, part k's from its first row; its picks are its own
+-            if (o.rows.len > 0) try e.ops().logprobRows(e.b.logits + row0 * @as(u64, e.c.vocab) * 2, e.c.vocab, e.b.sampled, w.stream.logprobs.?, false, self.rows_dev + row0 * row_words * 4, w.rows());
++            if (o.rows.len > 0) try e.ops().logprobRows(e.b.logits + row0 * @as(u64, e.c.vocab) * 2, e.c.vocab, e.b.sampled, w.stream.logprobs.?, false, self.rows_dev + row0 * row_words * 4, w.rows(), 0, 0);
+             row0 += w.rows();
+         }
+         try e.stream.synchronize();
+diff --git a/zig/src/families/nemotron/cuda_lone.zig b/zig/src/families/nemotron/cuda_lone.zig
+index f104ca947..b4a374dba 100644
+--- a/zig/src/families/nemotron/cuda_lone.zig
++++ b/zig/src/families/nemotron/cuda_lone.zig
+@@ -98,7 +98,7 @@ const Held = struct {
+ /// The kept rows of the window just verified, as the lane core's windows read them (Cuda.verifyFn).
+ fn windowRows(b: *Cuda, k: u8, picks: []const u32, out: []LogRow) !void {
+     const e = b.e;
+-    try e.ops().logprobRows(e.b.logits, e.c.vocab, e.b.sampled, k, false, b.rows_dev, picks.len);
++    try e.ops().logprobRows(e.b.logits, e.c.vocab, e.b.sampled, k, false, b.rows_dev, picks.len, 0, 0);
+     try e.stream.synchronize();
+     const words = b.rows_out.slice(u32);
+     for (out, picks, 0..) |*r, pick, i| r.* = LogRow.fromWords(words[i * row_words ..][0..row_words], pick, k);
+diff --git a/zig/src/families/nemotron/cuda_prompt_rows.zig b/zig/src/families/nemotron/cuda_prompt_rows.zig
+index 449e3e084..fc61cf251 100644
+--- a/zig/src/families/nemotron/cuda_prompt_rows.zig
++++ b/zig/src/families/nemotron/cuda_prompt_rows.zig
+@@ -26,7 +26,7 @@ pub fn run(e: *Engine, p: PromptRows, next: []const u32) !void {
+         const n = @min(p.rows, next.len - r);
+         @memcpy(p.picks[0..n], next[r..][0..n]);
+         try e.ops().prefillDense(e.b.p_hidden + r * @as(u64, e.c.hidden) * 2, e.w.head, p.logits, n);
+-        try e.ops().logprobRows(p.logits, e.c.vocab, p.picks_dev, p.k, true, p.out_dev, n);
++        try e.ops().logprobRows(p.logits, e.c.vocab, p.picks_dev, p.k, true, p.out_dev, n, 0, 0);
+         try e.stream.synchronize();
+         try p.call(p.ctx, p.out[0 .. n * p.stride], p.picks[0..n]);
+     }
+diff --git a/zig/src/families/qwen3_5/cuda_mtp.zig b/zig/src/families/qwen3_5/cuda_mtp.zig
+index 7dab9cf01..a77f98814 100644
+--- a/zig/src/families/qwen3_5/cuda_mtp.zig
++++ b/zig/src/families/qwen3_5/cuda_mtp.zig
+@@ -334,7 +334,7 @@ pub const Mtp = struct {
+         const e = d.e;
+         try d.proj(e.head, d.x + first * e.g.hidden * 2, d.logits, n);
+         try e.run(e.fns.argmax, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, .{ d.logits, @as(c_int, @intCast(e.g.vocab)), d.tok });
+-        if (cands and d.trees) try e.draws.logprobRows(e.stream, d.logits, e.g.vocab, d.picks, ranks, false, d.words, n);
++        if (cands and d.trees) try e.draws.logprobRows(e.stream, d.logits, e.g.vocab, d.picks, ranks, false, d.words, n, 0, 0);
+     }
+ 
+     /// The drawn token, and the first `n` rows' candidates by rank, after a draw.
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index c8f073546..5b192a90b 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -487,6 +487,11 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         .warm_turns = h.store != null and @hasDecl(F, "warm_quiet"),
+         .logprobs = served.backend.vtable.first_row != null,
+         .prompt_logprobs = served.backend.vtable.prompt_rows,
++        .prompt_logprobs_ids = served.backend.vtable.prompt_ids,
++        .checkpoint_digest = if (@hasField(@TypeOf(loaded), "checkpoint_digest"))
++            std.fmt.bytesToHex(loaded.checkpoint_digest, .lower)
++        else
++            @splat(0),
+         .penalties = served.backend.penalties,
+         .structures = served.backend.vtable.first_masked != null,
+         .vision = if (@hasField(@TypeOf(loaded), "vision")) vision_offer.offer(loaded.vision, o.vision) else null,
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 2835e2460..ef0356634 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -37,6 +37,13 @@ pub const Input = struct {
+     logprobs: ?u8 = null,
+     /// ``/v1/completions``' ``prompt_logprobs``: rows for the prompt with this many alternatives; null: not asked.
+     prompt_logprobs: ?u8 = null,
++    /// The ids each prompt position also scores (fields.promptLogprobsIds), aligned to the rendered prompt; the
++    /// engine receives rows 1.. as its padded matrix. null: the request named none.
++    prompt_logprobs_ids: ?fields_mod.PromptIds = null,
++    /// ``prompt_logprobs`` entries as vLLM's maps (the default) or ``compact``.
++    prompt_logprobs_format: ?[]const u8 = null,
++    /// ``echo``: the prompt repeated before the completion's text (``/v1/completions``).
++    echo: bool = false,
+ };
+ 
+ /// A streamed piece: content text (a string) or a delta object (reasoning or tool calls).
+@@ -68,8 +75,12 @@ pub const Reply = struct {
+     effort: ?[]const u8 = null,
+     /// ``choices[0].logprobs`` (``{"content": [...]}``) for a request that asked; null otherwise.
+     logprobs: ?Value = null,
+-    /// ``choices[0].prompt_logprobs`` (vLLM's form) for a request that asked; null otherwise.
++    /// ``choices[0].prompt_logprobs`` (vLLM's or the compact form) for a request that asked; null otherwise.
+     prompt_logprobs: ?Value = null,
++    /// The prompt positions with no score, for the reply's ``prompt_logprobs_missing``; empty: every one scored.
++    prompt_missing: []const u32 = &.{},
++    /// The exact ids the engine scored, for a reply that reports ``prompt_token_ids``; empty otherwise.
++    prompt_ids: []const u32 = &.{},
+     loop_stop: ?u32 = null, // the loop period when --loop-guard-stop ended the reply in its reasoning
+ };
+ 
+@@ -205,6 +216,31 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+     }
+     if (input.logprobs) |count| request.logprobs = try @import("logprobs.zig").admit(srv, cx, thinking, request.think_budget, count);
+     request.prompt_logprobs = input.prompt_logprobs;
++    if (input.prompt_logprobs_ids) |id_lists| {
++        if (input.prompt_logprobs == null) return cx.refuse("prompt_logprobs_token_ids needs prompt_logprobs");
++        const positions = rendered.ids.len;
++        const rows: []const []const u32 = switch (id_lists) {
++            .every => |flat| blk: {
++                const all = try a.alloc([]const u32, positions);
++                @memset(all, flat);
++                break :blk all;
++            },
++            .rows => |r| blk: {
++                if (r.len != positions)
++                    return cx.fail(.request, "prompt_logprobs_token_ids needs one list per prompt position ({d} of them), or one flat list", .{positions});
++                break :blk r;
++            },
++        };
++        var width: usize = 0;
++        for (rows[1..]) |row| width = @max(width, row.len);
++        if (width > 0) {
++            const matrix = try a.alloc(u32, (positions - 1) * width);
++            @memset(matrix, std.math.maxInt(u32)); // lanes.logprob.extra_none: a gap the engine leaves nan
++            for (rows[1..positions], 0..) |row, r| @memcpy(matrix[r * width ..][0..row.len], row);
++            request.prompt_logprobs_ids = matrix;
++            request.prompt_logprobs_stride = @intCast(width);
++        }
++    }
+     const response_channel: ResponseChannel = if (request.structure) |st| switch (st.kind) {
+         .json, .json_schema => .structured_json,
+         else => .automatic,
+@@ -253,7 +289,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+     };
+     srv.release(preparing, null); // a background request waits only while a foreground one prepares
+     preparing = false;
+-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .think_off_split = if (!thinking and !reply_text.isChannel(srv.markers) and input.prompt == null and prepared.response_channel != .structured_json and request.logprobs == null) think_off_split.hold() else 0, .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .response_channel = prepared.response_channel, .tools = if (prepared.response_channel == .structured_json) &.{} else input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop };
++    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .think_off_split = if (!thinking and !reply_text.isChannel(srv.markers) and input.prompt == null and prepared.response_channel != .structured_json and request.logprobs == null) think_off_split.hold() else 0, .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .response_channel = prepared.response_channel, .tools = if (prepared.response_channel == .structured_json) &.{} else input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop, .prompt_ids = request.prompt, .lp_ids = request.prompt_logprobs_ids, .lp_stride = request.prompt_logprobs_stride, .lp_compact = std.mem.eql(u8, input.prompt_logprobs_format orelse "", "compact") };
+     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
+     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
+     const result: Failure!Reply = blk: {
+@@ -316,6 +352,10 @@ const Generation = struct {
+     chunk_index: usize = 0,
+     lp: ?@import("logprobs.zig").Stream = null, // the request asked for logprobs: its rows, copied with each round
+     loop_stop: bool = false, // --loop-guard-stop: the engine ends the reply where the loop guard fires
++    prompt_ids: []const u32 = &.{}, // the request's exact prompt ids, for the reply's prompt_token_ids
++    lp_ids: []const u32 = &.{}, // the request's padded per-position ids, for the reply's logprob entries
++    lp_stride: u32 = 0,
++    lp_compact: bool = false, // prompt_logprobs entries as compact rows, not vLLM's maps
+ 
+     /// TF_THINK_OFF_SPLIT: whether a thinking-off reply's text before its close token is its reasoning, so far.
+     fn strayClose(g: *const Generation, finished: bool) think_off_split.Decision {
+@@ -585,6 +625,10 @@ const Generation = struct {
+             .err => {},
+         };
+         const think_end: ?u32 = if (thinking or stray) g.srv.text.tokenId(g.srv.markers.close) else null;
++        const prompt_lp: ?@import("logprobs.zig").Prompt = if (m.prompt) |p|
++            try @import("logprobs.zig").promptValue(g.srv, a, p, g.lp_ids, g.lp_stride, g.lp_compact)
++        else
++            null;
+         const reply: Reply = .{
+             .response_channel = g.response_channel,
+             .content = content,
+@@ -601,7 +645,9 @@ const Generation = struct {
+             .thinking = thinking,
+             .effort = effort,
+             .logprobs = if (g.lp) |l| try @import("logprobs.zig").value(g.srv, cx, a, g.thinking, content_tokens, l.rows.items) else null,
+-            .prompt_logprobs = if (m.prompt_rows) |r| try @import("logprobs.zig").promptValue(g.srv, a, r) else null,
++            .prompt_logprobs = if (prompt_lp) |p| p.value else null,
++            .prompt_missing = if (prompt_lp) |p| p.missing else &.{},
++            .prompt_ids = if (m.prompt != null) g.prompt_ids else &.{},
+             .loop_stop = stopped,
+         };
+         if (std.mem.eql(u8, reason, "length") and thinking and reply_text.pyStrip(content).len == 0)
+diff --git a/zig/src/server/cli.zig b/zig/src/server/cli.zig
+index b758b7a9d..404071638 100644
+--- a/zig/src/server/cli.zig
++++ b/zig/src/server/cli.zig
+@@ -210,6 +210,7 @@ pub const Args = struct {
+     loop_guard_stop: bool = false, // the reply ends where the loop guard fires (implies --loop-guard)
+     no_drafts: bool = false,
+     keep_warm: i64 = 900, // seconds the idle keepalive runs after the last request ends (0: off)
++    prompt_logprobs_cap: u32 = 128, // the most prompt_logprobs alternatives one request asks for
+     idle_unload: i64 = 0, // seconds of idle past the last request before the engine closes (0: never; the next request reloads)
+     compact_auto: bool = false,
+     compact_fraction: ?f64 = null,
+@@ -421,7 +422,7 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
+         out.learn_conversations = true;
+     } else if (is(name, "--learn-daily-gib")) {
+         out.learn_daily_gib = try gib(u, a, name, v);
+-    } else if (is(name, "--prompt-seed")) out.prompt_seed = true else if (is(name, "--max-tokens")) out.max_tokens = try int(u, a, name, v) else if (is(name, "--temperature")) out.temperature = try float(u, a, name, v) else if (is(name, "--top-p")) out.top_p = try float(u, a, name, v) else if (is(name, "--top-k")) out.top_k = try int(u, a, name, v) else if (is(name, "--min-p")) out.min_p = try float(u, a, name, v) else if (is(name, "--thinking")) out.thinking = true else if (is(name, "--no-thinking")) out.thinking = false else if (is(name, "--reasoning-effort")) out.reasoning_effort = v else if (is(name, "--thinking-budget")) out.thinking_budget = try int(u, a, name, v) else if (is(name, "--thinking-reserve")) out.thinking_reserve = try int(u, a, name, v) else if (is(name, "--loop-guard")) out.loop_guard = true else if (is(name, "--loop-guard-stop")) out.loop_guard_stop = true else if (is(name, "--drafter")) out.drafter = v else if (is(name, "--drafter-bits")) out.drafter_bits = @intCast(try int(u, a, name, v)) else if (is(name, "--record")) out.record = v else if (is(name, "--kv-cache")) out.kv_cache = v else if (is(name, "--prompt-precision")) out.prompt_precision = v else if (is(name, "--no-drafts")) out.no_drafts = true else if (is(name, "--keep-warm")) out.keep_warm = try int(u, a, name, v) else if (is(name, "--idle-unload")) out.idle_unload = try int(u, a, name, v) else if (is(name, "--compact-at")) {
++    } else if (is(name, "--prompt-seed")) out.prompt_seed = true else if (is(name, "--max-tokens")) out.max_tokens = try int(u, a, name, v) else if (is(name, "--temperature")) out.temperature = try float(u, a, name, v) else if (is(name, "--top-p")) out.top_p = try float(u, a, name, v) else if (is(name, "--top-k")) out.top_k = try int(u, a, name, v) else if (is(name, "--min-p")) out.min_p = try float(u, a, name, v) else if (is(name, "--thinking")) out.thinking = true else if (is(name, "--no-thinking")) out.thinking = false else if (is(name, "--reasoning-effort")) out.reasoning_effort = v else if (is(name, "--thinking-budget")) out.thinking_budget = try int(u, a, name, v) else if (is(name, "--thinking-reserve")) out.thinking_reserve = try int(u, a, name, v) else if (is(name, "--loop-guard")) out.loop_guard = true else if (is(name, "--loop-guard-stop")) out.loop_guard_stop = true else if (is(name, "--drafter")) out.drafter = v else if (is(name, "--drafter-bits")) out.drafter_bits = @intCast(try int(u, a, name, v)) else if (is(name, "--record")) out.record = v else if (is(name, "--kv-cache")) out.kv_cache = v else if (is(name, "--prompt-precision")) out.prompt_precision = v else if (is(name, "--no-drafts")) out.no_drafts = true else if (is(name, "--keep-warm")) out.keep_warm = try int(u, a, name, v) else if (is(name, "--prompt-logprobs-cap")) out.prompt_logprobs_cap = @intCast(@max(1, try int(u, a, name, v))) else if (is(name, "--idle-unload")) out.idle_unload = try int(u, a, name, v) else if (is(name, "--compact-at")) {
+         if (std.mem.eql(u8, v, "auto")) out.compact_auto = true else {
+             const f = try float(u, a, name, v);
+             if (!(f > 0 and f <= 1)) return fail(u, a, "argument --compact-at: expected auto or a fraction in (0, 1]: '{s}'", .{v});
+diff --git a/zig/src/server/engines.zig b/zig/src/server/engines.zig
+index 00d3868e0..5afdb398e 100644
+--- a/zig/src/server/engines.zig
++++ b/zig/src/server/engines.zig
+@@ -26,7 +26,11 @@ pub fn p2p(a: Allocator) ?[]const u8 {
+ 
+ /// What the open /health names: this release, the built-in backend and the GPU a serve with ``args`` opens.
+ pub fn identity(a: Allocator, args: cli.Args) build_identity.Identity {
+-    return build_identity.of(native, a, @import("build_options").version, args.device);
++    const options = @import("build_options");
++    var id = build_identity.of(native, a, options.version, args.device);
++    id.commit = if (@hasDecl(options, "git_commit")) options.git_commit else "";
++    id.patches = if (@hasDecl(options, "patches")) options.patches else "";
++    return id;
+ }
+ 
+ /// The engine for the checkpoint in ``dir``, or null with ``problem`` set.
+diff --git a/zig/src/server/fields.zig b/zig/src/server/fields.zig
+index 5deb4741c..72bd288d8 100644
+--- a/zig/src/server/fields.zig
++++ b/zig/src/server/fields.zig
+@@ -305,16 +305,73 @@ pub fn legacyLogprobs(cx: *Cx, body: Value, supported: bool) errors.Refused!?u8
+     return @intCast(n.?);
+ }
+ 
+-/// vLLM's ``prompt_logprobs``: 0 through 20 alternatives on a whole ``/v1/completions`` reply, or null when not asked.
+-pub fn promptLogprobs(cx: *Cx, body: Value, completions: bool, streamed: bool, supported: bool) errors.Refused!?u8 {
++/// vLLM's ``prompt_logprobs``: 0 through ``cap`` alternatives on a whole ``/v1/completions`` reply, or null.
++pub fn promptLogprobs(cx: *Cx, body: Value, completions: bool, streamed: bool, supported: bool, cap: u8) errors.Refused!?u8 {
+     const asked = body.field("prompt_logprobs") orelse return null;
+     const n = asked.int64();
+-    if (asked != .int or n == null or n.? < 0 or n.? > 20) return cx.refuse("prompt_logprobs must be an integer between 0 and 20, or null");
++    if (asked != .int or n == null or n.? < 0 or n.? > cap)
++        return cx.fail(.request, "prompt_logprobs must be an integer between 0 and {d}, or null", .{cap});
+     if (!completions or streamed) return cx.refuse("prompt_logprobs are supported on /v1/completions without streaming only");
+     if (!supported) return cx.refuse("prompt_logprobs are not supported by this model or backend");
+     return @intCast(n.?);
+ }
+ 
++/// The per-position token ids a ``prompt_logprobs`` request also scores (vLLM's ``token_ids_logprob``): a flat list
++/// scores the same ids at every position, a list of lists the row's own ids; each id inside the vocabulary, each
++/// row at most ``cap`` entries. Row 0 (before any token) carries no rows: its list, when given, is checked only.
++pub const PromptIds = union(enum) {
++    every: []const u32, // the one list, every position
++    rows: []const []const u32, // position p's list; rows[0] unused by the engine
++
++    pub fn len(p: PromptIds) usize {
++        return switch (p) {
++            .every => |x| x.len,
++            .rows => |x| if (x.len > 0) x[1..].len else 0,
++        };
++    }
++};
++
++pub fn promptLogprobsIds(cx: *Cx, body: Value, vocab: u32, cap: usize) errors.Refused!?PromptIds {
++    const asked = body.field("prompt_logprobs_token_ids") orelse return null;
++    if (asked != .array or asked.array.len == 0) return cx.refuse("prompt_logprobs_token_ids must be a nonempty list of token ids, or a list of per-position lists");
++    if (asked.array[0] == .array) {
++        const rows = try cx.a.alloc([]const u32, asked.array.len);
++        for (asked.array, rows) |row, *slot| {
++            if (row != .array) return cx.refuse("prompt_logprobs_token_ids must be a list of token ids, or a list of per-position lists");
++            slot.* = try idsOf(cx, row, vocab, cap);
++        }
++        return .{ .rows = rows };
++    }
++    return .{ .every = try idsOf(cx, asked, vocab, cap) };
++}
++
++fn idsOf(cx: *Cx, row: Value, vocab: u32, cap: usize) errors.Refused![]const u32 {
++    if (row.array.len > cap) return cx.fail(.request, "prompt_logprobs_token_ids carries at most {d} ids a position", .{cap});
++    const out = try cx.a.alloc(u32, row.array.len);
++    for (row.array, out) |id, *slot| {
++        const n = id.int64();
++        if (n == null or n.? < 0 or n.? >= vocab) return cx.fail(.request, "prompt_logprobs_token_ids ids must be integers in the valid range 0 to {d}", .{@as(i64, vocab) - 1});
++        slot.* = @intCast(n.?);
++    }
++    return out;
++}
++
++/// ``prompt_logprobs_format``: the entries' shape, vLLM's map (the default) or ``compact``.
++pub fn promptLogprobsFormat(cx: *Cx, body: Value) errors.Refused!?[]const u8 {
++    const asked = body.field("prompt_logprobs_format") orelse return null;
++    if (asked != .string or (asked.string.len != 0 and !std.mem.eql(u8, asked.string, "vllm") and !std.mem.eql(u8, asked.string, "compact")))
++        return cx.refuse("prompt_logprobs_format must be \"vllm\" or \"compact\", or null");
++    return if (asked.string.len == 0) null else asked.string;
++}
++
++/// ``echo``: the prompt repeated before the completion's text; a bool or null.
++pub fn echo(cx: *Cx, body: Value) errors.Refused!bool {
++    const asked = body.field("echo") orelse return false;
++    if (asked == .null) return false;
++    if (asked != .bool) return cx.refuse("echo must be a boolean or null");
++    return asked.bool;
++}
++
+ const media = [_][]const u8{ "image", "images", "image_url", "input_image", "audio", "input_audio", "video", "video_url" };
+ 
+ /// ``validate_modalities``: text in, text out.
+diff --git a/zig/src/server/identity.zig b/zig/src/server/identity.zig
+index 3b1a4b9c5..5d70f032c 100644
+--- a/zig/src/server/identity.zig
++++ b/zig/src/server/identity.zig
+@@ -3,7 +3,13 @@ const std = @import("std");
+ const Allocator = std.mem.Allocator;
+ 
+ /// Read once at startup; an empty field is left out of /health, and a test server given none names none.
+-pub const Identity = struct { version: []const u8 = "", backend: []const u8 = "", device: []const u8 = "" };
++pub const Identity = struct {
++    version: []const u8 = "",
++    backend: []const u8 = "",
++    device: []const u8 = "",
++    commit: []const u8 = "", // the engine tree's commit (-Dgit-commit); empty: unknown
++    patches: []const u8 = "", // the applied patch stack's hash (-Dpatches); empty: none recorded
++};
+ 
+ /// A binary's identity: its release always, its engine module's first backend, and the GPU `device` picks, if any.
+ pub fn of(comptime Engines: type, a: Allocator, version: []const u8, device: ?u32) Identity {
+diff --git a/zig/src/server/logprobs.zig b/zig/src/server/logprobs.zig
+index 549ec9ea1..233290126 100644
+--- a/zig/src/server/logprobs.zig
++++ b/zig/src/server/logprobs.zig
+@@ -91,17 +91,85 @@ pub fn legacy(a: Allocator, rows: Value, offset: *usize) Allocator.Error!Value {
+     return .{ .object = out };
+ }
+ 
+-/// vLLM's ``prompt_logprobs``: null, then ``{id: {logprob, rank, decoded_token}}`` a token, the prompt token first.
+-pub fn promptValue(srv: *Server, a: Allocator, rows: []const api.LogprobRow) Allocator.Error!Value {
+-    const out = try a.alloc(Value, rows.len + 1);
+-    out[0] = .null;
+-    for (out[1..], rows) |*slot, r| {
+-        const o = try json.newObject(a);
+-        try promptEntry(srv, a, o, r.token, r.logprob, r.rank);
+-        for (r.ids[0..r.count], r.logprobs[0..r.count], 1..) |id, lp, rank| if (id != r.token) try promptEntry(srv, a, o, id, lp, rank);
+-        slot.* = .{ .object = o };
++/// The prompt's logprob entries: vLLM's maps (``null``, then ``{id: {logprob, rank, decoded_token}}`` a position,
++/// the prompt token first, then the best, then the request's own ids), or ``compact`` rows. ``ids``/``stride`` are
++/// the request's padded per-position id matrix, row p - 1 for prompt position p; ``missing`` names the positions
++/// whose token has no score (the engine's nan), for the reply's ``prompt_logprobs_missing``.
++pub const Prompt = struct { value: Value, missing: []const u32 = &.{} };
++
++pub fn promptValue(srv: *Server, a: Allocator, p: api.PromptLogprobs, ids: []const u32, stride: u32, compact: bool) Allocator.Error!Prompt {
++    const rows = try a.alloc(Value, p.rows.len + 1);
++    rows[0] = if (compact) try compactRow(a, p, 0, ids, stride) else .null;
++    var missing: std.ArrayList(u32) = .empty;
++    for (p.rows, 1..) |r, position| {
++        const scored = !std.math.isNan(r.logprob);
++        if (!scored) try missing.append(a, @intCast(position));
++        rows[position] = if (compact)
++            try compactRow(a, p, position, ids, stride)
++        else blk: {
++            const o = try json.newObject(a);
++            if (scored) try promptEntry(srv, a, o, r.token, r.logprob, r.rank);
++            for (r.ids[0..r.count], r.logprobs[0..r.count], 1..) |id, lp, rank| if (id != r.token) try promptEntry(srv, a, o, id, lp, rank);
++            try extrasInto(srv, a, o, p, ids, stride, position);
++            break :blk .{ .object = o };
++        };
++    }
++    return .{ .value = .{ .array = rows }, .missing = missing.items };
++}
++
++/// The requested ids' entries for ``position`` in vLLM's shape; the engine's nan marks a gap in the padded row.
++fn extrasInto(srv: *Server, a: Allocator, o: *json.Object, p: api.PromptLogprobs, ids: []const u32, stride: u32, position: usize) Allocator.Error!void {
++    if (position == 0 or stride == 0 or p.stride == 0 or p.extra_logprobs.len < position * p.stride) return;
++    const row = position - 1; // the engine's rows start at prompt position 1
++    if (row >= p.rows.len) return;
++    for (0..@min(stride, p.stride)) |j| {
++        const lp = p.extra_logprobs[row * p.stride + j];
++        if (!std.math.isFinite(lp)) continue;
++        const id = ids[row * stride + j];
++        if (id == api.logprob_extra_none) continue; // the row's list was shorter: the engine left a gap
++        var key: [16]u8 = undefined;
++        const text = std.fmt.bufPrint(&key, "{d}", .{id}) catch unreachable;
++        if (o.get(text) != null) continue; // already there: the token itself or among the best
++        try promptEntry(srv, a, o, id, lp, p.extra_ranks[row * p.stride + j]);
++    }
++}
++
++/// ``compact``: per position ``{"ids": [...], "logprobs": [...], "actual": {...}}``, the token first where it has a
++/// score, then the best, then the requested ids; the compact rows carry no per-id ranks, the map form does.
++fn compactRow(a: Allocator, p: api.PromptLogprobs, position: usize, ids: []const u32, stride: u32) Allocator.Error!Value {
++    const o = try json.newObject(a);
++    var id_list: std.ArrayList(Value) = .empty;
++    var lp_list: std.ArrayList(Value) = .empty;
++    const r: ?api.LogprobRow = if (position > 0 and position <= p.rows.len) p.rows[position - 1] else null;
++    if (r) |row| if (!std.math.isNan(row.logprob)) {
++        try id_list.append(a, try json.intValue(a, row.token));
++        try lp_list.append(a, .{ .float = row.logprob });
++    };
++    if (r) |row| for (row.ids[0..row.count], row.logprobs[0..row.count]) |id, lp| {
++        if (id == row.token and !std.math.isNan(row.logprob)) continue;
++        try id_list.append(a, try json.intValue(a, id));
++        try lp_list.append(a, .{ .float = lp });
++    };
++    if (position > 0 and stride > 0 and p.stride > 0 and p.extra_logprobs.len >= position * p.stride) {
++        const row = position - 1;
++        for (0..@min(stride, p.stride)) |j| {
++            const lp = p.extra_logprobs[row * p.stride + j];
++            const id = ids[row * stride + j];
++            if (!std.math.isFinite(lp) or id == api.logprob_extra_none) continue;
++            try id_list.append(a, try json.intValue(a, id));
++            try lp_list.append(a, .{ .float = lp });
++        }
+     }
+-    return .{ .array = out };
++    try o.put(a, "ids", .{ .array = id_list.items });
++    try o.put(a, "logprobs", .{ .array = lp_list.items });
++    const actual = try json.newObject(a);
++    if (r) |row| if (!std.math.isNan(row.logprob)) {
++        try actual.put(a, "id", try json.intValue(a, row.token));
++        try actual.put(a, "logprob", .{ .float = row.logprob });
++        try actual.put(a, "rank", try json.intValue(a, row.rank));
++    };
++    try o.put(a, "actual", .{ .object = actual });
++    return .{ .object = o };
+ }
+ 
+ fn promptEntry(srv: *Server, a: Allocator, o: *json.Object, id: u32, logprob: f32, rank: usize) Allocator.Error!void {
+diff --git a/zig/src/server/logprobs_test.zig b/zig/src/server/logprobs_test.zig
+index 359a1e1b1..c06beecf6 100644
+--- a/zig/src/server/logprobs_test.zig
++++ b/zig/src/server/logprobs_test.zig
+@@ -75,6 +75,9 @@ const Script = struct {
+     reply: []const u32,
+     asked: ?u8 = null,
+     prompt_rows: bool = true,
++    stride_seen: u32 = 0,
++    nan_at: ?usize = null, // this prompt row's logprob reads as nan: the position is "missing"
++    lp_missing: ?usize = null, // the request's logprobs count, as the engine saw it
+ 
+     fn engine(e: *@This()) api.Engine {
+         return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
+@@ -88,6 +91,7 @@ const Script = struct {
+     fn submit(ctx: *anyopaque, id: api.Id, r: *const api.Request, sink: api.Sink) api.SubmitError!void {
+         const e: *Script = @ptrCast(@alignCast(ctx));
+         e.asked = r.logprobs;
++        e.stride_seen = r.prompt_logprobs_stride;
+         var rows: [32]api.LogprobRow = undefined;
+         for (e.reply, rows[0..e.reply.len], 0..) |t, *row, i| {
+             const lp = -@as(f32, @floatFromInt(i + 1)) / 4;
+@@ -99,16 +103,31 @@ const Script = struct {
+         }
+         sink.event(sink.ctx, id, &.{ .prefilled = 0 });
+         if (r.prompt_logprobs) |k| {
++            e.lp_missing = k;
+             var prompt_rows: [32]api.LogprobRow = undefined;
+-            for (r.prompt[1..], prompt_rows[0 .. r.prompt.len - 1], 1..) |t, *row, i| {
++            const rows_n = r.prompt.len - 1;
++            const stride = r.prompt_logprobs_stride;
++            var extra_lp: [256]f32 = @splat(std.math.nan(f32));
++            var extra_rk: [256]u32 = @splat(0);
++            if (stride > 0) for (0..rows_n) |row| for (0..stride) |j| {
++                extra_lp[row * stride + j] = -@as(f32, @floatFromInt(row)) - 7.5;
++                extra_rk[row * stride + j] = @intCast(row + 30);
++            };
++            for (r.prompt[1..], prompt_rows[0..rows_n], 1..) |t, *row, i| {
+                 const top = i % 2 == 0;
+-                row.* = .{ .token = t, .logprob = -@as(f32, @floatFromInt(i)) / 8, .count = k, .rank = if (top) 1 else 2 };
++                const lp: f32 = if (e.nan_at == i) std.math.nan(f32) else -@as(f32, @floatFromInt(i)) / 8;
++                row.* = .{ .token = t, .logprob = lp, .count = k, .rank = if (top) 1 else 2 };
+                 for (0..k) |j| {
+                     row.ids[j] = if (j > 0) @intCast('A' + j) else if (top) t else 'z';
+                     row.logprobs[j] = if (j == 0 and top) row.logprob else -@as(f32, @floatFromInt(j)) / 16;
+                 }
+             }
+-            sink.event(sink.ctx, id, &.{ .prompt_logprobs = prompt_rows[0 .. r.prompt.len - 1] });
++            sink.event(sink.ctx, id, &.{ .prompt_logprobs = .{
++                .rows = prompt_rows[0..rows_n],
++                .extra_logprobs = extra_lp[0 .. rows_n * stride],
++                .extra_ranks = extra_rk[0 .. rows_n * stride],
++                .stride = stride,
++            } });
+         }
+         const half = e.reply.len / 2;
+         for ([_][2]usize{ .{ 0, half }, .{ half, e.reply.len } }) |part| {
+@@ -173,8 +192,13 @@ fn send(reply: []const u32, thinking: bool, route: Route, body: []const u8) !Got
+ }
+ 
+ fn sendWith(reply: []const u32, thinking: bool, route: Route, body: []const u8, prompt_rows: bool) !Got {
++    return sendTuned(reply, thinking, route, body, prompt_rows, null);
++}
++
++fn sendTuned(reply: []const u32, thinking: bool, route: Route, body: []const u8, prompt_rows: bool, tune: ?*const fn (*Script) void) !Got {
+     var text: Text = .{};
+     var backend: Script = .{ .reply = reply, .prompt_rows = prompt_rows };
++    if (tune) |t| t(&backend);
+     var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
+         .served_name = "test-model",
+         .model_ids = &.{"test-model"},
+@@ -426,7 +450,7 @@ test "prompt_logprobs: null first, then each prompt token with its rank before t
+     const refused = [_]struct { route: Route, body: []const u8, rows: bool = true }{
+         .{ .route = .chat, .body = "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"prompt_logprobs\":1}" },
+         .{ .route = .completions, .body = "{\"model\":\"test-model\",\"prompt\":\"abc\",\"prompt_logprobs\":1,\"stream\":true}" },
+-        .{ .route = .completions, .body = "{\"model\":\"test-model\",\"prompt\":\"abc\",\"prompt_logprobs\":21}" },
++        .{ .route = .completions, .body = "{\"model\":\"test-model\",\"prompt\":\"abc\",\"prompt_logprobs\":200}" },
+         .{ .route = .completions, .body = "{\"model\":\"test-model\",\"prompt\":\"abc\",\"prompt_logprobs\":true}" },
+         .{ .route = .completions, .body = "{\"model\":\"test-model\",\"prompt\":\"abc\",\"prompt_logprobs\":1}", .rows = false },
+     };
+@@ -436,3 +460,105 @@ test "prompt_logprobs: null first, then each prompt token with its rank before t
+         try std.testing.expectEqual(@as(u16, 400), got.status);
+     }
+ }
++
++fn choiceOf(parsed: std.json.Value) std.json.Value {
++    return parsed.object.get("choices").?.array.items[0];
++}
++
++test "the dashboard's combined call: prompt_logprobs beside logprobs and echo, on one 200" {
++    const reply = tokensOf("Hi");
++    var got = try send(&reply, false, .completions, "{\"model\":\"test-model\",\"prompt\":\"abc\",\"max_tokens\":2,\"temperature\":0,\"prompt_logprobs\":5,\"logprobs\":2,\"echo\":true}");
++    defer got.deinit();
++    const parsed = try content(got); // 200
++    defer parsed.deinit();
++    const choice = choiceOf(parsed.value);
++    const rows = choice.object.get("prompt_logprobs").?.array.items;
++    try std.testing.expectEqual(@as(usize, 3), rows.len);
++    try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("prompt_logprobs_missing").?.array.items.len);
++    try std.testing.expect(choice.object.get("logprobs") != null and choice.object.get("logprobs").? != .null); // the reply's own rows, honored beside the prompt's
++    try std.testing.expect(std.mem.startsWith(u8, choice.object.get("text").?.string, "abc")); // echo: the prompt, then the completion
++}
++
++test "prompt_logprobs_token_ids: a flat list scores at every position, per-position lists at their own" {
++    const reply = tokensOf("Hi");
++    var flat = try send(&reply, false, .completions, "{\"model\":\"test-model\",\"prompt\":\"abc\",\"max_tokens\":2,\"prompt_logprobs\":1,\"prompt_logprobs_token_ids\":[7,8]}");
++    defer flat.deinit();
++    const parsed = try content(flat);
++    defer parsed.deinit();
++    const rows = choiceOf(parsed.value).object.get("prompt_logprobs").?.array.items;
++    for (rows[1..], 0..) |row, i| {
++        const entry = row.object.get("7").?.object;
++        try std.testing.expectEqual(@as(f64, -@as(f64, @floatFromInt(i)) - 7.5), entry.get("logprob").?.float);
++        try std.testing.expectEqual(@as(i64, @intCast(30 + i)), entry.get("rank").?.integer);
++        try std.testing.expect(row.object.get("8") != null);
++    }
++    var per = try send(&reply, false, .completions, "{\"model\":\"test-model\",\"prompt\":\"abc\",\"max_tokens\":2,\"prompt_logprobs\":1,\"prompt_logprobs_token_ids\":[[],[],[9]]}");
++    defer per.deinit();
++    const per_parsed = try content(per);
++    defer per_parsed.deinit();
++    const per_rows = choiceOf(per_parsed.value).object.get("prompt_logprobs").?.array.items;
++    try std.testing.expect(per_rows[1].object.get("9") == null); // position 1's list is empty
++    const ninth = per_rows[2].object.get("9").?.object;
++    try std.testing.expectEqual(@as(f64, -8.5), ninth.get("logprob").?.float);
++    try std.testing.expectEqual(@as(i64, 31), ninth.get("rank").?.integer);
++    // the refusals: ids without prompt_logprobs, an id outside the vocabulary, a wrong row count
++    for ([_][]const u8{
++        "{\"model\":\"test-model\",\"prompt\":\"abc\",\"max_tokens\":2,\"prompt_logprobs_token_ids\":[7]}",
++        "{\"model\":\"test-model\",\"prompt\":\"abc\",\"max_tokens\":2,\"prompt_logprobs\":1,\"prompt_logprobs_token_ids\":[500]}",
++        "{\"model\":\"test-model\",\"prompt\":\"abc\",\"max_tokens\":2,\"prompt_logprobs\":1,\"prompt_logprobs_token_ids\":[[7]]}",
++    }) |body| {
++        var got = try send(&reply, false, .completions, body);
++        defer got.deinit();
++        try std.testing.expectEqual(@as(u16, 400), got.status);
++    }
++}
++
++test "prompt_logprobs_missing names the positions whose token has no score, and none otherwise" {
++    const reply = tokensOf("Hi");
++    const tune = struct {
++        fn run(script: *Script) void {
++            script.nan_at = 1;
++        }
++    }.run;
++    var got = try sendTuned(&reply, false, .completions, "{\"model\":\"test-model\",\"prompt\":\"abc\",\"max_tokens\":2,\"prompt_logprobs\":1}", true, tune);
++    defer got.deinit();
++    const parsed = try content(got);
++    defer parsed.deinit();
++    const missing = parsed.value.object.get("prompt_logprobs_missing").?.array.items;
++    try std.testing.expectEqual(@as(usize, 1), missing.len);
++    try std.testing.expectEqual(@as(i64, 1), missing[0].integer);
++    const rows = choiceOf(parsed.value).object.get("prompt_logprobs").?.array.items;
++    try std.testing.expect(rows[1].object.get("98") == null); // no score: no entry for the token itself
++    try std.testing.expect(rows[2].object.get("99") != null); // its neighbour still scores
++}
++
++test "prompt_logprobs_format compact: ids, logprobs and actual, the token first" {
++    const reply = tokensOf("Hi");
++    var got = try send(&reply, false, .completions, "{\"model\":\"test-model\",\"prompt\":\"abc\",\"max_tokens\":2,\"prompt_logprobs\":1,\"prompt_logprobs_format\":\"compact\"}");
++    defer got.deinit();
++    const parsed = try content(got);
++    defer parsed.deinit();
++    const rows = choiceOf(parsed.value).object.get("prompt_logprobs").?.array.items;
++    try std.testing.expect(rows[0].object.get("ids") != null and rows[0].object.get("actual") != null); // position 0: empty but shaped
++    const row = rows[1].object;
++    try std.testing.expectEqual(@as(i64, 98), row.get("ids").?.array.items[0].integer); // the token itself first
++    try std.testing.expectEqual(@as(f64, -0.125), row.get("logprobs").?.array.items[0].float);
++    try std.testing.expectEqual(@as(i64, 98), row.get("actual").?.object.get("id").?.integer);
++    try std.testing.expectEqual(@as(f64, -0.125), row.get("actual").?.object.get("logprob").?.float);
++    try std.testing.expectEqual(@as(i64, 2), row.get("actual").?.object.get("rank").?.integer);
++    try std.testing.expect(row.get("98") == null); // no map entries in the compact form
++}
++
++test "prompt_token_ids: the ids the engine scored, beside prompt_logprobs only" {
++    const reply = tokensOf("Hi");
++    var got = try send(&reply, false, .completions, "{\"model\":\"test-model\",\"prompt\":\"abc\",\"max_tokens\":2,\"prompt_logprobs\":1}");
++    defer got.deinit();
++    const parsed = try content(got);
++    defer parsed.deinit();
++    const ids = choiceOf(parsed.value).object.get("prompt_token_ids").?.array.items;
++    try std.testing.expectEqual(@as(usize, 3), ids.len);
++    for (ids, 0..) |id, i| try std.testing.expectEqual(@as(i64, @intCast('a' + i)), id.integer);
++    var plain = try send(&reply, false, .completions, "{\"model\":\"test-model\",\"prompt\":\"abc\",\"max_tokens\":2}");
++    defer plain.deinit();
++    try std.testing.expect(std.mem.indexOf(u8, plain.body, "prompt_token_ids") == null);
++}
+diff --git a/zig/src/server/mailbox.zig b/zig/src/server/mailbox.zig
+index dcff5cef6..038b67497 100644
+--- a/zig/src/server/mailbox.zig
++++ b/zig/src/server/mailbox.zig
+@@ -12,7 +12,7 @@ pub const Mailbox = struct {
+     tokens: std.ArrayList(u32) = .empty,
+     chunks: std.ArrayList(usize) = .empty, // where each round's tokens end
+     rows: std.ArrayList(api.LogprobRow) = .empty, // one a token of `tokens`, for requests with logprobs
+-    prompt_rows: ?[]api.LogprobRow = null, // one a prompt token after the first, for requests with prompt_logprobs
++    prompt: ?api.PromptLogprobs = null, // the prompt's rows and requested ids' values, for prompt_logprobs requests
+     cached: ?u32 = null,
+     prefilled_ns: ?i96 = null,
+     finished: bool = false,
+@@ -33,7 +33,14 @@ pub const Mailbox = struct {
+                 m.prefilled_ns = std.Io.Clock.awake.now(m.io).toNanoseconds();
+             },
+             .logprobs => |r| m.rows.appendSlice(m.gpa, r) catch {},
+-            .prompt_logprobs => |r| m.prompt_rows = m.gpa.dupe(api.LogprobRow, r) catch null,
++            .prompt_logprobs => |p| {
++                m.prompt = .{
++                    .rows = m.gpa.dupe(api.LogprobRow, p.rows) catch &.{},
++                    .extra_logprobs = m.gpa.dupe(f32, p.extra_logprobs) catch &.{},
++                    .extra_ranks = m.gpa.dupe(u32, p.extra_ranks) catch &.{},
++                    .stride = p.stride,
++                };
++            },
+             .tokens => |t| {
+                 m.tokens.appendSlice(m.gpa, t) catch {};
+                 m.chunks.append(m.gpa, m.tokens.items.len) catch {};
+@@ -56,7 +63,11 @@ pub const Mailbox = struct {
+         m.tokens.deinit(m.gpa);
+         m.chunks.deinit(m.gpa);
+         m.rows.deinit(m.gpa);
+-        if (m.prompt_rows) |r| m.gpa.free(r);
++        if (m.prompt) |p| {
++            m.gpa.free(p.rows);
++            m.gpa.free(p.extra_logprobs);
++            m.gpa.free(p.extra_ranks);
++        }
+         m.gpa.free(m.widths);
+         m.gpa.free(m.raised);
+         m.gpa.free(m.telemetry);
+diff --git a/zig/src/server/main.zig b/zig/src/server/main.zig
+index 7ab94683a..ca86f2b5b 100644
+--- a/zig/src/server/main.zig
++++ b/zig/src/server/main.zig
+@@ -33,7 +33,7 @@ const usage_line = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--
+     " [--silence-redraw-budget-s SECONDS] [--silence-redraw-controls LIST]" ++
+     " [--short-reply-ratio R] [--short-reply-chars-per-s CPS]" ++
+     " [--register-redraw-st ST] [--register-redraw-high PERCENT] [--register-high-hz HZ]" ++
+-    " [--compact-at COMPACT_AT] [--compact-keep COMPACT_KEEP]" ++
++    " [--compact-at COMPACT_AT] [--compact-keep COMPACT_KEEP] [--prompt-logprobs-cap N]" ++
+     " [--compact-memory COMPACT_MEMORY] [--slide] [--slide-graph SLIDE_GRAPH] [--parallel PARALLEL]" ++
+     " [--cortheon] [--no-update-check] [--backend {auto,mlx,cuda}] [--device DEVICE]" ++
+     " [--segments SEGMENTS] model\n";
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index 2f4d1532c..4298c25ac 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -1,5 +1,6 @@
+ //! POST /v1/chat/completions and /v1/completions, JSON or SSE, as ``server.http`` answers them.
+ const std = @import("std");
++const api = @import("engine_api");
+ const json = @import("json");
+ const errors = @import("errors.zig");
+ const fields = @import("fields.zig");
+@@ -129,9 +130,11 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
+     const body = try fields.parseNumbers(cx, raw);
+     try fields.validateModalities(cx, body);
+     // rows need each token's exact bytes: a tokenizer whose decoding depends on context (null) can't give them
+-    const asked = if (is_chat) json.truthyField(body, "logprobs") else body.field("logprobs") != null;
+-    const exact_bytes = asked and srv.info.logprobs and (srv.text.tokenBytes(cx.a, 0) catch return error.OutOfMemory) != null;
+-    const logprobs = if (is_chat) try fields.probabilityOptions(cx, body, exact_bytes) else try fields.legacyLogprobs(cx, body, exact_bytes);
++    const bytes_ok = (srv.text.tokenBytes(cx.a, 0) catch return error.OutOfMemory) != null;
++    const logprobs = if (is_chat)
++        try fields.probabilityOptions(cx, body, json.truthyField(body, "logprobs") and srv.info.logprobs and bytes_ok)
++    else
++        try completionsLogprobs(cx, body, srv.info.logprobs and bytes_ok);
+     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
+     var input: chat.Input = .{ .fields = undefined };
+     if (is_chat) {
+@@ -163,7 +166,13 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
+     if (thinking.clear) |c| try sampling.put(cx.a, "clear_thinking", .{ .bool = c });
+     input.fields = .{ .object = sampling };
+     const streamed = if (body.get("stream")) |s| s.truthy() else false;
+-    input.prompt_logprobs = try fields.promptLogprobs(cx, body, !is_chat, streamed, srv.info.prompt_logprobs);
++    const cap: u8 = @intCast(@min(srv.config.prompt_logprobs_cap, api.logprob_max));
++    input.prompt_logprobs = try fields.promptLogprobs(cx, body, !is_chat, streamed, srv.info.prompt_logprobs, cap);
++    if (!is_chat) {
++        input.prompt_logprobs_ids = try fields.promptLogprobsIds(cx, body, srv.text.vocabSize(), api.logprob_extra_max);
++        input.prompt_logprobs_format = try fields.promptLogprobsFormat(cx, body);
++        input.echo = try fields.echo(cx, body);
++    }
+     if (logprobs != null) {
+         // 0.6.6's set: the rows describe the plain reply text, so nothing may reshape it
+         var structured = false;
+@@ -192,6 +201,15 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
+     };
+ }
+ 
++/// ``/v1/completions``' ``logprobs``: value-checked and honored when the backend gives rows; beside a
++/// ``prompt_logprobs`` request it is ignored rather than refused, so the prompt's rows keep the call alive.
++fn completionsLogprobs(cx: *Cx, body: Value, supported: bool) errors.Refused!?u8 {
++    if (body.field("logprobs") == null) return null;
++    if (supported) return try fields.legacyLogprobs(cx, body, true);
++    const prompt_lp = body.field("prompt_logprobs") != null;
++    return try fields.legacyLogprobs(cx, body, prompt_lp);
++}
++
+ /// A completion's prompt as the model reads it: token ids as given, anything else as text.
+ fn legacyPrompt(srv: *Server, cx: *Cx, prompt: ?Value) errors.Refused!chat.Prompt {
+     const p = prompt orelse return .{ .text = "" };
+@@ -472,17 +490,27 @@ const Run = struct {
+             try choice.put(a, "finish_reason", .{ .string = reply.finish_reason });
+             if (reply.logprobs) |lp| try choice.put(a, "logprobs", lp);
+         } else {
+-            try choice.put(a, "text", .{ .string = reply.content });
++            try choice.put(a, "text", .{ .string = if (r.plan.input.echo) try echoText(r.srv, a, r.plan.input.prompt, reply.content) else reply.content });
+             try choice.put(a, "finish_reason", .{ .string = reply.finish_reason });
+             var from: usize = 0;
+             try choice.put(a, "logprobs", if (reply.logprobs) |lp| try @import("logprobs.zig").legacy(a, lp, &from) else .null);
+-            if (reply.prompt_logprobs) |p| try choice.put(a, "prompt_logprobs", p);
++            if (reply.prompt_logprobs) |p| {
++                try choice.put(a, "prompt_logprobs", p);
++                const id_values = try a.alloc(Value, reply.prompt_ids.len);
++                for (reply.prompt_ids, id_values) |t, *slot| slot.* = try json.intValue(a, t);
++                try choice.put(a, "prompt_token_ids", .{ .array = id_values });
++            }
+         }
+         const list = try a.alloc(Value, 1);
+         list[0] = .{ .object = choice };
+         try o.put(a, "choices", .{ .array = list });
+         try o.put(a, "usage", try r.usage(reply));
+         try r.extras(o, reply);
++        if (reply.prompt_logprobs != null) { // every position's score, or the row the engine could not take
++            const missing = try a.alloc(Value, reply.prompt_missing.len);
++            for (reply.prompt_missing, missing) |position, *slot| slot.* = try json.intValue(a, position);
++            try o.put(a, "prompt_logprobs_missing", .{ .array = missing });
++        }
+         if (reply.loop_stop) |period| try o.put(a, "error", try @import("loop_stop.zig").errorBody(a, period));
+     }
+ 
+@@ -500,6 +528,10 @@ const Run = struct {
+             try r.out.vt.open(r.out.ctx, s.prompt_len);
+             s.opened = true;
+             if (!s.tools and r.is_chat) try r.emit(r.chunk(roleDelta(r.a) catch return error.Closed, null) catch return error.Closed);
++            if (!r.is_chat and r.plan.input.echo) { // echo: the prompt streams first, as vLLM's does
++                const prompt = echoPrompt(r.srv, r.a, r.plan.input.prompt) catch return error.Closed;
++                try r.emit(r.chunk(.{ .string = prompt }, null) catch return error.Closed);
++            }
+             for (s.pending.items) |delta| try call(ctx, delta);
+             s.pending.clearRetainingCapacity();
+         }
+@@ -656,3 +688,17 @@ const Run = struct {
+ fn roleDelta(a: Allocator) Allocator.Error!Value {
+     return chat.deltaOf(a, "role", "assistant");
+ }
++
++/// ``echo``'s text: the prompt as submitted (a text prompt verbatim, id prompts decoded) then the completion's.
++fn echoText(srv: *Server, a: Allocator, prompt: ?chat.Prompt, content: []const u8) Allocator.Error![]const u8 {
++    return std.mem.concat(a, u8, &.{ try echoPrompt(srv, a, prompt), content });
++}
++
++/// The prompt alone, as ``echoText`` repeats it.
++fn echoPrompt(srv: *Server, a: Allocator, prompt: ?chat.Prompt) Allocator.Error![]const u8 {
++    const p = prompt orelse return "";
++    return switch (p) {
++        .text => |t| t,
++        .ids => |id_list| srv.text.decode(a, id_list),
++    };
++}
+diff --git a/zig/src/server/serve.zig b/zig/src/server/serve.zig
+index 38cf1109f..72959a229 100644
+--- a/zig/src/server/serve.zig
++++ b/zig/src/server/serve.zig
+@@ -116,6 +116,12 @@ fn env(s: Setup, name: []const u8) ?[]const u8 {
+     return m.get(name);
+ }
+ 
++/// The tensor parallelism this rank serves, from the rank count the launcher gave every rank (1 alone).
++fn tensorParallel(s: Setup) u32 {
++    const w = env(s, "TF_GLM_WORLD") orelse return 1;
++    return std.fmt.parseInt(u32, std.mem.trim(u8, w, " "), 10) catch 1;
++}
++
+ /// Serves until a stop signal; the process exit status.
+ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+     stop_requested.store(false, .release);
+@@ -199,6 +205,9 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+         .cortheon_search_key = env(s, "BRAVE_SEARCH_API_KEY"),
+         .saved_conversations = args.learn_conversations,
+         .identity = s.identity,
++        .prompt_logprobs_cap = args.prompt_logprobs_cap,
++        .kv_cache = args.kv_cache,
++        .tensor_parallel = tensorParallel(s),
+         .environ = s.environ,
+     };
+     const srv = server_mod.Server.init(gpa, io, s.engine, s.text, config, if (store.enabled()) &store else null) catch |err| {
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index ea841d520..a822995d8 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -100,6 +100,13 @@ pub const Config = struct {
+     admission: @import("request_admission.zig").Limits = .{},
+     /// The open /health names these after its other keys; empty fields are left out.
+     identity: Identity = .{},
++    /// The most ``prompt_logprobs`` alternatives a request may ask for (--prompt-logprobs-cap; the row layout's
++    /// own ceiling is ``api.logprob_max``). /v1/models reports the effective value.
++    prompt_logprobs_cap: u32 = api.logprob_max,
++    /// --kv-cache, as the launch named it ("fp8", ...); empty when the engine's default stands. /v1/models reports it.
++    kv_cache: []const u8 = "",
++    /// --parallel: this server's tensor parallelism. /v1/models reports it.
++    tensor_parallel: u32 = 1,
+     /// The process environment GET /v1/benchmark/manifest reads (rank count, revision, the hardware probe); null: none.
+     environ: ?*const std.process.Environ.Map = null,
+ };
+@@ -163,6 +170,8 @@ pub const Server = struct {
+     cortheon: ?*cortheon.State = null,
+     /// Recall's record (--recall), which GET and DELETE /v1/recall read and empty; main opens and closes it.
+     recall: ?*api.recall_store.Store = null,
++    /// The checkpoint and launch facts /v1/models reports as ``tensorfold``; null when it learned none.
++    build: ?Value = null,
+ 
+     /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
+     pub fn init(gpa: Allocator, io: std.Io, engine: api.Engine, text: model_text.Text, config: Config, keys: ?*auth.Store) !*Server {
+@@ -227,9 +236,61 @@ pub const Server = struct {
+             var step: [32]u8 = undefined;
+             log.line("prompt chunks of up to {s} tokens, cut at replies {d}+ tokens apart", .{ live.commas(&step, srv.info.prefill_step), srv.chunks.min_chunk });
+         }
++        srv.build = buildInfo(srv);
+         return srv;
+     }
+ 
++    /// The checkpoint and launch facts /v1/models reports, read once here; null when the usual files are missing.
++    fn buildInfo(srv: *Server) ?Value {
++        if (srv.config.model_dir.len == 0) return null;
++        const a = srv.arena.allocator();
++        const dir = std.Io.Dir.cwd();
++        const path = std.fs.path.join(a, &.{ srv.config.model_dir, "config.json" }) catch return null;
++        const text = dir.readFileAlloc(srv.io, path, a, .limited(16 << 20)) catch return null;
++        const cfg = switch (json.parse(a, text) catch return null) {
++            .ok => |v| v,
++            .err => return null,
++        };
++        const o = json.newObject(a) catch return null;
++        if (cfg.get("quantization_config")) |q| if (q == .object) o.put(a, "quantization", q) catch return null; // format and bit/group settings as the checkpoint states them
++        if (cfg.get("torch_dtype")) |t| if (t == .string) o.put(a, "compute_dtype", t) catch return null;
++        if (cfg.get("rope_theta")) |t| if (t == .int or t == .float) o.put(a, "rope_theta", t) catch return null;
++        if (cfg.get("rope_scaling")) |t| if (t == .object) o.put(a, "rope_scaling", t) catch return null;
++        o.put(a, "checkpoint", .{ .string = srv.config.model_dir }) catch return null;
++        if (srv.info.checkpoint_digest[0] != 0) o.put(a, "checkpoint_sha256", .{ .string = &srv.info.checkpoint_digest }) catch return null;
++        if (srv.config.kv_cache.len > 0) o.put(a, "kv_cache_dtype", .{ .string = srv.config.kv_cache }) catch return null;
++        o.put(a, "tensor_parallel", json.intValue(a, srv.config.tensor_parallel) catch return null) catch return null;
++        if (srv.info.context_window > 0) o.put(a, "context", json.intValue(a, srv.info.context_window) catch return null) catch return null;
++        const drafts = srv.config.use_drafts and srv.info.draft_sources.drafter != null;
++        const spec = json.newObject(a) catch return null;
++        spec.put(a, "enabled", .{ .bool = drafts }) catch return null;
++        if (srv.info.draft_sources.drafter) |d| {
++            spec.put(a, "kind", .{ .string = d.kind }) catch return null;
++            if (d.name.len > 0) spec.put(a, "name", .{ .string = d.name }) catch return null;
++        }
++        o.put(a, "speculative", .{ .object = spec }) catch return null;
++        if (tokHash(srv, a)) |sha| o.put(a, "tokenizer_sha256", .{ .string = a.dupe(u8, &sha) catch return null }) catch return null;
++        o.put(a, "prompt_bos", .{ .bool = promptBos(srv, a) }) catch return null;
++        o.put(a, "prompt_logprobs_cap", json.intValue(a, @min(srv.config.prompt_logprobs_cap, api.logprob_max)) catch return null) catch return null;
++        return .{ .object = o };
++    }
++
++    /// sha256 of the checkpoint's tokenizer.json, the vocabulary's own bytes; null without the file.
++    fn tokHash(srv: *Server, a: Allocator) ?[32]u8 {
++        const path = std.fs.path.join(a, &.{ srv.config.model_dir, "tokenizer.json" }) catch return null;
++        const text = std.Io.Dir.cwd().readFileAlloc(srv.io, path, a, .limited(256 << 20)) catch return null;
++        var sha: [32]u8 = undefined;
++        std.crypto.hash.sha2.Sha256.hash(text, &sha, .{});
++        return sha;
++    }
++
++    /// Whether a raw completions text prompt gets a token prepended (BOS or the template's opening marker).
++    fn promptBos(srv: *Server, a: Allocator) bool {
++        const with = srv.text.encode(a, "tensorfold probe", true) catch return false;
++        const without = srv.text.encode(a, "tensorfold probe", false) catch return false;
++        return with.len > without.len;
++    }
++
+     pub fn stopKeepalive(srv: *Server) void {
+         if (srv.keepalive) |k| k.stop();
+         srv.keepalive = null;
+diff --git a/zig/src/server/status_routes.zig b/zig/src/server/status_routes.zig
+index f9e38ba7b..9f6db6a28 100644
+--- a/zig/src/server/status_routes.zig
++++ b/zig/src/server/status_routes.zig
+@@ -99,7 +99,7 @@ pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
+     else
+         null;
+     for (srv.config.model_ids, data) |id, *slot| {
+-        slot.* = try modelValue(a, id, srv.info, created, reasoning);
++        slot.* = try modelValue(a, id, srv.info, created, reasoning, srv.build);
+     }
+     const o = try json.newObject(a);
+     try o.put(a, "object", .{ .string = "list" });
+@@ -108,7 +108,7 @@ pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
+ }
+ 
+ /// Discovery extensions report the loaded engine's prompt-plus-reply limit; zero leaves it unspecified.
+-fn modelValue(a: Allocator, id: []const u8, info: api.Info, created: i64, reasoning: ?Value) Allocator.Error!Value {
++fn modelValue(a: Allocator, id: []const u8, info: api.Info, created: i64, reasoning: ?Value, build: ?Value) Allocator.Error!Value {
+     const m = try json.newObject(a);
+     try m.put(a, "id", .{ .string = id });
+     try m.put(a, "object", .{ .string = "model" });
+@@ -119,6 +119,7 @@ fn modelValue(a: Allocator, id: []const u8, info: api.Info, created: i64, reason
+         try m.put(a, "max_model_len", try json.intValue(a, info.context_window));
+     }
+     if (reasoning) |r| try m.put(a, "reasoning", r);
++    if (build) |b| try m.put(a, "tensorfold", b); // the build and tokenizer facts, for reproducible runs
+     return .{ .object = m };
+ }
+ 
+@@ -240,7 +241,7 @@ test "model discovery reports fitted engine context equally for its served name
+     defer arena.deinit();
+     const info: api.Info = .{ .context_window = 8192, .context_fitted = true };
+     for ([_][]const u8{ "served-model", "model-alias" }) |id| {
+-        const value = try modelValue(arena.allocator(), id, info, 123, null);
++        const value = try modelValue(arena.allocator(), id, info, 123, null, null);
+         try std.testing.expectEqualStrings(id, value.get("id").?.string);
+         try std.testing.expectEqual(@as(i64, 8192), value.get("context_length").?.int64().?);
+         try std.testing.expectEqual(value.get("context_length").?.int64(), value.get("max_model_len").?.int64());
+@@ -251,10 +252,10 @@ test "model discovery reports fitted engine context equally for its served name
+ test "model discovery omits an unspecified context and preserves the full u32 limit" {
+     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+     defer arena.deinit();
+-    const unlimited = try modelValue(arena.allocator(), "model", .{}, 0, null);
++    const unlimited = try modelValue(arena.allocator(), "model", .{}, 0, null, null);
+     try std.testing.expect(unlimited.get("context_length") == null);
+     try std.testing.expect(unlimited.get("max_model_len") == null);
+-    const bounded = try modelValue(arena.allocator(), "model", .{ .context_window = std.math.maxInt(u32) }, 0, null);
++    const bounded = try modelValue(arena.allocator(), "model", .{ .context_window = std.math.maxInt(u32) }, 0, null, null);
+     try std.testing.expectEqual(@as(i64, std.math.maxInt(u32)), bounded.get("max_model_len").?.int64().?);
+ }
+ 
+@@ -262,9 +263,9 @@ test "model discovery adds reasoning to an entry only when the model has it" {
+     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+     defer arena.deinit();
+     const a = arena.allocator();
+-    const plain = try modelValue(a, "model", .{}, 0, null);
++    const plain = try modelValue(a, "model", .{}, 0, null, null);
+     try std.testing.expect(plain.get("reasoning") == null);
+-    const thinking = try modelValue(a, "model", .{}, 0, try reasoningValue(a, true, true, null, &.{"low"}));
++    const thinking = try modelValue(a, "model", .{}, 0, try reasoningValue(a, true, true, null, &.{"low"}), null);
+     try std.testing.expect(thinking.get("reasoning").?.get("default_enabled").?.bool);
+ }
+ 
+diff --git a/zig/tests/cuda/sample_tests.zig b/zig/tests/cuda/sample_tests.zig
+index c0810ee95..a260b213d 100644
+--- a/zig/tests/cuda/sample_tests.zig
++++ b/zig/tests/cuda/sample_tests.zig
+@@ -201,7 +201,7 @@ pub fn topk(gpu: Gpu) !void {
+         }
+         try logits.uploadAsync(0, std.mem.sliceAsBytes(host[0 .. n_rows * n]), stream.handle);
+         for (ks) |k| {
+-            try d.logprobRows(stream, logits.ptr, n, picks.ptr, k, false, want_dev.ptr, n_rows);
++            try d.logprobRows(stream, logits.ptr, n, picks.ptr, k, false, want_dev.ptr, n_rows, 0, 0);
+             try d.topkRows(stream, logits.ptr, n, k, parts.ptr, got_dev.ptr, n_rows);
+             try stream.synchronize();
+             var want: [n_rows * lp_words]u32 = undefined;
+-- 
+2.53.0
+
