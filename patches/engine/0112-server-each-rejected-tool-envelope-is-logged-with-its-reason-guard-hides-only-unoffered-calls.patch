@@ -1,0 +1,470 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Thu, 12 Nov 2026 13:22:46 +0530
+Subject: [PATCH] server: each rejected tool envelope is logged with its
+ reason, and TF_TOOL_CALL_GUARD hides only calls to unoffered tools, never
+ emptying a reply
+
+Ported onto f350cd3 + patches 0001-0109 and 0101 (this recipe's guard port, whose result is the base Spark wrote
+against) from the 2x DGX Spark recipe's patch 0112 (2026-11-09), verbatim: after it, openai.zig, tool_guard.zig,
+tool_stream.zig and late_system_test.zig are byte-identical to that recipe's final tree.
+
+A Hermes agent report (2026-11-06) found the guard's offered-tools path turning visible failures into silent ones:
+with tools offered it hid malformed envelopes too, so a reply holding only a call came back empty, the agent retried
+it blind (an empty reply reads as a failed generation), each retry hid the call again, and the turn died on a client
+timeout. The only log line was a count with no request id, no name and no reason, so what the model wrote could not
+be recovered.
+
+tool_parse.parse returns each rejected envelope (Rejection: reason unknown_tool_name or malformed, the tool name when
+one can be read, the envelope's text); parseWith takes Options.hide_unoffered, which leaves a well-formed call to an
+unoffered tool out of the content and keeps a malformed one. attachCalls logs one line per rejection,
+"tool call rejected from ID: REASON ['NAME'] (N tools offered) thinking= effort=; FATE", plus "unclosed" for a call
+the end token cut before its closer; TF_TOOL_CALL_DEBUG=1 adds the envelope text, escaped to one line. With the
+guard on and tools offered, a reply that hiding would leave with no text and no call keeps its envelopes.
+The no-tools guard path is unchanged.
+
+A call to Hermes' offered "tool_call" bridge whose calls[0] lacks a name is that tool's call (the client's
+"tool_call calls[0] requires a 'name'"), not a nameless call the server let through: tested as such.
+---
+ zig/src/server/late_system_test.zig |  76 +++++++++++++++++++
+ zig/src/server/openai.zig           |  43 +++++++++--
+ zig/src/server/tool_guard.zig       | 114 ++++++++++++++++++++++++++--
+ zig/src/server/tool_parse.zig       |  58 +++++++++++++-
+ zig/src/server/tool_parse_test.zig  |   1 +
+ zig/src/server/tool_stream.zig      |   2 +-
+ 6 files changed, 278 insertions(+), 16 deletions(-)
+
+diff --git a/zig/src/server/late_system_test.zig b/zig/src/server/late_system_test.zig
+index 3798da4c..8884266f 100644
+--- a/zig/src/server/late_system_test.zig
++++ b/zig/src/server/late_system_test.zig
+@@ -550,6 +550,82 @@ test "tool visibility HTTP: streamed replies retain an unoffered call" {
+     try unofferedVisible(true);
+ }
+ 
++/// A reply's text, whether it carried tool_calls, and its finish_reason, whole or streamed, with TF_TOOL_CALL_GUARD on.
++fn guarded(a: std.mem.Allocator, reply: []const u8, streaming: bool) !struct { content: []const u8, calls: bool, finish: []const u8 } {
++    const tool_guard = @import("tool_guard.zig");
++    tool_guard.setForTest(true);
++    defer tool_guard.setForTest(null);
++    var text: DropLate = .{};
++    var backend: Capture = .{ .reply = reply };
++    defer std.testing.allocator.free(backend.prompt);
++    const srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
++        .served_name = "m",
++        .model_ids = &.{"m"},
++        .enable_thinking = false,
++        .use_drafts = false,
++    }, null);
++    defer srv.deinit();
++    const got = try exchange(srv, "/v1/chat/completions", try std.mem.concat(a, u8, &.{ prose_chat, if (streaming) ",\"stream\":true}" else "}" }));
++    defer std.testing.allocator.free(got.body);
++    try std.testing.expectEqual(@as(u16, 200), got.status);
++    if (!streaming) {
++        const choice = (try json.parse(a, try a.dupe(u8, got.body))).ok.get("choices").?.array[0];
++        const message = choice.get("message").?;
++        const content = if (message.get("content")) |c| (if (c == .string) c.string else "") else "";
++        return .{ .content = content, .calls = message.get("tool_calls") != null, .finish = choice.get("finish_reason").?.string };
++    }
++    var content: std.ArrayList(u8) = .empty;
++    var calls = false;
++    var finish: []const u8 = "";
++    var lines = std.mem.splitScalar(u8, got.body, '\n');
++    while (lines.next()) |line| {
++        if (!std.mem.startsWith(u8, line, "data: ")) continue;
++        const data = std.mem.trim(u8, line[6..], "\r");
++        if (std.mem.eql(u8, data, "[DONE]")) continue;
++        const payload = (try json.parse(a, try a.dupe(u8, data))).ok;
++        for (payload.get("choices").?.array) |choice| {
++            const delta = choice.get("delta").?;
++            if (delta.get("content")) |part| if (part == .string) try content.appendSlice(a, part.string);
++            if (delta.get("tool_calls") != null) calls = true;
++            if (choice.get("finish_reason")) |reason| if (reason == .string) {
++                finish = reason.string;
++            };
++        }
++    }
++    return .{ .content = content.items, .calls = calls, .finish = finish };
++}
++
++test "tool visibility HTTP: guard on, tools offered: an unoffered call leaves prose, but never empties a reply" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const unoffered = "<tool_call>drive_preview<arg_key>id</arg_key><arg_value>7</arg_value></tool_call>";
++    for ([_]bool{ false, true }) |streaming| {
++        const with_prose = try guarded(a, "Checking." ++ unoffered, streaming);
++        try std.testing.expectEqualStrings("Checking.", with_prose.content);
++        try std.testing.expect(!with_prose.calls);
++        // the call was all the reply held: it stays, so the client sees what the model wrote instead of nothing
++        const alone = try guarded(a, unoffered, streaming);
++        try std.testing.expectEqualStrings(unoffered, alone.content);
++        try std.testing.expectEqualStrings("stop", alone.finish);
++    }
++}
++
++test "tool visibility HTTP: guard on, tools offered: a malformed call stays as text, an offered call parses" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const malformed = "<tool_call>{\"arguments\":{\"q\":\"a\"}}</tool_call>"; // no name: never a tool_calls entry
++    for ([_]bool{ false, true }) |streaming| {
++        const bad = try guarded(a, "Looking." ++ malformed, streaming);
++        try std.testing.expectEqualStrings("Looking." ++ malformed, bad.content);
++        try std.testing.expect(!bad.calls);
++        const good = try guarded(a, prose_reply, streaming);
++        try std.testing.expect(good.calls);
++        try std.testing.expectEqualStrings("tool_calls", good.finish);
++    }
++}
++
+ test "a tool-call reply warms the tool turn's opening and a plain reply the user turn's" {
+     var text: DropLate = .{};
+     var backend: Capture = .{ .reply = prose_reply, .warm_turns = true };
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index dfc1069c..2f4d1532 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -346,16 +346,28 @@ const Run = struct {
+             }
+             return null;
+         }
+-        const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
+-        if (parsed.rejected_envelopes > 0) log.line("warning: kept {d} malformed or unoffered tool envelopes as content", .{parsed.rejected_envelopes});
++        // TF_TOOL_CALL_GUARD: a well-formed call to a tool the request did not offer leaves the reply; a malformed one stays
++        var parsed = try tool_parse.parseWith(r.a, reply.content, tools, r.plan.policy.maxCalls(), .{ .hide_unoffered = r.plan.policy.drop_rejected });
++        var hidden: usize = 0;
++        for (parsed.rejections) |j| hidden += @intFromBool(j.hidden);
++        // ...unless hiding would leave the reply with nothing in it: an empty reply reads as a failed generation, and an
++        // agent retries it blind, to the same call hidden again
++        const kept_whole = hidden > 0 and parsed.calls == null and parsed.content.len == 0;
++        if (kept_whole) {
++            parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
++            hidden = 0;
++        }
++        r.logRejections(reply, parsed.rejections, tools.len, kept_whole);
+         // max_tokens cut a call the stream had begun: the whole reply returns it cut too, as the stream did (#1238)
+         const cut = if (!r.plan.policy.single and std.mem.eql(u8, reply.finish_reason, "length")) try tool_stream.cutCalls(r.a, reply.content, tools) else null;
+         if (cut != null) reply.content = try @import("reply_text.zig").cutProse(r.a, reply.content);
+         const found = cut orelse parsed.calls;
+-        // TF_TOOL_CALL_GUARD: the envelopes the parser kept as text (unoffered tools, malformed calls) leave the reply
+-        const dropped = r.plan.policy.drop_rejected and parsed.rejected_envelopes > 0;
+-        const base = if (dropped) try tool_stream.hideCalls(r.a, parsed.content) else parsed.content;
+-        if (dropped) log.line("tool-call guard: hid {d} unoffered or malformed tool envelopes from {s}", .{ parsed.rejected_envelopes, r.id });
++        // a call the end token cut before its closer (not max_tokens): the reply keeps it as text, the log says so
++        if (cut == null and !std.mem.eql(u8, reply.finish_reason, "length")) if (tool_parse.openCall(parsed.content)) |at|
++            r.logRejection(reply, "unclosed", tool_parse.leadName(parsed.content[at + "<tool_call>".len ..]), parsed.content[at..], tools.len, "kept as text");
++        const dropped = hidden > 0;
++        const base = parsed.content;
++        if (dropped) log.line("tool-call guard: hid {d} call(s) to unoffered tools from {s}", .{ hidden, r.id });
+         const calls = (if (r.turn != null) cortheon.clientCalls(found) else found) orelse {
+             if (r.plan.policy.single or parsed.calls != null or dropped) reply.content = try r.plan.policy.parsedContent(r.a, base);
+             return null;
+@@ -367,6 +379,25 @@ const Run = struct {
+         return if (r.plan.policy.single and calls.len > 1) calls[0..1] else calls;
+     }
+ 
++    /// One line per envelope the parser rejected (#T1): the request, why, the name, the mode, what became of it.
++    fn logRejections(r: *Run, reply: *const chat.Reply, list: []const tool_parse.Rejection, offered: usize, kept_whole: bool) void {
++        for (list) |j| {
++            const fate = if (j.hidden) "hidden (TF_TOOL_CALL_GUARD)" else if (kept_whole) "kept as text (hiding it would leave the reply empty)" else "kept as text";
++            r.logRejection(reply, j.reason.label(), j.name, j.envelope, offered, fate);
++        }
++    }
++
++    /// ``tool call rejected from ID: REASON ['NAME'] (N tools offered) thinking= effort=; FATE``, and with
++    /// TF_TOOL_CALL_DEBUG=1 the envelope itself, escaped and cut to a line.
++    fn logRejection(r: *Run, reply: *const chat.Reply, reason: []const u8, name: []const u8, envelope: []const u8, offered: usize, fate: []const u8) void {
++        var nb: [160]u8 = undefined;
++        const effort = if (reply.thinking) reply.effort orelse "none" else "none";
++        log.line("tool call rejected from {s}: {s} ['{s}'] ({d} tools offered) thinking={s} effort={s}; {s}", .{ r.id, reason, tool_guard.escaped(&nb, name), offered, if (reply.thinking) "True" else "False", effort, fate });
++        if (!tool_guard.debug()) return;
++        var eb: [1200]u8 = undefined;
++        log.line("tool call rejected from {s}: envelope ({d} bytes) {s}", .{ r.id, envelope.len, tool_guard.escaped(&eb, envelope) });
++    }
++
+     fn fail(r: *Run, cx: *const Cx, field: []const u8) void {
+         const a = r.a;
+         const kind_ok = cx.kind != .other and cx.kind != .server;
+diff --git a/zig/src/server/tool_guard.zig b/zig/src/server/tool_guard.zig
+index b73abdfa..a14383b8 100644
+--- a/zig/src/server/tool_guard.zig
++++ b/zig/src/server/tool_guard.zig
+@@ -1,8 +1,10 @@
+ //! TF_TOOL_CALL_GUARD=1: a chat request that offers no tools (none sent, or tool_choice "none") although its history
+ //! called them gets a closing system note that tools are unavailable, and any tool-call markup the model writes anyway
+ //! is hidden from the reply (tool_stream.Policy.guard) instead of reaching the client as text. A request that does offer
+-//! tools has the envelopes the parser keeps as text (a call to a tool it did not offer, a malformed call) hidden the same
+-//! way (Policy.drop_rejected). Off by default.
++//! tools has its well-formed calls to tools it did not offer hidden (Policy.drop_rejected, tool_parse.Options); a
++//! malformed call stays as text, and a reply that hiding would leave empty keeps its calls, since an empty reply reads
++//! as a failed generation that agents retry blind. Off by default. Every rejected envelope is logged with its reason
++//! (``tool call rejected from ID: REASON ['NAME'] ...``); TF_TOOL_CALL_DEBUG=1 adds its text.
+ const std = @import("std");
+ const json = @import("json");
+ const Value = json.Value;
+@@ -12,16 +14,59 @@ const Allocator = std.mem.Allocator;
+ pub const note = "Tools are not available for this reply. Answer in plain text from what you already have; do not write tool calls.";
+ 
+ var cached: std.atomic.Value(u8) = .init(0); // 0 unread, 1 off, 2 on
++var cached_debug: std.atomic.Value(u8) = .init(0);
+ 
+ /// Whether TF_TOOL_CALL_GUARD is 1 (read once).
+ pub fn on() bool {
+-    const v = cached.load(.monotonic);
++    return flag(&cached, "TF_TOOL_CALL_GUARD");
++}
++
++/// Tests set the guard on or off; ``null`` makes the next ``on`` read the environment again.
++pub fn setForTest(v: ?bool) void {
++    cached.store(if (v) |set| (if (set) 2 else 1) else 0, .monotonic);
++}
++
++/// Whether TF_TOOL_CALL_DEBUG is 1 (read once): each rejected tool envelope's text goes to the log beside its reason.
++pub fn debug() bool {
++    return flag(&cached_debug, "TF_TOOL_CALL_DEBUG");
++}
++
++fn flag(slot: *std.atomic.Value(u8), comptime name: [:0]const u8) bool {
++    const v = slot.load(.monotonic);
+     if (v != 0) return v == 2;
+-    const set = if (std.c.getenv("TF_TOOL_CALL_GUARD")) |s| std.mem.eql(u8, std.mem.span(s), "1") else false;
+-    cached.store(if (set) 2 else 1, .monotonic);
++    const set = if (std.c.getenv(name)) |s| std.mem.eql(u8, std.mem.span(s), "1") else false;
++    slot.store(if (set) 2 else 1, .monotonic);
+     return set;
+ }
+ 
++/// `s` on one log line in `buf`: newline, tab, CR, backslash and other control bytes escaped, and when it does not fit,
++/// its head, "...", and the count of bytes left out.
++pub fn escaped(buf: []u8, s: []const u8) []const u8 {
++    const room = buf.len -| 32; // the tail note's room
++    var n: usize = 0;
++    for (s, 0..) |ch, i| {
++        var tmp: [4]u8 = undefined;
++        const piece: []const u8 = switch (ch) {
++            '\n' => "\\n",
++            '\r' => "\\r",
++            '\t' => "\\t",
++            '\\' => "\\\\",
++            0...8, 11, 12, 14...31, 127 => std.fmt.bufPrint(&tmp, "\\x{x:0>2}", .{ch}) catch unreachable,
++            else => blk: {
++                tmp[0] = ch;
++                break :blk tmp[0..1];
++            },
++        };
++        if (n + piece.len > room) {
++            const tail = std.fmt.bufPrint(buf[n..], "...(+{d} bytes)", .{s.len - i}) catch "";
++            return buf[0 .. n + tail.len];
++        }
++        @memcpy(buf[n..][0..piece.len], piece);
++        n += piece.len;
++    }
++    return buf[0..n];
++}
++
+ /// Whether `messages` (the normalized list) holds a tool result or an assistant turn with tool calls.
+ pub fn usedTools(messages: Value) bool {
+     if (messages != .array) return false;
+@@ -88,3 +133,62 @@ test "hideCalls: drop_rejected's filter keeps prose around an unoffered call" {
+     try std.testing.expectEqualStrings("Let me check. ok", try hide(a, "Let me check.<tool_call>session_search<arg_key>q</arg_key><arg_value>x</arg_value></tool_call> ok"));
+     try std.testing.expectEqualStrings("plain", try hide(a, "plain"));
+ }
++
++test "parse: each rejected envelope carries its reason and name; hide_unoffered drops only well-formed unoffered calls" {
++    const tp = @import("tool_parse.zig");
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"shell_command\",\"parameters\":{\"type\":\"object\"}}}]")).ok.array;
++    const unoffered = "<tool_call>drive_preview<arg_key>id</arg_key><arg_value>7</arg_value></tool_call>";
++    // a dropped key name is not a rejection outside single-call mode: the call parses with no arguments
++    const missing_key = "<tool_call>shell_command<arg_key><arg_value>echo hi</arg_value></tool_call>";
++    const multiline_name = "<tool_call>shell\ncommand<arg_key>command</arg_key><arg_value>ls</arg_value></tool_call>";
++    const nameless = "<tool_call>{\"arguments\":{\"command\":\"ls\"}}</tool_call>";
++    const empty_name = "<tool_call><arg_key>command</arg_key><arg_value>ls</arg_value></tool_call>";
++    const good = "<tool_call>shell_command<arg_key>command</arg_key><arg_value>ls</arg_value></tool_call>";
++    const Case = struct { text: []const u8, reason: tp.Reason, name: []const u8 };
++    for ([_]Case{
++        .{ .text = unoffered, .reason = .unknown_tool_name, .name = "drive_preview" },
++        .{ .text = multiline_name, .reason = .malformed, .name = "shell" },
++        .{ .text = nameless, .reason = .malformed, .name = "" },
++        .{ .text = empty_name, .reason = .malformed, .name = "" },
++    }) |c| {
++        const r = try tp.parse(a, try std.mem.concat(a, u8, &.{ "Prose. ", c.text }), tools, null);
++        try std.testing.expect(r.calls == null); // a nameless or unoffered call is never a tool_calls entry
++        try std.testing.expectEqual(@as(usize, 1), r.rejections.len);
++        try std.testing.expectEqual(c.reason, r.rejections[0].reason);
++        try std.testing.expectEqualStrings(c.name, r.rejections[0].name);
++        try std.testing.expectEqualStrings(c.text, r.rejections[0].envelope);
++        try std.testing.expect(!r.rejections[0].hidden);
++    }
++    const lenient = try tp.parse(a, missing_key, tools, null);
++    try std.testing.expectEqualStrings("{}", lenient.calls.?[0].get("function").?.get("arguments").?.string);
++    try std.testing.expectEqual(@as(usize, 1), (try tp.parse(a, missing_key, tools, 1)).rejections.len);
++    // a mixed batch under the guard: the good call parses, the unoffered one leaves, the malformed one stays, prose stays
++    const hid = try tp.parseWith(a, "Let me look." ++ good ++ unoffered ++ nameless, tools, null, .{ .hide_unoffered = true });
++    try std.testing.expectEqual(@as(usize, 1), hid.calls.?.len);
++    try std.testing.expectEqualStrings("Let me look." ++ nameless, hid.content);
++    try std.testing.expectEqual(@as(usize, 2), hid.rejections.len);
++    try std.testing.expect(hid.rejections[0].hidden and !hid.rejections[1].hidden);
++}
++
++test "parse: a call to Hermes' offered tool_call bridge is that tool's call, whatever its arguments hold" {
++    const tp = @import("tool_parse.zig");
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"tool_call\",\"parameters\":{\"type\":\"object\",\"properties\":{\"calls\":{\"type\":\"array\"}}}}}]")).ok.array;
++    // calls[0] has no name: the client's tool refuses it ("tool_call calls[0] requires a 'name'"); the server forwards it
++    const r = try tp.parse(a, "<tool_call>tool_call<arg_key>calls</arg_key><arg_value>[{\"arguments\":{}}]</arg_value></tool_call>", tools, null);
++    try std.testing.expectEqualStrings("tool_call", r.calls.?[0].get("function").?.get("name").?.string);
++    try std.testing.expectEqual(@as(usize, 0), r.rejections.len);
++}
++
++test "escaped: one log line, control bytes escaped, a long envelope cut with its count" {
++    var wide: [64]u8 = undefined;
++    try std.testing.expectEqualStrings("a\\nb\\tc\\\\\\x01", escaped(&wide, "a\nb\tc\\\x01"));
++    var buf: [40]u8 = undefined; // 8 bytes of text beside the 32 kept for the note
++    const long: [100]u8 = @splat('x');
++    try std.testing.expectEqualStrings("xxxxxxxx...(+92 bytes)", escaped(&buf, &long));
++}
+diff --git a/zig/src/server/tool_parse.zig b/zig/src/server/tool_parse.zig
+index d612bbd1..bf261fee 100644
+--- a/zig/src/server/tool_parse.zig
++++ b/zig/src/server/tool_parse.zig
+@@ -20,7 +20,26 @@ const Error = tool_dsml.Error;
+ const Call = tool_dsml.Call;
+ const Envelope = struct { start: usize, end: usize, payload: []const u8, complete: bool = true };
+ 
+-pub const Parsed = struct { content: []const u8, calls: ?[]Value, rejected_envelopes: usize = 0 };
++pub const Parsed = struct { content: []const u8, calls: ?[]Value, rejected_envelopes: usize = 0, rejections: []const Rejection = &.{} };
++
++/// Why a whole envelope did not become a call: it names a tool the request did not offer (it parses as a call), or it
++/// is not a call in any spelling the parser reads (a missing key, a stray tag, an empty name, broken JSON).
++pub const Reason = enum {
++    unknown_tool_name,
++    malformed,
++
++    pub fn label(r: Reason) []const u8 {
++        return @tagName(r);
++    }
++};
++
++/// One rejected envelope: why, the tool name it carries (empty when none can be read), its text, and whether
++/// ``Options.hide_unoffered`` left it out of the content.
++pub const Rejection = struct { reason: Reason, name: []const u8, envelope: []const u8, hidden: bool = false };
++
++/// ``hide_unoffered`` (TF_TOOL_CALL_GUARD with tools offered): a well-formed call to a tool the request did not offer
++/// leaves the content; a malformed envelope always stays, so the client and the log can see what the model wrote.
++pub const Options = struct { hide_unoffered: bool = false };
+ 
+ fn findCI(hay: []const u8, needle: []const u8, from: usize) ?usize {
+     if (from > hay.len) return null;
+@@ -99,6 +118,11 @@ fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
+ 
+ /// ``parse_tool_calls_from_content``: the reply's content and its calls (null when it makes none).
+ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize) Allocator.Error!Parsed {
++    return parseWith(a, text, tools, max_calls, .{});
++}
++
++/// ``parse`` with its ``Options``.
++pub fn parseWith(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize, opts: Options) Allocator.Error!Parsed {
+     if (tools.len == 0) return .{ .content = text, .calls = null };
+     var known: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+     for (tools) |tool| {
+@@ -113,6 +137,7 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
+     var residue: std.ArrayList(u8) = .empty;
+     var cursor: usize = 0;
+     var rejected: usize = 0;
++    var rejections: std.ArrayList(Rejection) = .empty;
+     for (envs) |env| {
+         try residue.appendSlice(a, text[cursor..env.start]);
+         cursor = env.end;
+@@ -144,7 +169,10 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
+             }
+         }
+         const list = parsed orelse {
+-            try residue.appendSlice(a, text[env.start..env.end]);
++            const why = try rejection(a, env.payload, &schemas, &known, max_calls != null);
++            const hide = opts.hide_unoffered and why.reason == .unknown_tool_name;
++            if (!hide) try residue.appendSlice(a, text[env.start..env.end]);
++            try rejections.append(a, .{ .reason = why.reason, .name = why.name, .envelope = text[env.start..env.end], .hidden = hide });
+             rejected += 1;
+             continue;
+         };
+@@ -154,7 +182,23 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
+         }
+     }
+     try residue.appendSlice(a, text[cursor..]);
+-    return .{ .content = strip(residue.items), .calls = if (calls.items.len > 0) calls.items else null, .rejected_envelopes = rejected };
++    return .{ .content = strip(residue.items), .calls = if (calls.items.len > 0) calls.items else null, .rejected_envelopes = rejected, .rejections = rejections.items };
++}
++
++/// Why ``offeredCalls`` refused ``block``: the calls it holds when it parses, read without the offered set, name a tool
++/// the request did not offer; otherwise it is malformed, under the name its GLM spelling begins with when there is one.
++fn rejection(a: Allocator, block: []const u8, schemas: *const tool_params.Schemas, known: *const std.StringArrayHashMapUnmanaged([]const u8), complete: bool) Allocator.Error!struct { reason: Reason, name: []const u8 } {
++    if (try anyCalls(a, block, schemas, complete)) |list| {
++        for (list) |c| if ((try callName(a, c, known)) == null) return .{ .reason = .unknown_tool_name, .name = strip(c.name) };
++    }
++    return .{ .reason = .malformed, .name = leadName(block) };
++}
++
++/// The one-line name a GLM payload starts with (``NAME<arg_key>...``), or "" when it starts with none.
++pub fn leadName(block: []const u8) []const u8 {
++    const cut = std.mem.indexOfAny(u8, block, "<{[\n\r") orelse block.len;
++    const name = strip(block[0..cut]);
++    return if (name.len <= 64) name else "";
+ }
+ 
+ /// Openers inside a rejected envelope tried, from the last: a bound keeps a reply of quoted openers linear.
+@@ -189,6 +233,13 @@ fn lastOpener(text: []const u8, from: usize, before: usize) ?usize {
+ 
+ /// A payload's calls when it parses whole and each names an offered tool; null when it is not such a call.
+ fn offeredCalls(a: Allocator, block: []const u8, schemas: *const tool_params.Schemas, known: *const std.StringArrayHashMapUnmanaged([]const u8), complete: bool) Allocator.Error!?[]Call {
++    const list = try anyCalls(a, block, schemas, complete) orelse return null;
++    for (list) |c| if ((try callName(a, c, known)) == null) return null;
++    return list;
++}
++
++/// A payload's calls when it parses whole, whatever tools they name; null when it is not a call.
++fn anyCalls(a: Allocator, block: []const u8, schemas: *const tool_params.Schemas, complete: bool) Allocator.Error!?[]Call {
+     const parsed: ?[]Call = blk: {
+         if (tool_dsml.whole(block)) |b| {
+             break :blk tool_dsml.calls(a, b.inner, b.spelling) catch |e| switch (e) {
+@@ -209,7 +260,6 @@ fn offeredCalls(a: Allocator, block: []const u8, schemas: *const tool_params.Sch
+     };
+     const list = parsed orelse return null;
+     if (list.len == 0) return null;
+-    for (list) |c| if ((try callName(a, c, known)) == null) return null;
+     return list;
+ }
+ 
+diff --git a/zig/src/server/tool_parse_test.zig b/zig/src/server/tool_parse_test.zig
+index ee8d4916..f45f95fa 100644
+--- a/zig/src/server/tool_parse_test.zig
++++ b/zig/src/server/tool_parse_test.zig
+@@ -574,6 +574,7 @@ test "GLM pairs from the cached key and value ends are the pairs each key's own
+ 
+ test {
+     _ = @import("tool_parse_visibility_test.zig");
++    _ = @import("tool_guard.zig"); // rejection reasons, the guard's hiding, log escaping
+ }
+ 
+ test "prose that quotes the opener ahead of a call does not swallow the call" {
+diff --git a/zig/src/server/tool_stream.zig b/zig/src/server/tool_stream.zig
+index babd064f..2b4bfc5b 100644
+--- a/zig/src/server/tool_stream.zig
++++ b/zig/src/server/tool_stream.zig
+@@ -480,7 +480,7 @@ fn callTag(name: []const u8) bool {
+ pub const Policy = struct {
+     single: bool = false,
+     guard: bool = false,
+-    drop_rejected: bool = false, // TF_TOOL_CALL_GUARD with tools offered: unoffered or malformed envelopes leave the reply
++    drop_rejected: bool = false, // TF_TOOL_CALL_GUARD with tools offered: well-formed calls to unoffered tools leave the reply (tool_parse.Options)
+     filter: TextFilter = .{},
+ 
+     pub fn filtering(p: *const Policy) bool {
+-- 
+2.43.0
+

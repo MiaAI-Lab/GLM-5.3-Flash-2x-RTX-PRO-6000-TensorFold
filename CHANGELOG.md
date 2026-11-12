@@ -1,5 +1,29 @@
 # Changelog
 
+- **2026-11-12** -- Ported from the 2x DGX Spark recipe's tool-call-guard round. Not yet built on this host: all 109
+  patches apply to `f350cd3e` with the Dockerfile's loop, and `scripts/tests/run.sh` passes.
+  - Engine patch 0101, `TF_TOOL_CALL_GUARD=1` (opt-in, off by default; that recipe's 0107, ported here 2026-11-05
+    and live on this host's deployment since 2026-11-07, image `5a91310bda8a`): a chat request that offers no tools
+    although its history called them gets a closing system note and its call markup hidden; a request that offers
+    tools has the envelopes the parser keeps as text hidden, streamed or whole, each logged.
+  - Engine patch 0112 (that recipe's 0112, verbatim; its base is 0101's result here byte for byte): each rejected
+    tool envelope is logged one by one — `tool call rejected from ID: REASON ['NAME'] (N tools offered)
+    thinking= effort=; FATE`, reasons `unknown_tool_name`, `malformed` and `unclosed`, and `TF_TOOL_CALL_DEBUG=1`
+    adds the envelope's text. With tools offered the guard hides only well-formed calls to unoffered tools: a
+    malformed call stays as text the client can see, and a reply that hiding would leave with no text and no call
+    keeps its calls — an agent never retries a blank reply blind until its timeout (the Hermes report that recipe's
+    entry records, 25 replies of 436 with calls hidden, 11 left empty). The no-tools path is unchanged; guard off,
+    replies are byte-identical apart from the log.
+  - Engine patch 0111 (that recipe's 0111, verbatim): the clean image build compiles without a compiler warning —
+    two fp8 prompt kernels' unread `RW`, prefill_attention's readerless `SMEM_MAX`, glm_mm's unused `Tile::SMEM`,
+    and the flashnext_fact/flashnext_attn unroll loops moved behind an inverted `if constexpr`. On that recipe all
+    six files' fatbins compiled byte-identical to the unpatched build.
+  - Checked against that recipe's final tree: after this round, openai.zig, tool_guard.zig, tool_stream.zig,
+    late_system_test.zig and five of the six kernel files are byte-identical to it; glm_mm.cu differs only by its
+    GB10 stage kernels (that recipe's 0100), which this recipe does not carry. Noted on the way: that recipe's 0103
+    (its re-port of this recipe's 0096) adds a guard against an opener inside a still-open value (`insideValue`,
+    with a host test) that has not flowed back this way — a candidate for a later port.
+
 - **2026-11-11** -- Ported from the 2x DGX Spark recipe's 2026-11-10/11 round (its main 74cf93c). Not yet run on
   this host: the patches apply to `f350cd3e` with the Dockerfile's loop and the scripts pass `scripts/tests/run.sh`.
   - Engine patches 0105-0107 from upstream TensorFold main, regenerated against this recipe's 0001-0104:

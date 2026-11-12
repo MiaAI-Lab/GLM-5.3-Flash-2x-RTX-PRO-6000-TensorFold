@@ -327,7 +327,7 @@ full overlay measured about 15% below the parent on code. Not measured on this h
 
 ## Engine patches
 
-`patches/engine/` holds 106 patches on TensorFold `f350cd3e`, applied in order at image build. Grouped by purpose:
+`patches/engine/` holds 109 patches on TensorFold `f350cd3e`, applied in order at image build. Grouped by purpose:
 
 | Patches | What they do |
 | --- | --- |
@@ -353,6 +353,7 @@ full overlay measured about 15% below the parent on code. Not measured on this h
 | 0092 | A JSON answer stays JSON beside offered tools: `response_format`, `guided_json` and `structured_outputs` replies are never parsed as tool calls, on chat, Responses and Messages |
 | 0093 | A reply grammar is freed when its stream cannot start |
 | 0096 | A tool call after prose that quotes its opener (`Qwen's <tool_call>{}`) is parsed as the call; before, the quoted opener began the envelope and the whole reply came back as content with no `tool_calls` |
+| 0101 | `TF_TOOL_CALL_GUARD=1` (opt-in, off by default; the 2x DGX Spark recipe's 0107): a chat request that offers no tools although its history called them gets a closing system note and its call markup hidden from the reply, streamed or whole, each hiding logged |
 | 0102 | A request may hold up to 100 images: the `--vision-max-images` bound rises from 64 (Qwen-VL's M-RoPE span table, sized by the same bound, follows) |
 | 0097 | Warm turns for GLM: after a reply the server prefills the next turn's prompt in the background, so a user message after an agent loop resumes past the loop instead of re-reading it (GLM's template drops the loop's reasoning once the next message comes); the pass yields to real work at its next chunk gate, and (every family) to a request admitted ahead of it into the fill queue; each pass's outcome is logged (`next turn: background prefill of N tokens done` / `stepped aside` / `failed: ...`) |
 | 0103 | `--learn-conversations` for GLM on CUDA (`LEARN_GIB`, off by default), a backport of upstream [#1411](https://github.com/ashhart/TensorFold/pull/1411) by its author (the 2x DGX Spark recipe's 0109): kept prompt states on disk, every rank's part, written behind the request and read back after an eviction or a restart. `--spill-gib` and `--checkpoint-slots` are refused for GLM. Off: replies byte-identical |
@@ -362,6 +363,8 @@ full overlay measured about 15% below the parent on code. Not measured on this h
 | 0107 | From upstream (6d4191a95, #2257, adapted): decode windows of 32 rows (16 before), so a context copy verifies up to 31 tokens a round; DFlash2 still drafts 7. Shared-window scratch is flagged outright (a 32-row segment no longer shrinks the KDA projection buffer or drops 0075/0088's one-launch segment attention), the follower's draws hold 32 rows, and the window width joins `--learn-conversations`' store identity. On the 2x DGX Spark pair a one-stream file rewrite went from 151 to 201-205 tok/s decode, prose unchanged, token hashes identical; not measured here |
 | 0108 | `TF_EXTRA_EOS=<token>[,<token>...]` (`EXTRA_EOS`, on by default with `<\|assistant\|>`): the named tokens end a reply like the checkpoint's EOS ids. A name the tokenizer does not hold refuses the start |
 | 0109 | `TF_THINK_OFF_SPLIT=<tokens>` (`THINK_OFF_SPLIT`, opt-in, off by default): a thinking-off chat reply that writes the think close token within the hold is split like a thinking reply, its draft as `reasoning_content` |
+| 0111 | The clean image build compiles without a compiler warning (the 2x DGX Spark recipe's 0111): two fp8 prompt kernels' unread `RW`, prefill_attention's readerless `SMEM_MAX`, glm_mm's unused `Tile::SMEM`, and the flashnext_fact/flashnext_attn unroll loops behind an inverted `if constexpr`; no kernel's arithmetic, launch shape or output changes (all six files' fatbins byte-identical there) |
+| 0112 | Each rejected tool envelope is logged one by one with its reason, and `TF_TOOL_CALL_DEBUG=1` adds its text (the 2x DGX Spark recipe's 0112): with `TF_TOOL_CALL_GUARD=1` and tools offered, only well-formed calls to unoffered tools are hidden — a malformed call stays as text, and a reply that hiding would leave empty keeps its calls, so an agent never retries a blank reply blind |
 | 0076, 0079, 0085, 0087 | Test and contract-record changes |
 
 Every default-on patch was A/B tested against the image before it: greedy (T=0) replies identical, plus a measured

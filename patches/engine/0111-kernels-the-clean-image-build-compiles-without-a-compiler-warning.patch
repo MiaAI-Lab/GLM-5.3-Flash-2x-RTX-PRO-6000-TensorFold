@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Thu, 12 Nov 2026 13:22:46 +0530
+Subject: [PATCH] kernels: the clean image build compiles without a compiler
+ warning
+
+Ported onto f350cd3 + patches 0001-0109 from the 2x DGX Spark recipe's patch 0111 (2026-11-08), verbatim: every hunk
+applied to this tree unchanged, and all six files but glm_mm.cu (whose extra tail here lacks Spark's GB10 stages
+kernels) come out byte-identical to that recipe's final tree.
+
+The image build's nvcc prints 49 warning lines on a clean machine (three dates of builds
+kept them in docs/speed logs): fp8_experts.cu and drama3_fp8.cu declare a kernel-local RW
+their bodies never read; prefill_attention.cu's SMEM_MAX has no reader anywhere; glm_mm.cu's
+Tile keeps an SMEM member no instantiation uses; and the pragma-unroll loops after
+flashnext_fact.cu's and flashnext_attn.cu's if-constexpr branches are unreachable at the
+instants those branches are taken, which nvcc reports once per kernel. The declarations go;
+the two loops now sit behind an inverted if constexpr (one flashnext_fact wrap covers the
+rest of the iteration's scales, rows and epilogue), so each instantiation compiles only the
+side it can reach. No kernel's arithmetic, launch shape or output changes: with this patch,
+all six files' fatbins compile byte-identical to the unpatched build (nvcc 13.3, sm_121).
+---
+ zig/kernels/cuda/drama3_fp8.cu        | 1 -
+ zig/kernels/cuda/flashnext_attn.cu    | 2 ++
+ zig/kernels/cuda/flashnext_fact.cu    | 2 ++
+ zig/kernels/cuda/fp8_experts.cu       | 1 -
+ zig/kernels/cuda/glm_mm.cu            | 1 -
+ zig/kernels/cuda/prefill_attention.cu | 1 -
+ 6 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/zig/kernels/cuda/drama3_fp8.cu b/zig/kernels/cuda/drama3_fp8.cu
+index 5b9ae65..4c4d3c3 100644
+--- a/zig/kernels/cuda/drama3_fp8.cu
++++ b/zig/kernels/cuda/drama3_fp8.cu
+@@ -176,7 +176,6 @@ __global__ void __launch_bounds__(PWARPS * 32, PMIN)
+                              const int* __restrict__ items, const int* __restrict__ counts,
+                              const int* __restrict__ members, void* __restrict__ out, int N, float limit, int skip,
+                              const float* __restrict__ xsc) {
+-  constexpr int RW = PromptCfg<M, RT, CW>::RW;
+   __shared__ uint4 sw[PSTAGES][CW][M * BLOCK4];
+   __shared__ uint4 sx[PSTAGES][64][4];
+   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
+diff --git a/zig/kernels/cuda/flashnext_attn.cu b/zig/kernels/cuda/flashnext_attn.cu
+index ff4f7aa..27c11a1 100644
+--- a/zig/kernels/cuda/flashnext_attn.cu
++++ b/zig/kernels/cuda/flashnext_attn.cu
+@@ -443,6 +443,7 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+         }
+         continue;
+     }
++    if constexpr (!FUSE) {                                 // o / m / l beside OUT, as fn_attn_merge holds them when it does not fuse
+ #pragma unroll
+     for (int h = 0; h < 2; ++h) {
+         const int i = g + 8 * h;
+@@ -459,6 +460,7 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+         }
+     }
+     }
++    }
+     if constexpr (FUSE) {                                  // o / l, rounded once, as fn_attn_merge writes OUT
+         __nv_bfloat16* OUT = reinterpret_cast<__nv_bfloat16*>(PO);
+ #pragma unroll
+diff --git a/zig/kernels/cuda/flashnext_fact.cu b/zig/kernels/cuda/flashnext_fact.cu
+index efe02c1..3e96956 100644
+--- a/zig/kernels/cuda/flashnext_fact.cu
++++ b/zig/kernels/cuda/flashnext_fact.cu
+@@ -171,6 +171,7 @@ __global__ void __launch_bounds__(WM * WN * 32, MINB) fact_kernel(
+                 slice_end(it * GPS + gi);
+                 continue;
+             }
++            if constexpr (!BLOCKED) {                  // the tile's k16 MMAs, then its scales and rows (BLOCKED took its own path above)
+ #pragma unroll
+             for (int kt = 0; kt < GS / 16; ++kt) {
+                 uint32_t a[T::MT][4];
+@@ -215,6 +216,7 @@ __global__ void __launch_bounds__(WM * WN * 32, MINB) fact_kernel(
+                 epilogue(b);
+                 slice_end(gl);
+             }
++            }
+         }
+     }
+     if constexpr (DBUF && !BLOCKED) {
+diff --git a/zig/kernels/cuda/fp8_experts.cu b/zig/kernels/cuda/fp8_experts.cu
+index 7c26739..046d6a9 100644
+--- a/zig/kernels/cuda/fp8_experts.cu
++++ b/zig/kernels/cuda/fp8_experts.cu
+@@ -146,7 +146,6 @@ __global__ void __launch_bounds__(PWARPS * 32, PMIN)
+                              const uint4* __restrict__ W, const float* __restrict__ scale, int KG, int NB,
+                              const int* __restrict__ items, const int* __restrict__ counts,
+                              const int* __restrict__ members, void* __restrict__ out, int N, float limit, int skip) {
+-  constexpr int RW = PromptCfg<M, RT, CW>::RW;
+   __shared__ uint4 sw[PSTAGES][CW][M * BLOCK4];
+   __shared__ uint4 sx[PSTAGES][64][4];
+   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
+diff --git a/zig/kernels/cuda/glm_mm.cu b/zig/kernels/cuda/glm_mm.cu
+index 52a3762..3ba5748 100644
+--- a/zig/kernels/cuda/glm_mm.cu
++++ b/zig/kernels/cuda/glm_mm.cu
+@@ -109,7 +109,6 @@ struct Tile {
+     static constexpr int W = 8 * 32 * WPC * 4;                // 8 column tiles' chunks
+     static constexpr int S = 8 * 8 * 2;                       // their scales (fp16)
+     static constexpr int STAGE = X + W + S;
+-    static constexpr int SMEM = STAGES * STAGE;
+ };
+ 
+ // ROWS_FIRST: row blocks fastest, so the blocks reading one weight tile run together and share it in L2 (prompts)
+diff --git a/zig/kernels/cuda/prefill_attention.cu b/zig/kernels/cuda/prefill_attention.cu
+index af5acbd..003f531 100644
+--- a/zig/kernels/cuda/prefill_attention.cu
++++ b/zig/kernels/cuda/prefill_attention.cu
+@@ -18,7 +18,6 @@ using qmm_frag::mma0;
+ 
+ constexpr int BN = 64, HALF = 32;             // keys a tile (the fold's unit), keys a staging slot
+ constexpr float LOG2E = 1.4426950408889634f;
+-constexpr int SMEM_MAX = 96 * 1024;
+ 
+ using tf_common::cp_wait;
+ 
+-- 
+2.43.0
+
