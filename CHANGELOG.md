@@ -1,5 +1,10 @@
 # Changelog
 
+- **2026-11-20 (fixes)** -- Engine patches `0014`–`0016`, found on the 2x RTX PRO 6000 host and verified there (rebuild the image to pick them up):
+  - `0014` DFlash2 selector: a draft row with NaN or -inf logits returned the kernel's no-winner id `0x7fffffff`, which the host used to index the successor codebook and crashed the server (general protection exception). Ids outside the vocabulary are skipped now.
+  - `0015` `KV=fp8` on the page pool: the sparse token lists were written as BF16 page rows but read as positions by the E4M3 kernel, so prompts past `index_topk` (2,048 keys) attended the wrong rows (garbled replies, `!!!!` runs, echoed prompts; issue #64 on the Sparks recipe). `KV=bf16` and `KV_PAGES=off` were unaffected.
+  - `0016` `KV_SHARD=1` with DFlash2: the target MTP head's prompt rows were written through the key pages' table and stride instead of the latent pages' own, overwriting other layers' E4M3 scales, so decode after a prompt longer than about 768 tokens returned token 0 (`!!!!`). A sharded cache's latent rows are now written and read through the latent table everywhere.
+  - Checked at `PARALLEL=4`, the 1,048,576-token window, `KV=fp8`, `KV_SHARD=1`, DFlash2: a hidden-code retrieval is correct from 860 up to 72k tokens, concurrent requests and a 400-token decode after a 2.4k-token prompt included.
 - **2026-11-20** -- Updated the 2x RTX PRO 6000 recipe to **TensorFold 1.3.0 (`81de26f6`)** with **KV sharding (`KV_SHARD=1`)**:
   - **Faster decode & smaller stack:** CUDA kernels chain with fewer launch gaps (PDL), and our E4M3 KV, MoE, and DFlash2 speedups are now built into upstream (13 patches `0001`–`0013` instead of 100+).
   - **KV sharding & smarter prompt cache:** `KV_SHARD=1` keeps each stream's KV rows on one GPU; prompt cache is reserved up front and multi-turn thinking chats reuse cached reasoning.
