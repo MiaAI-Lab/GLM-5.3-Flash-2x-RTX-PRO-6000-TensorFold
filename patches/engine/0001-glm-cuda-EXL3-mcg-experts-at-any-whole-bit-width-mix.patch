@@ -1,24 +1,9 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: MiaAI-Lab <mia.ailab1@gmail.com>
-Date: Fri, 30 Oct 2026 09:41:08 +0200
-Subject: [PATCH 1/4] glm cuda: EXL3 mcg experts at any whole-bit width, mixed
- by projection
+From 7f0451a7882eab09abb2a3acfefe3ff0b216c899 Mon Sep 17 00:00:00 2001
+From: MiaAI_Lab <mia.ailab1@gmail.com>
+Date: Fri, 20 Nov 2026 01:33:10 +0200
+Subject: [PATCH 01/12] glm cuda: EXL3 mcg experts at any whole-bit width,
+ mixed
 
-Admission reads EXL3 mcg checkpoints at 1 to 8 bits: "bits" may be absent
-(a mixed checkpoint gives "avg_bits"), and a given one must lie in range.
-The loader takes each trellis's width from its last dimension, slices TP
-shares by that width's tile bytes, places each expert's trellis at its own
-offset and uploads a width table a projection (one table, as before, when
-the three agree). Layer gets uniform_k2_gu and uniform_k2_d; uniform_k2
-stays nonzero only when every projection agrees, so a 4-bit layer uploads
-upstream's bytes and keeps the prompt kernels.
-
-Scratch is sized by the path each layer takes: the prompt kernels' when
-they take it, else the grouped path's, the buffers taking the largest over
-every layer and the MTP layer (a mixed layer's prompt chunks run grouped).
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_015bV57ikYD5vn1va1KmaPjw
 ---
  zig/build/glm_family_host.zig           |   1 +
  zig/src/cuda/exl3_experts.zig           |   2 +
@@ -31,19 +16,19 @@ Claude-Session: https://claude.ai/code/session_015bV57ikYD5vn1va1KmaPjw
  create mode 100644 zig/src/families/glm/cuda_exl3_test.zig
 
 diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
-index 766db339..1987ff62 100644
+index e20d136ad..747675eb4 100644
 --- a/zig/build/glm_family_host.zig
 +++ b/zig/build/glm_family_host.zig
-@@ -8,6 +8,7 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
-     b.step("test-glm-startup-host", "Page refusals propagate through rank liveness before engine construction").dependOn(&startup_run.step);
-     step.dependOn(&startup_run.step);
+@@ -39,6 +39,7 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
+     b.step("test-glm-thin-weights-host", "TF_GLM_LAYERS's admission bytes by tensor from synthetic shard headers").dependOn(&thin_run.step);
+     step.dependOn(&thin_run.step);
      b.step("test-glm-tp3-host", "Uneven KDA head shares through actual projection and load planning, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM TP3:"} })).step);
 +    b.step("test-glm-exl3-host", "GLM EXL3 admission, mixed-width expert loading and scratch sizing, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM EXL3:"} })).step);
      // TF_GLM_INDEX_CUDA: the launch rules, and (its own slower step) glm_index_*.cuh as host C++ against plain models
      const index_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM index:"} }));
      b.step("test-glm-index-host", "GLM's prompt indexer launch rules without devices").dependOn(&index_run.step);
 diff --git a/zig/src/cuda/exl3_experts.zig b/zig/src/cuda/exl3_experts.zig
-index 4984b1a8..3392daac 100644
+index 005e007fd..76a2334ab 100644
 --- a/zig/src/cuda/exl3_experts.zig
 +++ b/zig/src/cuda/exl3_experts.zig
 @@ -34,6 +34,8 @@ pub const Layer = struct {
@@ -56,7 +41,7 @@ index 4984b1a8..3392daac 100644
      gu_stride: usize = 0, // gate/up trellis row stride in tiles (0: contiguous per projection)
      limit: f32 = 0, // the SwiGLU clamp (0: none)
 diff --git a/zig/src/families/glm/cuda_exl3.zig b/zig/src/families/glm/cuda_exl3.zig
-index f70c0f33..81ae73ea 100644
+index 682db10e3..1f1bf078c 100644
 --- a/zig/src/families/glm/cuda_exl3.zig
 +++ b/zig/src/families/glm/cuda_exl3.zig
 @@ -1,7 +1,9 @@
@@ -291,10 +276,10 @@ index f70c0f33..81ae73ea 100644
      return out;
  }
  
-@@ -128,24 +222,53 @@ pub const Scratch = struct { picks: u64, xg: u64, xu: u64, z: u64 };
- pub const top_k = 8;
- /// Rows a call to the common experts takes: each call reads every expert's weights, so a prompt pass needs few calls.
+@@ -130,24 +224,53 @@ pub const top_k = 8;
  pub const chunk_rows = 1024;
+ /// The prompt item plan has no decode grouper's shared-memory cap; one call covers a supported whole prompt pass.
+ pub const prompt_rows = 4096;
 -fn layer(w: Experts, count: usize, dims: usize, width: usize, limit: f32) common.Layer {
 -    return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.k2, .up_k2 = w.k2, .down_k2 = w.k2, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = count, .dims = dims, .width = width, .codebook = .mcg, .limit = limit, .act_mode = 0, .uniform_k2 = 8, .shared_input = w.shx };
 -}
@@ -335,14 +320,14 @@ index f70c0f33..81ae73ea 100644
      return std.mem.alignForward(usize, cap * top_k * 4, 256);
  }
 -pub fn scratchBytes(rows: usize, dims: usize, width: usize, prefill: bool, shx: bool) [4]usize {
+-    var l = shape(dims, width);
+-    l.shared_input = shx;
 +/// The scratch `run` takes on `w`'s experts: the prompt kernels' when `prefill` and they take this layer, else the
 +/// grouped path's (a layer the prompt kernels refuse runs its prompt chunks there, in the same arena).
 +pub fn scratchFor(rows: usize, dims: usize, width: usize, prefill: bool, w: Experts) [4]usize {
-     const n: usize = @min(rows, chunk_rows);
--    var l = shape(dims, width);
--    l.shared_input = shx;
 +    const l = layer(w, cuda.grouped.max_experts, dims, width, 0);
-     if (prefill and common.prompt.eligible(l)) return .{ picksBytes(rows) + (common.prompt.bytes(l, n, top_k) catch unreachable), 4, 4, 4 };
+     if (prefill and common.prompt.eligible(l)) return .{ common.prompt.bytes(l, @min(rows, prompt_rows), top_k + 1) catch unreachable, 4, 4, 4 };
+     const n: usize = @min(rows, chunk_rows);
 -    return .{ picksBytes(rows) + (common.scratchBytes(shape(dims, width), n, top_k) catch unreachable), 4, 4, 4 };
 +    return .{ picksBytes(rows) + (common.scratchBytes(l, n, top_k) catch unreachable), 4, 4, 4 };
 +}
@@ -356,16 +341,16 @@ index f70c0f33..81ae73ea 100644
  }
  /// `height` rows of `width` bytes, `spitch` apart at `src`, to `dpitch` apart at `dst`, in one call.
  fn copyRows(stream: cuda.Stream, dst: u64, dpitch: usize, src: u64, spitch: usize, width: usize, height: usize, what: []const u8) !void {
-@@ -155,7 +278,7 @@ fn copyRows(stream: cuda.Stream, dst: u64, dpitch: usize, src: u64, spitch: usiz
+@@ -157,7 +280,7 @@ fn copyRows(stream: cuda.Stream, dst: u64, dpitch: usize, src: u64, spitch: usiz
  pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, plan_buf: cuda.grouped.Plan, x: u64, x_stride: usize, picks: u64, slots: usize, rows: usize, count: usize, dims: usize, width: usize, limit: f32, prompt: bool, ey: u64, xd: u64) !void {
      _ = xd;
      if (slots != top_k + 1) return error.UnsupportedTopK;
 -    if (dims % 256 != 0 or width % 128 != 0) return error.NotExl3Mcg4;
 +    if (dims % 256 != 0 or width % 128 != 0) return error.UnreadableExl3;
      const l = layer(w, count, dims, width, limit);
-     const cap: usize = @min(rows, chunk_rows);
-     const arena = sc.picks + picksBytes(rows);
-@@ -177,20 +300,8 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
+     if (prompt and common.prompt.eligible(l)) {
+         const scratch = try common.prompt.scratch(sc.picks, l, @min(rows, prompt_rows), slots);
+@@ -187,20 +310,8 @@ fn compact(k: *const Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, x: u
      }
  }
  
@@ -390,7 +375,7 @@ index f70c0f33..81ae73ea 100644
  test "a chunk's compacted picks end before the common scratch at every row count" {
 diff --git a/zig/src/families/glm/cuda_exl3_test.zig b/zig/src/families/glm/cuda_exl3_test.zig
 new file mode 100644
-index 00000000..4b04d873
+index 000000000..4b04d873a
 --- /dev/null
 +++ b/zig/src/families/glm/cuda_exl3_test.zig
 @@ -0,0 +1,361 @@
@@ -756,10 +741,10 @@ index 00000000..4b04d873
 +    }
 +}
 diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
-index 8193fae5..2ce7de51 100644
+index e933c6b4c..d87d19b1e 100644
 --- a/zig/src/families/glm/cuda_native.zig
 +++ b/zig/src/families/glm/cuda_native.zig
-@@ -422,7 +422,8 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+@@ -527,7 +527,8 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
              "GLM-5.3-Flash on CUDA runs on at most {d} ranks: set TF_GLM_WORLD to {d} or fewer",
              .{ ranks.max_world, ranks.max_world },
          ),
@@ -769,7 +754,7 @@ index 8193fae5..2ce7de51 100644
          error.UnreadableFormat => "a projection is stored in a format GLM-5.3-Flash on CUDA does not read (the log names its module, recipe and tensors)",
          else => null,
      };
-@@ -436,7 +437,7 @@ test "a place inside its world of at most 16 ranks serves; a larger world is ref
+@@ -541,7 +542,7 @@ test "a place inside its world of at most 16 ranks serves; a larger world is ref
  }
  
  test "a checkpoint refused for its format, at the entry or by the loader, is explained" {
@@ -777,12 +762,12 @@ index 8193fae5..2ce7de51 100644
 +    for ([_]anyerror{ error.NotModelOpt, error.UnsupportedQuant, error.UnreadableFormat, error.UnreadableExl3 }) |e| try std.testing.expect(explain(null, e) != null);
  }
  
- test "TF_KV_PAGES: auto pages from two ranks, off and 0 give windows, all and other values page like on" {
+ test "TF_KV_SHARE past the slots a startup plan holds is refused, and the refusal is explained" {
 diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
-index 68cdd0c2..84c625c0 100644
+index 5a5c8919a..d7c13b587 100644
 --- a/zig/src/families/glm/cuda_state.zig
 +++ b/zig/src/families/glm/cuda_state.zig
-@@ -197,7 +197,9 @@ pub const Buffers = struct {
+@@ -247,7 +247,9 @@ pub const Buffers = struct {
          var mm: usize = 4;
          // windows under rows_from rows keep their K slices apart (a prompt's tail chunk on the prefill buffers too)
          for (b16Shapes(w)) |sh_| mm = @max(mm, b16.partBytes(@min(rows, b16.rows_from - 1), sh_[0], sh_[1]));
@@ -794,7 +779,7 @@ index 68cdd0c2..84c625c0 100644
          for (w.layers) |l| split = split or (l.mixer == .kda and l.mixer.kda.proj == .split);
          const hist_len = if (pairs > cuda.grouped.small) (pairs + cuda.grouped.small - 1) / cuda.grouped.small * (count + 1) else 1;
 diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_weights.zig
-index e625101a..4b994502 100644
+index ac9f7aea1..fe2679033 100644
 --- a/zig/src/families/glm/cuda_weights.zig
 +++ b/zig/src/families/glm/cuda_weights.zig
 @@ -43,7 +43,6 @@ pub const Weights = struct {
@@ -805,7 +790,7 @@ index e625101a..4b994502 100644
      buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
      named: std.ArrayList(Named) = .empty,
  
-@@ -440,7 +439,6 @@ const Loader = struct {
+@@ -441,7 +440,6 @@ const Loader = struct {
          var x3: ?exl3.Experts = null;
          if (c.exl3) { // the MTP layer's experts too
              x3 = try exl3.load(L, i, count, d, c.moe_inter, cut);
@@ -813,3 +798,6 @@ index e625101a..4b994502 100644
          } else routed = try L.nvfp4Experts(i);
          const sh = L.w.share.shared;
          const sw: []const formats.Format = if (i == c.layers) &.{ .bf16, .fp8_pb, .mxfp8 } else &.{ .bf16, .fp8_pb }; // MTP's MXFP8
+-- 
+2.53.0
+

@@ -29,7 +29,7 @@ unset _cfg_key _cfg_line _cfg_value
 
 # --- pinned engine build (hashed into the image tag with docker/ and patches/engine/*.patch) ----------------------
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
-TF_REF="${TF_REF:-f350cd3ea253a042e205746928271f9d8f71a82d}"
+TF_REF="${TF_REF:-81de26f649677aa72ae0034d4af6e010cd947038}"
 ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 ZIG_SHA256="${ZIG_SHA256:-1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026}"
 SM="${SM:-120}"                                  # RTX PRO 6000 Blackwell: sm_120
@@ -56,10 +56,13 @@ ABLIT_ID="Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit"
 _id="Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold"; _dir=model
 if [[ "$ABLIT" == 1 ]]; then _id=$ABLIT_ID; _dir=model-ablit; fi
 MODEL_ID="${MODEL_ID:-$_id}"
+PROPOSAL_HEAD_PYTHON="${PROPOSAL_HEAD_PYTHON:-python3}"  # numpy is needed only to prepare an EXL3 draft head once
+MODEL_VARIANT="${MODEL_VARIANT:-default}"       # default: repository's canonical view; k6/k8: cuteafd-mc variant
 # The pins belong to the checkpoints above; another MODEL_ID needs its own MODEL_REVISION.
 case "$MODEL_ID" in
   Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold) _rev=76c0b5173166d2795dd48860f45d8224817f894c ;;
   "$ABLIT_ID") _rev=57edefd2f5d9b371c8345883304d5af68b52fa24 ;;
+  wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC) _rev=91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d ;;
   *) _rev="" ;;
 esac
 MODEL_REVISION="${MODEL_REVISION:-$_rev}"
