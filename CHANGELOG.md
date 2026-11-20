@@ -1,18 +1,10 @@
 # Changelog
 
-- **2026-11-20** -- Updated `TF_REF` from `f350cd3e` to `81de26f6` (TensorFold `1.3.0`) and ported the recipe patch
-  stack down to 13 patches (`0001`–`0013`, including `0013` for `KV_SHARD=1`):
-  - **Faster GLM decode launches:** Programmatic Dependent Launches (PDL) for GLM CUDA kernels and `qmmf` decode
-    linears cut launch gaps between decode steps (`TF_GLM_PDL=0` to disable).
-  - **Upstreamed GLM CUDA & DFlash2 stack:** Paged E4M3 latent KV caches, grouped-experts load-ahead (`sm_120+`),
-    fused MoE decode glue, `TF_GLM_ABSORB_MMA=1`, `TF_GLM_CE_EXCHANGE=1`, same-host two-rank gather, DFlash2
-    window/copy-drafting rules, and shared sampling (`cuda.sample.rule`) are now built into upstream `1.3.0`.
-  - **Better prompt cache & KV pool behavior:** `--prompt-cache-gib` is reserved ahead of extra stream windows
-    natively (`kv_pool.zig`), multi-turn thinking requests reuse reasoning in the next-turn cache guess (`#3264`),
-    and KV page-retirement bookkeeping preserves reader fences and trim state (`#3852`).
-  - **TP=2 vision stability:** Follower rank sleeps on its liveness line during long rank-0 vision passes (`#3675`).
-  - **Verified live** on 2x RTX PRO 6000 (`1,048,576` context, `KV_SHARD=1`): `124.3 tok/s` (thinking off) /
-    `249.7 tok/s` (thinking on).
+- **2026-11-20** -- Updated the 2x RTX PRO 6000 recipe to **TensorFold 1.3.0 (`81de26f6`)** with **KV sharding (`KV_SHARD=1`)**:
+  - **Faster decode & smaller stack:** CUDA kernels chain with fewer launch gaps (PDL), and our E4M3 KV, MoE, and DFlash2 speedups are now built into upstream (13 patches `0001`–`0013` instead of 100+).
+  - **KV sharding & smarter prompt cache:** `KV_SHARD=1` keeps each stream's KV rows on one GPU; prompt cache is reserved up front and multi-turn thinking chats reuse cached reasoning.
+  - **More model variants & stability:** Added `MODEL_VARIANT` (`k6`/`k8`) and `GLM-5.3-Flash-EXL3-K4-MC` support, plus 2-GPU vision timeout protection.
+  - **Verified live** (`1,048,576` context, `KV_SHARD=1`): **124.3 tok/s** (thinking off) / **249.7 tok/s** (thinking on).
 
 - **2026-11-12** -- The stack on main now matches what this host's deployment has served since 2026-11-05: engine
   patches 0094 (a prompt chunk takes 4096 rows) and 0095 (the drafter ingests a 4096-row chunk) are out — the running
