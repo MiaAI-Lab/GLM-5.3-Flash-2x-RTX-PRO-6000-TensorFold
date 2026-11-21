@@ -364,7 +364,7 @@ check_cache_min() {
   fi
   if ! python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) >= float(sys.argv[2]) else 1)' "$got" "$PROMPT_CACHE_MIN_GIB"; then
     GLM_STOP_LOCK_HELD=1 "$REPO_ROOT/stop.sh"
-    fail E_CACHE "Rank 0 funds a $got GiB prompt cache a rank, under PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB; the server is stopped. The cache is what this start's room leaves (device pages after the KV pool, a host tier from the available memory), capped by PROMPT_CACHE_GIB: lower PARALLEL or CONTEXT, free host memory, or set TF_GLM_HOST_CACHE_GIB. Logs: $(last_archive)."
+    fail E_CACHE "Rank 0 funds a $got GiB prompt cache a rank, under PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB; the server is stopped. The cache is what this start's room leaves (device pages after the KV pool, a host tier from the available memory), capped by PROMPT_CACHE_GIB: lower PARALLEL or CONTEXT, free host memory, or export TF_GLM_HOST_CACHE=1 (TensorFold 1.3.0: PROMPT_CACHE_GIB then sizes a pinned host tier). Logs: $(last_archive)."
   fi
   log "Prompt cache: rank 0 funds $got GiB a rank (PROMPT_CACHE_MIN_GIB=$PROMPT_CACHE_MIN_GIB)."
 }
@@ -536,7 +536,8 @@ if [[ "$DRY_RUN" != 1 ]]; then
     # One stream reads "1 stream at once"; auto names no count.
     [[ "$PARALLEL" == auto ]] || grep -qE "(^|[^0-9])$PARALLEL streams? at once" "$RUN_LOG_DIR/rank0.log" 2>/dev/null ||
       warn W_STREAMS "The engine serves fewer than PARALLEL=$PARALLEL streams at once; see the startup line in $RUN_LOG_DIR/rank0.log."
-    [[ "$PROMPT_CACHE_GIB" == 0 ]] || grep -q 'pinned host memory' "$RUN_LOG_DIR/rank0.log" 2>/dev/null ||
+    # TensorFold 1.3.0 (TF_GLM_HOST_CACHE=1) words it "a 8.0 GiB prompt cache in host memory"; older engines "pinned host memory"
+    [[ "$PROMPT_CACHE_GIB" == 0 ]] || grep -qE 'pinned host memory|GiB prompt cache in host memory' "$RUN_LOG_DIR/rank0.log" 2>/dev/null ||
       warn W_CACHE "No host prompt-cache tier this start: follow-up turns re-read their whole prompt. See the prompt cache line in $RUN_LOG_DIR/rank0.log."
   elif (( ATTEMPT == 2 )); then
     log "Context: $CTX tokens, not the $CONTEXT asked; set CONTEXT=$CTX in scripts/local.sh to skip the refused start."
