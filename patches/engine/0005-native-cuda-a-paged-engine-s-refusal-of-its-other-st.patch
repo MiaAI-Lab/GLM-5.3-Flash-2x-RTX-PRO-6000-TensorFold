@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MiaAI_Lab <mia.ailab1@gmail.com>
+Date: Thu, 26 Nov 2026 10:08:06 +0200
+Subject: [PATCH] native cuda: a paged engine's refusal of its other streams
+ names the window that fits beside them
+
+1.3.5 leaves less device room than 1.3.0 did, so --parallel 4 at a 1,048,576-token window is refused on the
+2x RTX PRO 6000 host ('--parallel 4 needs 0.90 GiB for its other streams' fixed parts ... leaves 4.42 GiB').
+The refusal now ends '; fits: --parallel N, --context T' with the largest own window beside the other streams'
+fixed parts, state runs and a page each, which a launcher's CONTEXT=auto retries with.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ zig/src/native/cuda_kv_pool.zig | 26 +++++++++++++++++++++++++-
+ 1 file changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/native/cuda_kv_pool.zig b/zig/src/native/cuda_kv_pool.zig
+index 9d8fe6a37..bd5d975e1 100644
+--- a/zig/src/native/cuda_kv_pool.zig
++++ b/zig/src/native/cuda_kv_pool.zig
+@@ -184,12 +184,36 @@ pub fn plan(comptime F: type, a: Allocator, l: kv_pool.Layout, room: u64, o: api
+     return kv_pool.plan(l, budgetOf(F, l, room, o, window, host_mode, engine_paged, kept_ppm, slots)) catch |e| {
+         problem.* = switch (e) {
+             error.NoStream => if (engine_paged) try std.fmt.allocPrint(a, "the CUDA memory budget fits no stream beside the model: one at a {d}-token window takes {d:.2} GiB of KV pages, and the budget leaves {d:.2} GiB", .{ window, toGib(l.pages(window + rows) * l.pageBytes()), toGib(room) }) else "the CUDA memory budget fits no stream beside the model",
+-            error.TooMany => try std.fmt.allocPrint(a, "--parallel {d} needs {d:.2} GiB for its other streams' fixed parts, state runs and a page each, and the CUDA memory budget leaves {d:.2} GiB: serve fewer, or free device memory", .{ o.lanes, toGib((o.lanes - 1) * (l.fixed_bytes + (1 + l.runPages()) * l.pageBytes())), toGib(room) }),
++            error.TooMany => try std.fmt.allocPrint(a, "--parallel {d} needs {d:.2} GiB for its other streams' fixed parts, state runs and a page each, and the CUDA memory budget leaves {d:.2} GiB: serve fewer, or free device memory{s}", .{ o.lanes, toGib((o.lanes - 1) * (l.fixed_bytes + (1 + l.runPages()) * l.pageBytes())), toGib(room), try fitsHint(a, l, room, o.lanes, rows, engine_paged) }),
+         };
+         return null;
+     };
+ }
+ 
++/// A paged engine's refusal of its other streams names the largest own window beside them ("; fits: --parallel N,
++/// --context T"), which a launcher may retry with; "" when none fits or the engine's own sequence is not on pages.
++fn fitsHint(a: Allocator, l: kv_pool.Layout, room: u64, lanes: u32, rows: u64, engine_paged: bool) ![]const u8 {
++    if (!engine_paged or lanes == 0) return "";
++    const others = @as(u64, lanes - 1) * (l.fixed_bytes + (1 + l.runPages()) * l.pageBytes());
++    if (others >= room) return "";
++    const tokens = (room - others) / l.pageBytes() * l.page_tokens;
++    if (tokens <= rows) return "";
++    return std.fmt.allocPrint(a, "; fits: --parallel {d}, --context {d}", .{ lanes, tokens - rows });
++}
++
++test "a paged refusal of the other streams names the window that fits beside them" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const l: kv_pool.Layout = .{ .fixed_bytes = 300 << 20, .token_bytes = 4 << 10, .page_tokens = 512, .snap_bytes = 0 };
++    const hint = try fitsHint(arena.allocator(), l, 4 << 30, 4, 32, true);
++    try std.testing.expect(std.mem.startsWith(u8, hint, "; fits: --parallel 4, --context "));
++    const t = try std.fmt.parseInt(u64, hint["; fits: --parallel 4, --context ".len..], 10);
++    // the hinted own window and the other three streams' fixed parts and pages fit the room
++    try std.testing.expect(l.pages(t + 32) * l.pageBytes() + 3 * (l.fixed_bytes + (1 + l.runPages()) * l.pageBytes()) <= 4 << 30);
++    try std.testing.expectEqualStrings("", try fitsHint(arena.allocator(), l, 4 << 30, 4, 32, false));
++    try std.testing.expectEqualStrings("", try fitsHint(arena.allocator(), l, 512 << 20, 4, 32, true));
++}
++
+ /// The planned streams' sequences and pages made now; false: `problem` says why they could not be.
+ pub fn attach(comptime F: type, a: Allocator, ctx: *anyopaque, paged: ?Plan, planned: ?kv_pool.Budget, problem: *[]const u8) !bool {
+     if (comptime !@hasDecl(F, "attach")) return true;
+-- 
+2.53.0
+

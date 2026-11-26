@@ -1,24 +1,19 @@
-From 590bcc89a6d65320403909b7814236eff4dd18f9 Mon Sep 17 00:00:00 2001
-From: SvangenStudios <svangenstudios@outlook.com>
-Date: Fri, 20 Nov 2026 01:39:47 +0200
-Subject: [PATCH 07/12] lanes: a reply grammar is freed when its stream cannot
- start
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MiaAI_Lab <mia.ailab1@gmail.com>
+Date: Thu, 26 Nov 2026 09:00:37 +0200
+Subject: [PATCH 2/4] lanes: a reply grammar is freed when its stream cannot
+ start it
 
-The grammar was built inside Stream.init's argument list, and only a started job frees it, so a Stream.init that failed
-after the build leaked it. It is now built first and freed on that failure. Only out-of-memory reaches this path.
-
-Adapted to this engine by Mia's AI Lab from the second half of SvangenStudios' 0039 on
-https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold (PR #28); the use-after-free that PR's
-first half fixes is not present here.
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  zig/src/core/lane_stream.zig | 13 ++++++++-----
  1 file changed, 8 insertions(+), 5 deletions(-)
 
 diff --git a/zig/src/core/lane_stream.zig b/zig/src/core/lane_stream.zig
-index e6fc84fe4..4e223f168 100644
+index 962426a08..b9c188c35 100644
 --- a/zig/src/core/lane_stream.zig
 +++ b/zig/src/core/lane_stream.zig
-@@ -35,6 +35,12 @@ pub fn open(h: *LaneHost, job: *Job) bool {
+@@ -32,6 +32,12 @@ pub fn open(h: *LaneHost, job: *Job) bool {
          job.custom = ps.make(ps.ctx, h.gpa, r.prompt, r.eos) catch return !h.drop(job, "the drafter could not start");
      } else job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return !h.drop(job, "the drafter could not start");
      const recall = recalls.reader(h, job);
@@ -31,7 +26,7 @@ index e6fc84fe4..4e223f168 100644
      job.stream = lanes.Stream.init(h.gpa, .{
          .id = "request",
          .prompt = r.prompt,
-@@ -63,11 +69,7 @@ pub fn open(h: *LaneHost, job: *Job) bool {
+@@ -60,11 +66,7 @@ pub fn open(h: *LaneHost, job: *Job) bool {
          .history_len = r.history_len,
          .shared_prefixes = r.shared_prefixes,
          .reuse = reuse,
@@ -44,7 +39,7 @@ index e6fc84fe4..4e223f168 100644
          .decode_spans = h.spans(r),
          .decide = r.decide,
          .untaught = r.untaught,
-@@ -76,6 +78,7 @@ pub fn open(h: *LaneHost, job: *Job) bool {
+@@ -75,6 +77,7 @@ pub fn open(h: *LaneHost, job: *Job) bool {
      }) catch {
          freeProposer(h, job);
          recalls.release(job);

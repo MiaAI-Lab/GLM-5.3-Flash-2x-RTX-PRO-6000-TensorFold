@@ -167,7 +167,7 @@ build_serve_args() {
     [[ -z "$MTP_CONFIDENCE" ]] || SERVE_ARGS+=(--mtp-confidence "$MTP_CONFIDENCE")
   fi
   [[ -z "$PROMPT_CACHE_GIB" ]] || SERVE_ARGS+=(--prompt-cache-gib "$PROMPT_CACHE_GIB")
-  # LEARN_GIB: engine patch 0103 keeps the prompt states on disk too (CACHE_DIR/learn holds every rank's part)
+  # LEARN_GIB: upstream --learn-conversations keeps the prompt states on disk too (CACHE_DIR/learn holds every rank's part)
   [[ "$LEARN_GIB" == 0 ]] || SERVE_ARGS+=(--learn-conversations --learn-dir /state/learn --learn-gib "$LEARN_GIB"
     --learn-min-free-gib "$LEARN_MIN_FREE_GIB")
   read -r -a extra <<< "$SERVE_EXTRA_ARGS"
@@ -190,13 +190,13 @@ build_env_args() {
     -e "NCCL_IB_DISABLE=$NCCL_IB_DISABLE" -e "TF_BIN=$TF_BIN" -e "RANK_DEVICES=$RANK_DEVICES"
     -e "TENSORFOLD_PREFILL_SHARE=$PREFILL_SHARE")
   [[ -z "$PREFILL_BUDGET" ]] || ENV_ARGS+=(-e "TENSORFOLD_PREFILL_BUDGET=$PREFILL_BUDGET")
-  # KV_SHARD=1: engine patch 0104 keeps each stream's latent rows on its owner GPU (every rank reads the same value)
+  # KV_SHARD=1: engine patch 0001 keeps each stream's latent rows on its owner GPU (every rank reads the same value)
   [[ "$KV_SHARD" != 1 ]] || ENV_ARGS+=(-e "TF_GLM_KV_SHARD=1")
-  # L2PF=1: engine patch 0105 prefetches each decode window's next weights into L2 (every rank must agree)
+  # L2PF=1: upstream (TF_GLM_L2PF) prefetches each decode window's next weights into L2 (every rank must agree)
   [[ "$L2PF" != 1 ]] || ENV_ARGS+=(-e "TF_GLM_L2PF=1")
-  # EXTRA_EOS: engine patch 0108 ends a reply at these tokens too (every rank alike)
+  # EXTRA_EOS: engine patch 0003 ends a reply at these tokens too (every rank alike)
   [[ "$EXTRA_EOS" == none ]] || ENV_ARGS+=(-e "TF_EXTRA_EOS=$EXTRA_EOS")
-  # THINK_OFF_SPLIT: engine patch 0109 moves a thinking-off draft closed by </think> into reasoning_content
+  # THINK_OFF_SPLIT: engine patch 0003 moves a thinking-off draft closed by </think> into reasoning_content
   [[ "$THINK_OFF_SPLIT" == 0 ]] || ENV_ARGS+=(-e "TF_THINK_OFF_SPLIT=$THINK_OFF_SPLIT")
   while IFS= read -r key; do
     [[ "$MANAGED_ENV" != *" $key "* ]] || continue
@@ -536,7 +536,7 @@ if [[ "$DRY_RUN" != 1 ]]; then
     # One stream reads "1 stream at once"; auto names no count.
     [[ "$PARALLEL" == auto ]] || grep -qE "(^|[^0-9])$PARALLEL streams? at once" "$RUN_LOG_DIR/rank0.log" 2>/dev/null ||
       warn W_STREAMS "The engine serves fewer than PARALLEL=$PARALLEL streams at once; see the startup line in $RUN_LOG_DIR/rank0.log."
-    # TensorFold 1.3.0 (TF_GLM_HOST_CACHE=1) words it "a 8.0 GiB prompt cache in host memory"; older engines "pinned host memory"
+    # TensorFold 1.3.0 and later (TF_GLM_HOST_CACHE=1) word it "a 8.0 GiB prompt cache in host memory"; older engines "pinned host memory"
     [[ "$PROMPT_CACHE_GIB" == 0 ]] || grep -qE 'pinned host memory|GiB prompt cache in host memory' "$RUN_LOG_DIR/rank0.log" 2>/dev/null ||
       warn W_CACHE "No host prompt-cache tier this start: follow-up turns re-read their whole prompt. See the prompt cache line in $RUN_LOG_DIR/rank0.log."
   elif (( ATTEMPT == 2 )); then

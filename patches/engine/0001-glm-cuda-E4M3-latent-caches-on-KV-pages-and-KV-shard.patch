@@ -1,48 +1,79 @@
-From 771f583cb0c640c74cd5c6b8b8155b3c70d2fb41 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: MiaAI_Lab <mia.ailab1@gmail.com>
-Date: Fri, 20 Nov 2026 10:45:02 +0200
-Subject: [PATCH] glm cuda: kv shard keeps each stream's latent rows on one
- rank (port 0104)
+Date: Thu, 26 Nov 2026 09:00:37 +0200
+Subject: [PATCH 1/4] glm cuda: E4M3 latent caches on KV pages, and KV sharding
+ (TF_GLM_KV_SHARD)
 
+The 2x RTX PRO 6000 recipe's GLM stack, ported from TensorFold 1.3.0 (81de26f6) to 1.3.5 onto main's latent
+Shape (rows of kv_lora + qk_rope, the pool a parameter), its roped 576-wide path and its index geometry:
+
+- E4M3 (--kv-cache fp8) latent rows on KV pages: each cache's part of a page holds its codes, then their fp32
+  scales, then the pooled keys (Shape.format); the paged _fp8 chunk and latent-write kernels; the snapshot plan
+  copies codes and scales as their own parts. TF_KV_PAGES on/1/all (and any other text, as before) pages E4M3
+  too; auto keeps whole windows for E4M3.
+- An E4M3 cache's sparse token lists stay positions (Table.logical): its chunks take each key through the table.
+- A reply the pool cannot hold opens with the longest reply the pool holds for its prompt.
+- KV sharding at TP=2 (TF_GLM_KV_SHARD=1): each stream's E4M3 latent rows on its owner GPU, owner-computed
+  decode and verify, prompts on a borrowed twin, kept states carried between owners; latent rows are always
+  written and read through the latent table (the target MTP head's prompt rows included). New here: refused by
+  name beside --learn-conversations, whose GLM disk images (new in 1.3.x) hold whole states.
+- Tests: the stack's host tests on main's APIs, tf-cuda-test glm-kv-shard-check.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  docs/glm-port/kv-shard-1104.md                | 267 ++++++++
+ zig/build/glm_family_host.zig                 |   1 +
+ zig/glm_snapshot_host.zig                     | 141 ++++
+ zig/kernels/cuda/common/mla.cuh               |  37 +-
+ zig/kernels/cuda/glm_glue_attn.cuh            |  18 +
+ zig/kernels/cuda/glm_glue_latent.cuh          |  13 +
+ .../core/contract/glm_kv_paged_records.zig    |  52 ++
+ .../contract/measurements/pending_133.zig     |   3 +
+ zig/src/core/contract/registry.zig            |   1 +
+ zig/src/core/contract/registry_joins.zig      |   3 +-
  zig/src/core/engine_status.zig                |   6 +
- zig/src/core/lane_host.zig                    |   2 +
- zig/src/core/lane_host_status.zig             |  10 +-
+ zig/src/core/lane_host.zig                    |   1 +
+ zig/src/core/lane_host_status.zig             |  13 +-
  zig/src/core/lane_host_status_test.zig        |  40 ++
  zig/src/core/lanes/kv_parts.zig               |  74 ++
  zig/src/core/lanes/lanes.zig                  |   1 +
- zig/src/families/glm/cuda.zig                 |   7 +
- zig/src/families/glm/cuda_dsa_block.zig       |  75 ++-
+ zig/src/families/glm/cuda.zig                 |   8 +
+ zig/src/families/glm/cuda_dsa_block.zig       |  81 ++-
  zig/src/families/glm/cuda_engine.zig          |  55 +-
  zig/src/families/glm/cuda_engine_types.zig    |   2 +-
  zig/src/families/glm/cuda_follow.zig          |  36 +-
  zig/src/families/glm/cuda_forward.zig         |   6 +-
- zig/src/families/glm/cuda_kv_shard.zig        | 631 ++++++++++++++++++
+ zig/src/families/glm/cuda_glue.zig            |   5 +
+ zig/src/families/glm/cuda_kv8_test.zig        | 222 +++++-
+ zig/src/families/glm/cuda_kv_shard.zig        | 636 ++++++++++++++++++
  zig/src/families/glm/cuda_kv_shard_attn.zig   | 238 +++++++
  .../families/glm/cuda_kv_shard_attn_test.zig  | 208 ++++++
  zig/src/families/glm/cuda_kv_shard_keep.zig   | 107 +++
- .../families/glm/cuda_kv_shard_keep_test.zig  | 134 ++++
+ .../families/glm/cuda_kv_shard_keep_test.zig  | 135 ++++
  .../families/glm/cuda_kv_shard_pages_test.zig | 332 +++++++++
- zig/src/families/glm/cuda_lanes.zig           |  36 +-
- zig/src/families/glm/cuda_native.zig          |  14 +-
- zig/src/families/glm/cuda_pages.zig           | 196 +++++-
+ zig/src/families/glm/cuda_lanes.zig           |  42 +-
+ zig/src/families/glm/cuda_latent.zig          |  31 +-
+ zig/src/families/glm/cuda_native.zig          |  27 +-
+ zig/src/families/glm/cuda_pages.zig           | 265 +++++++-
+ zig/src/families/glm/cuda_pages_test.zig      |  54 ++
  zig/src/families/glm/cuda_prompts.zig         |   8 +
  zig/src/families/glm/cuda_ranks.zig           |  18 +-
  zig/src/families/glm/cuda_ranks_test.zig      |  45 ++
  zig/src/families/glm/cuda_shared.zig          |   5 +
  zig/src/families/glm/cuda_snapshot_layout.zig |  54 +-
  zig/src/families/glm/cuda_snapshot_pages.zig  |  40 +-
- zig/src/families/glm/cuda_snapshots.zig       | 101 ++-
- zig/src/families/glm/cuda_state.zig           |  42 +-
+ zig/src/families/glm/cuda_snapshots.zig       | 111 ++-
+ zig/src/families/glm/cuda_sparse.zig          |   5 +-
+ zig/src/families/glm/cuda_start.zig           |   6 +-
+ zig/src/families/glm/cuda_start_test.zig      |  38 +-
+ zig/src/families/glm/cuda_state.zig           | 101 ++-
  zig/src/native/cuda.zig                       |   3 +-
  zig/src/native/cuda_startup_phase.zig         |   1 +
- zig/src/server/metrics.zig                    |  35 +
- zig/src/server/status_routes.zig              |  34 +
- zig/tests/cuda/glm_kv_shard_check.zig         | 163 +++++
- zig/tests/cuda/main.zig                       |   3 +
- 36 files changed, 2968 insertions(+), 61 deletions(-)
+ zig/tests/cuda/glm_kv_shard_check.zig         | 162 +++++
+ zig/tests/cuda/main.zig                       |   2 +
+ 50 files changed, 3607 insertions(+), 153 deletions(-)
  create mode 100644 docs/glm-port/kv-shard-1104.md
+ create mode 100644 zig/src/core/contract/glm_kv_paged_records.zig
  create mode 100644 zig/src/core/lanes/kv_parts.zig
  create mode 100644 zig/src/families/glm/cuda_kv_shard.zig
  create mode 100644 zig/src/families/glm/cuda_kv_shard_attn.zig
@@ -325,8 +356,389 @@ index 000000000..350e401f9
 +reads, the format words, `CARRY=0`, 4 mutants), `cuda_ranks_test.zig` (the switches' read and fingerprint),
 +`core/lane_host_status_test.zig`, `server/metrics.zig`, `server/status_routes.zig` (telemetry). All in
 +`test-cuda-host` (the GLM module's test block) and runnable alone with the module's `--test-filter "kv shard"`.
+diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
+index 7c570d32d..b5646a586 100644
+--- a/zig/build/glm_family_host.zig
++++ b/zig/build/glm_family_host.zig
+@@ -88,6 +88,7 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
+     const snapshots = b.createModule(.{ .root_source_file = b.path("zig/glm_snapshot_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm", .module = glm }, .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "engine_api", .module = api }, .{ .name = "copies", .module = copies } } });
+     const snapshots_run = b.addRunArtifact(b.addTest(.{ .root_module = snapshots }));
+     b.step("test-glm-snapshots-host", "Prompt-sized GLM state copies, page budgets and rank ordering without devices").dependOn(&snapshots_run.step);
++    b.step("test-glm-kv-pages-host", "TF_KV_PAGES for bf16 and E4M3, the page layouts, admission and refusals, on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{ "TF_KV_PAGES", "capacity keeps", "the plan's window", "a paged stream", "the engine's own sequence holds", "a pool is refused", "a follower", "TF_KV_POISON", "every host allocation failure while making the pages", "E4M3 pages", "a request needing more pages" } })).step);
+     step.dependOn(&snapshots_run.step);
+     b.step("test-glm-prompt-settings-host", "Actual opt-in settings and rank agreement on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{ "prompt K experiment", "TF_GLM_PAIR_EXPERTS", "startup switches", "nvfp4 paired prompt staging bytes", "plan sizes as the Python" } })).step);
+     const request_starts = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"glm request starts:"} }));
+diff --git a/zig/glm_snapshot_host.zig b/zig/glm_snapshot_host.zig
+index b4e538db4..573d64b71 100644
+--- a/zig/glm_snapshot_host.zig
++++ b/zig/glm_snapshot_host.zig
+@@ -597,3 +597,144 @@ test "GLM snapshots: TF_KV_SHARE's adapter reads GLM's decls as the store it rep
+     const r = adapter.cacheRules(glm.native);
+     try std.testing.expect(r.planned and r.grid == 2048 and r.lookahead == 1 and r.min_prompt == 0 and r.warm == .off and !r.fork);
+ }
++
++/// Every field an E4M3 prefix at `at` reads, in `a` and in `b` (codes, scales, rings, pooled keys), from either layout.
++fn expectSamePrefix8(c: glm.config.Config, a: *const glm.forward.State, b: *const glm.forward.State, at: usize, head: ?usize) !void {
++    try same(a.pos_dev, b.pos_dev, 4);
++    try same(a.conv, b.conv, a.kda_layers * 3 * a.conv_c * 2);
++    try same(a.rec, b.rec, 2 * a.kda_layers * a.rec_layer);
++    for (0..a.caches.len + 1) |j| {
++        const n = if (j < a.caches.len) at else head orelse break;
++        const x = if (j < a.caches.len) a.caches[j] else a.mtp_caches;
++        const y = if (j < b.caches.len) b.caches[j] else b.mtp_caches;
++        try t.expect(x.ls != 0 and y.ls != 0);
++        for (0..n) |r| {
++            try same(rowAt(a, x, x.lc, r, c.kv_lora, 512), rowAt(b, y, y.lc, r, c.kv_lora, 512), c.kv_lora);
++            try same(rowAt(a, x, x.ls, r, 4, 512), rowAt(b, y, y.ls, r, 4, 512), 4);
++        }
++        for (0..2) |k| try same(a.rings[2 * j + k], b.rings[2 * j + k], @min(n, a.ring_rows) * a.ring_row);
++        for (0..@min(n / 4 + 2, x.pk_rows)) |p| try same(rowAt(a, x, x.pk, p, c.i_dim * 2, 128), rowAt(b, y, y.pk, p, c.i_dim * 2, 128), c.i_dim * 2);
++    }
++    try same(a.mtp_pos_dev, b.mtp_pos_dev, 4);
++    try same(a.prompt_hidden, b.prompt_hidden, c.hidden * 2);
++}
++
++test "GLM snapshots: an E4M3 paged sequence keeps and resumes its codes, scales and pooled keys through its pages" {
++    var d = rec.init();
++    for ([_]bool{ false, true }) |mtp| {
++        var f: Fixture = undefined;
++        try f.initFormat(&d, 0, 2, mtp, true);
++        defer f.deinit();
++        const c = f.e.c;
++        var w: glm.weights.Weights = undefined;
++        w.config = c;
++        w.share = f.e.share;
++        var layers: [2]glm.weights.Layer = undefined;
++        layers[0].mixer = .{ .mla = undefined };
++        layers[1].mixer = .{ .kda = undefined };
++        w.layers = &layers;
++        // a page: the DSA layer's part (codes, scales, pooled keys), the head's after it only with the head
++        const part = 512 * (c.kv_lora + 4) + 128 * c.i_dim * 2;
++        try t.expectEqual(@as(u64, (1 + @as(usize, @intFromBool(mtp))) * part), glm.state.pageBytesOf(&w, true, mtp));
++        const page = (1 + @as(usize, @intFromBool(mtp))) * part;
++        const ids = [_]u32{ 5, 2, 9, 0, 7, 1, 3, 8, 4, 6 };
++        var kv = try cuda.DeviceBuffer.alloc(&d, ids.len * page);
++        defer kv.free();
++        var paged = f.seq;
++        paged.st = try glm.forward.State.initPagedFormat(t.allocator, &d, &w, 16448, .{ .kv = kv.ptr, .pages = glm.pages.tableLen(16448), .page_bytes = page }, true, mtp);
++        defer paged.st.deinit();
++        paged.st.pages = &ids;
++        paged.st.capacity = ids.len * 512;
++        // its layout: codes, then the part's scales, then its pooled keys, and the head's part only with the head
++        const x = paged.st.caches[0];
++        try t.expectEqual(kv.ptr, x.lc);
++        try t.expectEqual(kv.ptr + 512 * c.kv_lora, x.ls);
++        try t.expectEqual(kv.ptr + 512 * (c.kv_lora + 4), x.pk);
++        try t.expectEqual(@as(u64, page), x.ps);
++        if (mtp) try t.expectEqual(kv.ptr + part, paged.st.mtp_caches.lc);
++        const window = &f.seq;
++        try f.e.prepareSnapshots(3 * f.e.stateBytes(4096));
++        for ([_]usize{ 511, 1537, 4096 }) |at| {
++            const head: ?usize = if (mtp) at + 7 else null;
++            f.e.cur = window;
++            try f.mark(at, head orelse at, @intCast(at % 251));
++            const id = try f.e.keepState();
++            @memset(rec.bytes(paged.st.arena.buf.ptr, paged.st.arena.buf.len), 0xE9);
++            @memset(rec.bytes(kv.ptr, kv.len), 0xE9);
++            f.e.cur = &paged;
++            try f.e.restoreState(id);
++            try expectSamePrefix8(c, &window.st, &paged.st, at, head);
++            try t.expectEqual(at, paged.st.pos);
++            f.e.dropState(id);
++            f.e.dropped.clearRetainingCapacity();
++            const back = try f.e.keepState(); // the pages' prefix back onto a window
++            @memset(rec.bytes(window.st.arena.buf.ptr, window.st.arena.buf.len), 0x5C);
++            f.e.cur = window;
++            try f.e.restoreState(back);
++            try expectSamePrefix8(c, &paged.st, &window.st, at, head);
++            f.e.dropState(back);
++            f.e.dropped.clearRetainingCapacity();
++        }
++        f.e.cur = window;
++    }
++}
++
++test "GLM snapshots: an E4M3 state kept on one paged stream restores into another stream on other pages, its table its own" {
++    var d = rec.init();
++    var f: Fixture = undefined;
++    try f.initFormat(&d, 1, 2, false, true); // a follower's share, beside DFlash2: no head
++    defer f.deinit();
++    const c = f.e.c;
++    var w: glm.weights.Weights = undefined;
++    w.config = c;
++    w.share = f.e.share;
++    var layers: [2]glm.weights.Layer = undefined;
++    layers[0].mixer = .{ .mla = undefined };
++    layers[1].mixer = .{ .kda = undefined };
++    w.layers = &layers;
++    const page = glm.state.pageBytesOf(&w, true, false);
++    // one pool of 20 pages, the two streams' tables disjoint and shuffled
++    const ids_a = [_]u32{ 13, 2, 19, 7, 0, 11, 5, 16, 9, 3 };
++    const ids_b = [_]u32{ 4, 17, 8, 1, 14, 10, 18, 6, 12, 15 };
++    var kv = try cuda.DeviceBuffer.alloc(&d, 20 * page);
++    defer kv.free();
++    const at: glm.state.Paged = .{ .kv = kv.ptr, .pages = glm.pages.tableLen(16448), .page_bytes = page };
++    var a = f.seq;
++    a.st = try glm.forward.State.initPagedFormat(t.allocator, &d, &w, 16448, at, true, false);
++    defer a.st.deinit();
++    var b = f.seq;
++    b.st = try glm.forward.State.initPagedFormat(t.allocator, &d, &w, 16448, at, true, false);
++    defer b.st.deinit();
++    for ([_]*@TypeOf(a){ &a, &b }, [_][]const u32{ &ids_a, &ids_b }) |q, ids| {
++        q.st.pages = ids;
++        q.st.capacity = ids.len * 512;
++        @memset(rec.bytes(q.st.table, ids.len * 4), 0x77); // each table is its stream's: a restore leaves it alone
++    }
++    try f.e.prepareSnapshots(2 * f.e.stateBytes(4096));
++    for ([_]usize{ 1537, 4096 }) |at_row| {
++        // stream a's rows on its pages, as its prompt wrote them
++        @memset(rec.bytes(kv.ptr, kv.len), 0);
++        const arena = rec.bytes(a.st.arena.buf.ptr, a.st.arena.buf.len);
++        for (arena, 0..) |*x, i| x.* = @truncate(i *% 29 +% at_row);
++        @memset(rec.bytes(a.st.table, ids_a.len * 4), 0x77); // the pattern ran over a's own table (its arena's end)
++        for (ids_a) |id| for (rec.bytes(kv.ptr + id * page, page), 0..) |*x, i| {
++            x.* = @truncate(i *% 13 +% id);
++        };
++        try a.st.restoreHost(f.e.stream, at_row, 0, &.{1}, .{ 0, 0 });
++        f.e.cur = &a;
++        const id = try f.e.keepState();
++        // b's pages hold other bytes; the restore writes b's own pages through b's ids
++        for (ids_b) |pid| @memset(rec.bytes(kv.ptr + pid * page, page), 0xE9);
++        const a_pages = try t.allocator.dupe(u8, rec.bytes(kv.ptr, kv.len));
++        defer t.allocator.free(a_pages);
++        f.e.cur = &b;
++        try f.e.restoreState(id);
++        try expectSamePrefix8(c, &a.st, &b.st, at_row, null);
++        try t.expectEqual(at_row, b.st.pos);
++        for (ids_a) |pid| try t.expectEqualSlices(u8, a_pages[pid * page ..][0..page], rec.bytes(kv.ptr + pid * page, page)); // a's untouched
++        for ([_]*@TypeOf(a){ &a, &b }, [_][]const u32{ &ids_a, &ids_b }) |q, ids| for (rec.bytes(q.st.table, ids.len * 4)) |x| try t.expectEqual(@as(u8, 0x77), x);
++        f.e.dropState(id);
++        f.e.dropped.clearRetainingCapacity();
++    }
++    f.e.cur = &f.seq;
++}
+diff --git a/zig/kernels/cuda/common/mla.cuh b/zig/kernels/cuda/common/mla.cuh
+index 782884202..fb535d042 100644
+--- a/zig/kernels/cuda/common/mla.cuh
++++ b/zig/kernels/cuda/common/mla.cuh
+@@ -44,13 +44,16 @@ constexpr int wide_smem() {
+ }
+ 
+ // RW roped columns (Ling's 64) follow the latent in q and keys; SPLIT: block z is chunk z * sw + sr, keys page z.
+-template <int HB, bool FP8 = false, int RW = 0, bool SPLIT = false>
++// PAGED8: an E4M3 cache on KV pages (pt, pstep bytes apart): a dense chunk is one page, a sparse key's logical token goes
++// through the table to its page; codes and scales then load as on a window, so the arithmetic is the window's.
++template <int HB, bool FP8 = false, int RW = 0, bool SPLIT = false, bool PAGED8 = false>
+ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
+                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
+                             float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr,
+                             int sw = 1, int sr = 0) {
+   static_assert(!(FP8 && RW != 0), "the E4M3 cache holds the latent alone");
+   static_assert(!(SPLIT && FP8), "a split cache holds BF16 rows");
++  static_assert(!(PAGED8 && !FP8), "PAGED8 requires FP8");
+   constexpr int MT = HB / 16, KW = LW + RW;
+   extern __shared__ __align__(16) unsigned char smem[];
+   __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(smem);
+@@ -67,6 +70,15 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+   // a dense chunk's 512 keys are one page, its rows from that page's; a sparse key's row comes as the token list has it
+   const __nv_bfloat16* paged = !FP8 && pt && !sparse && live ? lc + ((int64_t)pt[c] * (pstep / 2) - start * KW) : lc;
+   const __nv_bfloat16* keys_at = SPLIT ? lc + (c * CH - start) * KW : paged;
++  const unsigned char* codes8 = reinterpret_cast<const unsigned char*>(lc);
++  const float* scales8 = scales;
++  if constexpr (PAGED8) {
++    if (!sparse && live) {
++      const int64_t page = (int64_t)pt[c] * pstep;
++      codes8 += page - start * LW;
++      scales8 = reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(scales) + page) - start;
++    }
++  }
+   auto load_kv = [&](int tile) {
+     __nv_bfloat16* dst = kvs + (tile & 1) * KT * KW;
+     const int64_t first = start + tile * KT;
+@@ -76,12 +88,27 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
+       const bool ok = sparse ? ki < n : ki <= limit;
+       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+       if constexpr (FP8) {
+-        const unsigned char* codes = reinterpret_cast<const unsigned char*>(lc);
+-        const float row_scale = ok ? scales[src] : 1.0f;
++        const unsigned char* code_base = codes8;
++        int64_t code_row = src;
++        float row_scale = 1.0f;
++        if constexpr (PAGED8) {
++          if (sparse) {
++            const int s = ok ? (int)src : 0;
++            const int64_t page = ok ? (int64_t)pt[s >> 9] * pstep : 0;
++            const int row = s & (CH - 1);
++            code_base = codes8 + page;
++            code_row = row;
++            row_scale = ok ? *reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(scales) + page + row * 4) : 1.0f;
++          } else {
++            row_scale = ok ? scales8[src] : 1.0f;
++          }
++        } else {
++          row_scale = ok ? scales8[src] : 1.0f;
++        }
+ #pragma unroll
+         for (int j = 0; j < 8; j += 2) {
+-          const uint16_t bits = ok ? (uint16_t)codes[src * LW + u * 8 + j] |
+-                                        ((uint16_t)codes[src * LW + u * 8 + j + 1] << 8) : 0;
++          const uint16_t bits = ok ? (uint16_t)code_base[code_row * LW + u * 8 + j] |
++                                        ((uint16_t)code_base[code_row * LW + u * 8 + j + 1] << 8) : 0;
+           const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
+           dst[wide(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, row_scale));
+           dst[wide(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, row_scale));
+diff --git a/zig/kernels/cuda/glm_glue_attn.cuh b/zig/kernels/cuda/glm_glue_attn.cuh
+index 48433be8a..0e0d0f1b1 100644
+--- a/zig/kernels/cuda/glm_glue_attn.cuh
++++ b/zig/kernels/cuda/glm_glue_attn.cuh
+@@ -43,6 +43,24 @@ extern "C" __global__ void __launch_bounds__(256)
+                                  po, pm, pl, rows, heads, w, scale, sparse, nullptr, 0, scales);
+ }
+ 
++// The E4M3 variants on KV pages: the stream's table `pt`, its pages `pstep` bytes apart (codes and scales in each).
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_chunks_16_fp8_paged(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
++                               const int* tok, const int* cnt, float* po, float* pm, float* pl, int64_t rows,
++                               int64_t heads, int64_t w, float scale, int sparse, const int* pt, int64_t pstep) {
++  glm_pdl::enter();
++  glm_attn::chunks_wide<16, true, 0, false, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
++                                                 po, pm, pl, rows, heads, w, scale, sparse, pt, pstep, scales);
++}
++extern "C" __global__ void __launch_bounds__(256)
++    tf_glm_chunks_32_fp8_paged(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
++                               const int* tok, const int* cnt, float* po, float* pm, float* pl, int64_t rows,
++                               int64_t heads, int64_t w, float scale, int sparse, const int* pt, int64_t pstep) {
++  glm_pdl::enter();
++  glm_attn::chunks_wide<32, true, 0, false, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
++                                                 po, pm, pl, rows, heads, w, scale, sparse, pt, pstep, scales);
++}
++
+ // latent._merge, block (row, head), 128 threads: chunks merged in order, o / l by div.full; skips sparse count-0 rows.
+ extern "C" __global__ void __launch_bounds__(128)
+     tf_glm_merge(const float* po, const float* pm, const float* pl, __nv_bfloat16* out, const int* cnt, int64_t rows,
+diff --git a/zig/kernels/cuda/glm_glue_latent.cuh b/zig/kernels/cuda/glm_glue_latent.cuh
+index 241b66add..f9ebbafa6 100644
+--- a/zig/kernels/cuda/glm_glue_latent.cuh
++++ b/zig/kernels/cuda/glm_glue_latent.cuh
+@@ -99,3 +99,16 @@ extern "C" __global__ void __launch_bounds__(512)
+   __shared__ float red[16];
+   tf_kv_fp8::quant_row<512, true>(__bfloat162float(lat[r * stride + d]), d, cache + at * 512, scales + at, red);
+ }
++
++// The same row on KV pages: page pt[at / 512] holds its codes at row at % 512 of this cache's part (from `cache`) and its
++// scale at that row of the part's scales (from `scales`), the pages `ps` bytes apart; the rounding is the window's.
++extern "C" __global__ void __launch_bounds__(512)
++    tf_glm_lat_write_fp8_paged(const __nv_bfloat16* lat, int64_t stride, unsigned char* cache, float* scales,
++                               const int* pos, const int* pt, int64_t ps) {
++  const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
++  const int64_t page = (int64_t)pt[at / 512] * ps, row = at % 512;
++  const int d = threadIdx.x;
++  __shared__ float red[16];
++  float* s = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(scales) + page) + row;
++  tf_kv_fp8::quant_row<512, true>(__bfloat162float(lat[r * stride + d]), d, cache + page + row * 512, s, red);
++}
+diff --git a/zig/src/core/contract/glm_kv_paged_records.zig b/zig/src/core/contract/glm_kv_paged_records.zig
+new file mode 100644
+index 000000000..f86953ac5
+--- /dev/null
++++ b/zig/src/core/contract/glm_kv_paged_records.zig
+@@ -0,0 +1,52 @@
++//! GLM's E4M3 latent cache on KV pages: nvcc 13.0's receipts owed, 13.3's in measurements/pending_133.zig.
++//! Each paged launch is its window twin's (glm_kv_pending.zig) with a page table: same image, block and shared bytes.
++const std = @import("std");
++const registry = @import("registry.zig");
++const limits = @import("limits.zig");
++
++pub const cuda = [_]registry.CudaRecord{
++    .{ .launch = .{ .name = "glm_glue tf_glm_lat_write_fp8_paged", .symbol = "tf_glm_lat_write_fp8_paged", .image = "glm_glue", .threads = 512, .min_sm = 80 }, .usage = registry.none },
++    .{ .launch = .{ .name = "glm_glue tf_glm_chunks_16_fp8_paged", .symbol = "tf_glm_chunks_16_fp8_paged", .image = "glm_glue", .threads = 256, .dynamic = 83328, .opt_in = true, .min_sm = 80 }, .usage = registry.none },
++    .{ .launch = .{ .name = "glm_glue tf_glm_chunks_32_fp8_paged", .symbol = "tf_glm_chunks_32_fp8_paged", .image = "glm_glue", .threads = 256, .dynamic = 101120, .opt_in = true, .min_sm = 80 }, .usage = registry.none },
++};
++
++fn twin(paged: registry.CudaRecord) !registry.CudaRecord {
++    const symbol = paged.launch.symbol[0 .. paged.launch.symbol.len - "_paged".len];
++    for (@import("glm_kv_pending.zig").records) |r| if (std.mem.eql(u8, r.launch.symbol, symbol)) return r;
++    return error.MissingRecord;
++}
++
++test "GLM FP8 KV pages: 13.0 pending, 13.3's receipts fit every SM, and each launch is its window twin's" {
++    for (cuda) |r| {
++        try std.testing.expect(std.mem.endsWith(u8, r.launch.symbol, "_paged"));
++        try std.testing.expect(std.mem.endsWith(u8, r.launch.name, r.launch.symbol));
++        try std.testing.expectEqual(registry.none, registry.usageFor(r, .{ .major = 13, .minor = 0 }));
++        const got = registry.usageFor(r, .{ .major = 13, .minor = 3 });
++        for (limits.sms, got) |sm, u| {
++            try std.testing.expect(u.regs > 0 and u.bound == r.launch.threads);
++            var text: std.ArrayList(u8) = .empty;
++            defer text.deinit(std.testing.allocator);
++            try std.testing.expectEqual(@as(usize, 0), try limits.cuda(r.launch, u, sm, &text, std.testing.allocator));
++        }
++        // the table changes addressing only: the block, its shared bytes and the image are the window kernel's
++        const w = try twin(r);
++        try std.testing.expectEqualStrings(w.launch.image, r.launch.image);
++        try std.testing.expectEqual(w.launch.threads, r.launch.threads);
++        try std.testing.expectEqual(w.launch.dynamic, r.launch.dynamic);
++        try std.testing.expectEqual(w.launch.opt_in, r.launch.opt_in);
++        try std.testing.expectEqual(w.launch.min_sm, r.launch.min_sm);
++        for (registry.usageFor(w, .{ .major = 13, .minor = 3 }), got) |a, b| {
++            try std.testing.expectEqual(a.static, b.static);
++            try std.testing.expectEqual(a.bound, b.bound);
++        }
++    }
++}
++
++test "GLM FP8 KV pages: every paged launch is registered once, beside the window's three" {
++    var n: usize = 0;
++    for (registry.all_cuda) |r| {
++        if (std.mem.startsWith(u8, r.launch.symbol, "tf_glm_") and std.mem.endsWith(u8, r.launch.symbol, "_fp8_paged")) n += 1;
++    }
++    try std.testing.expectEqual(cuda.len, n);
++    for (cuda) |r| _ = try twin(r);
++}
+diff --git a/zig/src/core/contract/measurements/pending_133.zig b/zig/src/core/contract/measurements/pending_133.zig
+index 56af8cdf4..75331f429 100644
+--- a/zig/src/core/contract/measurements/pending_133.zig
++++ b/zig/src/core/contract/measurements/pending_133.zig
+@@ -42,8 +42,11 @@ pub const records = [_]Override{
+     .{ .name = "gdn_prep tf_gdn_prep_64", .usage = .{ .{ .regs = 44, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 46, .static = 0, .bound = 128 }, .{ .regs = 46, .static = 0, .bound = 128 } } },
+     .{ .name = "gdn_prep tf_gdn_prep_64, 16 rows or fewer", .usage = .{ .{ .regs = 44, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 40, .static = 0, .bound = 128 }, .{ .regs = 46, .static = 0, .bound = 128 }, .{ .regs = 46, .static = 0, .bound = 128 } } },
+     .{ .name = "glm_glue tf_glm_chunks_16_fp8", .usage = .{ .{ .regs = 64, .static = 0, .bound = 256 }, .{ .regs = 64, .static = 0, .bound = 256 }, .{ .regs = 64, .static = 0, .bound = 256 }, .{ .regs = 64, .static = 0, .bound = 256 }, .{ .regs = 64, .static = 0, .bound = 256 } } },
++    .{ .name = "glm_glue tf_glm_chunks_16_fp8_paged", .usage = .{ .{ .regs = 178, .static = 0, .bound = 256 }, .{ .regs = 178, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 } } },
+     .{ .name = "glm_glue tf_glm_chunks_32_fp8", .usage = .{ .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 127, .static = 0, .bound = 256 }, .{ .regs = 130, .static = 0, .bound = 256 }, .{ .regs = 130, .static = 0, .bound = 256 } } },
++    .{ .name = "glm_glue tf_glm_chunks_32_fp8_paged", .usage = .{ .{ .regs = 218, .static = 0, .bound = 256 }, .{ .regs = 218, .static = 0, .bound = 256 }, .{ .regs = 196, .static = 0, .bound = 256 }, .{ .regs = 159, .static = 0, .bound = 256 }, .{ .regs = 159, .static = 0, .bound = 256 } } },
+     .{ .name = "glm_glue tf_glm_lat_write_fp8", .usage = .{ .{ .regs = 26, .static = 64, .bound = 512 }, .{ .regs = 28, .static = 64, .bound = 512 }, .{ .regs = 28, .static = 64, .bound = 512 }, .{ .regs = 25, .static = 64, .bound = 512 }, .{ .regs = 25, .static = 64, .bound = 512 } } },
++    .{ .name = "glm_glue tf_glm_lat_write_fp8_paged", .usage = .{ .{ .regs = 30, .static = 64, .bound = 512 }, .{ .regs = 30, .static = 64, .bound = 512 }, .{ .regs = 30, .static = 64, .bound = 512 }, .{ .regs = 27, .static = 64, .bound = 512 }, .{ .regs = 27, .static = 64, .bound = 512 } } },
+     .{ .name = "norms tf_l2_rows", .usage = .{ .{ .regs = 48, .static = 32, .bound = 256 }, .{ .regs = 48, .static = 32, .bound = 256 }, .{ .regs = 48, .static = 32, .bound = 256 }, .{ .regs = 64, .static = 32, .bound = 256 }, .{ .regs = 64, .static = 32, .bound = 256 } } },
+     .{ .name = "norms tf_slerp_rows", .usage = .{ .{ .regs = 113, .static = 32, .bound = 256 }, .{ .regs = 113, .static = 32, .bound = 256 }, .{ .regs = 113, .static = 32, .bound = 256 }, .{ .regs = 113, .static = 32, .bound = 256 }, .{ .regs = 113, .static = 32, .bound = 256 } } },
+     .{ .name = "qk_rows tf_qk_rows at dim 256", .usage = .{ .{ .regs = 30, .static = 32, .bound = 256 }, .{ .regs = 36, .static = 32, .bound = 256 }, .{ .regs = 36, .static = 32, .bound = 256 }, .{ .regs = 29, .static = 32, .bound = 256 }, .{ .regs = 29, .static = 32, .bound = 256 } } },
+diff --git a/zig/src/core/contract/registry.zig b/zig/src/core/contract/registry.zig
+index ba1cfebd4..0373ee67e 100644
+--- a/zig/src/core/contract/registry.zig
++++ b/zig/src/core/contract/registry.zig
+@@ -486,6 +486,7 @@ test {
+     _ = @import("glm_f32w_pending.zig");
+     _ = @import("glm_l2pf_pending.zig");
+     _ = @import("exl3_prompt_pending.zig");
++    _ = @import("glm_kv_paged_records.zig");
+     _ = @import("registry_pending_test.zig");
+     _ = @import("flashnext_pages_pending.zig");
+     _ = @import("flashnext_attn_lanes_pending.zig");
+diff --git a/zig/src/core/contract/registry_joins.zig b/zig/src/core/contract/registry_joins.zig
+index 7f78b593a..77e4c249a 100644
+--- a/zig/src/core/contract/registry_joins.zig
++++ b/zig/src/core/contract/registry_joins.zig
+@@ -64,7 +64,8 @@ pub const cuda_pending = @import("qwen_whole_records.zig").records ++
+     @import("ricursive_prep_records.zig").cuda ++
+     @import("ricursive_attn_records.zig").cuda ++
+     @import("registry_media.zig").cuda_pending ++
+-    @import("h3_image_cuda_records.zig").records;
++    @import("h3_image_cuda_records.zig").records ++
++    @import("glm_kv_paged_records.zig").cuda;
+ pub const metal_before = @import("fsr_records.zig").metal ++
+     @import("scale_index_records.zig").metal ++
+     @import("lfm3_records.zig").metal;
 diff --git a/zig/src/core/engine_status.zig b/zig/src/core/engine_status.zig
-index 0700fd90a..1a2f3d14a 100644
+index eae20fc82..6826ac999 100644
 --- a/zig/src/core/engine_status.zig
 +++ b/zig/src/core/engine_status.zig
 @@ -48,6 +48,12 @@ pub const Status = struct {
@@ -340,35 +752,58 @@ index 0700fd90a..1a2f3d14a 100644
 +    pub const KvParts = @import("lanes").kv_parts.Stats;
 +
      pub const PromptCache = struct {
-         states: u64 = 0,
-         bytes: u64 = 0,
+         /// The miss reasons' fixed names, in the enum's order: bounded labels, no request value becomes one.
+         pub const miss_reason_names = [_][]const u8{ "none", "cold", "too_short", "prompt_changed", "reply_changed", "image_changed", "frame_changed", "rows_changed", "ends_inside", "off_grid", "between_marks", "evicted", "shed", "expired", "cleared", "not_kept", "restore_failed" };
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index c0cf72313..21b587ecb 100644
+index 527498514..b73bf7c90 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
-@@ -61,6 +61,8 @@ pub const LaneHost = struct {
+@@ -57,6 +57,7 @@ pub const LaneHost = struct {
+     keepalive_target: ?api.keepalive.Target = null,
      lone: ?api.Lone = null, // the backend's driver for a lone greedy stream; null: every stream in the lane core
      lone_job: ?*Job = null, // the job that driver holds now
-     cache_status: ?api.Status.PromptCache = null, // published under mutex; HTTP threads never read the store
 +    kv_parts: ?lanes.kv_parts.Source = null, // a sharded backend's KV parts, read on the engine thread at each noteLive
-+    kv_status: ?api.Status.KvParts = null, // ...and published under mutex for status readers
-     disk_status: ?api.Status.DiskCache = null, // published under mutex beside it
      cache_at: i64 = 0, // wall-clock ms of the last full cache and disk copy (republished at 1 Hz at most)
      cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
+     recall: ?*lanes.recall_store.Store = null, // Recall's record: drafts from earlier requests (lane_host_recall.zig)
 diff --git a/zig/src/core/lane_host_status.zig b/zig/src/core/lane_host_status.zig
-index 954f5871c..dcf313db3 100644
+index 46e2ec18e..f2cc496be 100644
 --- a/zig/src/core/lane_host_status.zig
 +++ b/zig/src/core/lane_host_status.zig
-@@ -29,6 +29,7 @@ pub fn read(ctx: *anyopaque, out: *api.Status, stream_tokens: []u32) void {
+@@ -52,6 +52,7 @@ pub fn read(ctx: *anyopaque, out: *api.Status, stream_tokens: []u32) void {
          .streams = n,
-         .generation_tokens = h.live_generated,
-         .prompt_cache = h.cache_status,
-+        .kv_parts = h.kv_status,
-         .disk = h.disk_status,
+         .generation_tokens = s.generation_tokens,
+         .prompt_cache = s.cache_status,
++        .kv_parts = s.kv_status,
+         .disk = s.disk_status,
          .fsr = if (h.fsr) |source| source.read(source.ctx) else null,
-     };
-@@ -79,10 +80,17 @@ pub fn noteDecoded(h: *LaneHost, n: usize, first: bool) void {
-     @import("lane_host_load.zig").decoded(h, n, first);
+         .fill_prompt_tokens = s.fill_prompt_tokens,
+@@ -71,6 +72,7 @@ pub const State = struct {
+     live_tokens: std.ArrayList(u32) = .empty,
+     live_generated: u64 = 0,
+     cache_status: ?api.Status.PromptCache = null,
++    kv_status: ?api.Status.KvParts = null, // a sharded backend's KV parts, as noteLive last read them
+     disk_status: ?api.Status.DiskCache = null,
+     round_waits: std.atomic.Value(u64) = .init(0),
+     engine_id: std.Thread.Id = 0,
+@@ -115,6 +117,7 @@ pub const Snapshot = struct {
+     prefill_at: i96 = 0,
+     generation_tokens: u64 = 0,
+     cache_status: ?api.Status.PromptCache = null,
++    kv_status: ?api.Status.KvParts = null, // a sharded backend's KV parts, as noteLive last read them
+     disk_status: ?api.Status.DiskCache = null,
+     fill_prompt_tokens: ?u32 = null,
+     fill_tokens_left: ?u32 = null,
+@@ -148,6 +151,7 @@ pub fn publish(h: *LaneHost) void {
+         .prefill_at = h.st.prefill_at,
+         .generation_tokens = h.st.live_generated,
+         .cache_status = h.st.cache_status,
++        .kv_status = h.st.kv_status,
+         .disk_status = h.st.disk_status,
+         .fill_prompt_tokens = tmp.fill_prompt_tokens,
+         .fill_tokens_left = tmp.fill_tokens_left,
+@@ -204,11 +208,18 @@ pub fn noteDecoded(h: *LaneHost, n: usize, first: bool) void {
+     publish(h);
  }
  
 -/// Each started stream's context and generated tokens, for the next status read.
@@ -380,12 +815,13 @@ index 954f5871c..dcf313db3 100644
 +        parts = .{};
 +        src.read(src.ctx, &parts.?);
 +    }
-     h.mutex.lockUncancelable(h.io);
-     defer h.unlock();
-+    if (parts) |x| h.kv_status = x;
-     h.live_tokens.clearRetainingCapacity();
-     h.live_generated = 0;
-     const now_ms = @import("rows_io.zig").wallMs();
+     {
+         h.mutex.lockUncancelable(h.io);
+         defer h.mutex.unlock(h.io);
++        if (parts) |x| h.st.kv_status = x;
+         h.st.live_tokens.clearRetainingCapacity();
+         h.st.live_generated = 0;
+         const now_ms = @import("rows_io.zig").wallMs();
 diff --git a/zig/src/core/lane_host_status_test.zig b/zig/src/core/lane_host_status_test.zig
 index dc7da8998..0820787e9 100644
 --- a/zig/src/core/lane_host_status_test.zig
@@ -515,22 +951,30 @@ index 000000000..8180bc0cd
 +    inline for (@typeInfo(Part).@"struct".field_names) |n| try std.testing.expect(@field(Part.help, n).len > 0);
 +}
 diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
-index 3f7ebcd6e..ad063febf 100644
+index 2828001c3..e94e4f1fa 100644
 --- a/zig/src/core/lanes/lanes.zig
 +++ b/zig/src/core/lanes/lanes.zig
-@@ -48,6 +48,7 @@ pub const logprob = @import("logprob.zig");
- pub const grammar = @import("grammar.zig");
+@@ -51,6 +51,7 @@ pub const grammar = @import("grammar.zig");
  pub const grammar_time = @import("grammar_time.zig");
  pub const grammar_fake = @import("grammar_fake.zig"); // a stand-in libtfgrammar for tests
+ pub const drafted_fixture = @import("drafted_test.zig"); // its fake drafter and prompts, for a family's wrapper tests
 +pub const kv_parts = @import("kv_parts.zig");
  
  pub const Engine = engine.Engine;
  pub const Config = config.Config;
 diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
-index e28a6a2de..af9ca6812 100644
+index 8129f4c94..2cffff8f8 100644
 --- a/zig/src/families/glm/cuda.zig
 +++ b/zig/src/families/glm/cuda.zig
-@@ -35,6 +35,7 @@ pub const prompt_logprobs = @import("cuda_prompt_logprobs.zig");
+@@ -23,6 +23,7 @@ pub const shard = @import("cuda_shard.zig");
+ pub const weights = @import("cuda_weights.zig");
+ pub const tile = @import("cuda_tile.zig");
+ pub const forward = @import("cuda_forward.zig");
++pub const state = @import("cuda_state.zig");
+ pub const relay = @import("cuda_relay.zig");
+ pub const config = @import("config.zig");
+ pub const quant = @import("cuda_quant.zig");
+@@ -35,6 +36,7 @@ pub const prompt_logprobs = @import("cuda_prompt_logprobs.zig");
  pub const engine = @import("cuda_engine.zig");
  pub const prompt_pair = @import("cuda_prompt_pair.zig");
  pub const pages = @import("cuda_pages.zig");
@@ -538,7 +982,7 @@ index e28a6a2de..af9ca6812 100644
  pub const share = @import("cuda_share.zig");
  pub const open_owner = @import("cuda_open_owner.zig");
  pub const images = @import("cuda_images.zig");
-@@ -57,6 +58,12 @@ test {
+@@ -61,6 +63,12 @@ test {
      _ = @import("cuda_thin_bytes.zig");
      _ = @import("cuda_images_interleave_test.zig");
      _ = @import("cuda_pages_test.zig");
@@ -552,10 +996,10 @@ index e28a6a2de..af9ca6812 100644
      _ = @import("cuda_ranks_test.zig");
      _ = @import("cuda_ranks_roce_test.zig");
 diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda_dsa_block.zig
-index 03d4457e9..186cf82ea 100644
+index cf9e10e77..7861674a5 100644
 --- a/zig/src/families/glm/cuda_dsa_block.zig
 +++ b/zig/src/families/glm/cuda_dsa_block.zig
-@@ -47,6 +47,17 @@ pub const Caches = struct {
+@@ -64,6 +64,17 @@ pub const Caches = struct {
      pt: u64 = 0, // on pages: the stream's table (i32 page ids), lc and pk then this cache's place in page 0; 0: rows
      ps: u64 = 0, // on pages: bytes from one page to the next
      pks: u64 = 0, // TF_GLM_KV_HOST: the pooled keys' own page stride (their pages on the device); 0: ps
@@ -573,8 +1017,8 @@ index 03d4457e9..186cf82ea 100644
  };
  
  /// The block's scratch for up to `rows` rows.
-@@ -124,18 +135,24 @@ pub fn prepareProfile(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch,
-     if (qi) try projection.matmul(set, stream, ix.qb, s.qr, l.q_lora, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
+@@ -160,20 +171,26 @@ fn compactKv(set: glue.Set, l: Layer) bool {
+     return if (set.mm) |mk| !mk.prompt_fixed_k else false;
  }
  
 -/// One sequence's rows r0..r0 + rows at pos: latent and index keys written, dense then sparse attention into s.ol.
@@ -584,11 +1028,13 @@ index 03d4457e9..186cf82ea 100644
      const ix = l.index;
 -    const kw_rows = ix.d + ix.heads;
      var v = s; // the scratch from row r0
-     v.lat += r0 * l.lw * 2;
+     v.dp += r0 * (l.q_lora + l.row()) * 2;
+     v.lat += r0 * l.row() * 2;
 -    v.ikr += r0 * kw_rows * 2;
 +    v.ikr += r0 * (ix.d + ix.heads) * 2;
      v.igr += r0 * ix.d * 4;
-     v.qa += r0 * l.heads * l.lw * 2;
+     v.q += r0 * l.heads * l.qHead() * 2;
+     v.qa += r0 * l.heads * l.row() * 2;
      v.ol += r0 * l.heads * l.lw * 2;
      v.qi += r0 * ix.heads * ix.d * 2;
 +    return v;
@@ -601,87 +1047,91 @@ index 03d4457e9..186cf82ea 100644
 +    const kw_rows = ix.d + ix.heads;
 +    const v = attendScratch(l, s, r0);
      try writeKeys(k, stream, l, c, v, rows, pos);
+     try ropeQueries(set, stream, l, v, rows, pos);
      const t, const tk = try tables(l, c);
-     const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(l.qk), -0.5));
-@@ -156,7 +173,40 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch,
-             const slots = try g.gather(k.ops, stream, ix.gate, c.lc, c.pt, t.page_rows, pos, v.tokens, v.counts, rows, sparse.width);
-             return latent.sparseAttentionFormat(set, stream, v.qa, slots, 0, .{}, v.tokens, v.counts, sparse.width, v.partials, v.ol, rows, l.heads, l.lw, scale);
+@@ -196,7 +213,41 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch,
+             const slots = try g.gather(k.ops, stream, ix.gate, c.lc, c.pt, t.page_rows, pos, v.tokens, v.counts, rows, ix.geom.width());
+             return latent.sparseAttentionFormat(set, stream, v.qa, slots, 0, .{}, v.tokens, v.counts, ix.geom.width(), v.partials, v.ol, rows, l.heads, l.row(), scale);
          };
--        try latent.sparseAttentionFormat(set, stream, v.qa, c.lc, c.ls, t, v.tokens, v.counts, sparse.width, v.partials, v.ol, rows, l.heads, l.lw, scale);
-+        try latent.sparseAttentionFormat(set, stream, v.qa, c.lc, c.ls, latTable(l, c), v.tokens, v.counts, sparse.width, v.partials, v.ol, rows, l.heads, l.lw, scale);
+-        try latent.sparseAttentionFormat(set, stream, v.qa, c.lc, c.ls, t, v.tokens, v.counts, ix.geom.width(), v.partials, v.ol, rows, l.heads, l.row(), scale);
++        try latent.sparseAttentionFormat(set, stream, v.qa, c.lc, c.ls, latTable(l, c), v.tokens, v.counts, ix.geom.width(), v.partials, v.ol, rows, l.heads, l.row(), scale);
 +    }
 +}
 +
 +/// attend without its attention, for a rank that holds none of the stream's latent rows (TF_GLM_KV_SHARD): the rows'
-+/// latents written (into this rank's trash page), their index keys and gates, and the token lists (every rank picks,
-+/// and a split selection all-gathers); the holder attends for both ranks' heads.
++/// latents written (into this rank's trash page), their index keys and gates, its roped queries, and the token lists
++/// (every rank picks, and a split selection all-gathers); the holder attends for both ranks' heads.
 +pub fn attendNoLatent(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, r0: usize, rows: usize, pos: u64, host_pos: usize) !Scratch {
 +    const ix = l.index;
 +    _, const tk = try tables(l, c);
 +    const v = attendScratch(l, s, r0);
 +    try writeKeys(k, stream, l, c, v, rows, pos);
-+    if (sparseRows(l, host_pos, rows)) try sparse.selectTokensProfile(k.set, k.ops, stream, v.qi, v.ikr + ix.d * 2, ix.d + ix.heads, c.pk, tk, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts, k.split, k.prof);
++    try ropeQueries(k.set, stream, l, v, rows, pos);
++    if (sparseRows(l, host_pos, rows)) try sparse.selectTokensProfile(k.set, k.ops, stream, v.qi, v.ikr + ix.d * 2, ix.d + ix.heads, c.pk, tk, pos, host_pos, rows, ix.heads, ix.d, ix.geom, c.pk_rows - 2, v.select, v.tokens, v.counts, k.split, k.prof);
 +    return v;
 +}
 +
-+/// attend's attention alone, for `rows` rows whose latents, keys and token lists are in place: the queries at `qa`, the
-+/// outputs into `ol` ([rows][heads][lw] bf16), the lists at `tokens` and `counts` (sparse rows), the scratch's partials
-+/// and position slot; the same launches `attend` makes for those rows. Owner-computed attention (cuda_kv_shard_attn)
-+/// runs it for the other rank's heads, with that rank's queries.
++/// attend's attention alone, for `rows` rows whose latents, keys, roped queries and token lists are in place: the
++/// queries at `qa` ([rows][heads][row] bf16), the outputs into `ol` ([rows][heads][lw] bf16), the lists at `tokens` and
++/// `counts` (sparse rows), the scratch's partials and position slot; the same launches `attend` makes for those rows.
++/// Owner-computed attention (cuda_kv_shard_attn) runs it for the other rank's heads, with that rank's queries.
 +pub fn attendOnly(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize, qa: u64, ol: u64, tokens: u64, counts: u64) !void {
 +    var v = s;
 +    v.qa = qa;
 +    v.ol = ol;
-+    const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(l.qk), -0.5));
++    const scale = l.scale();
 +    if (host_pos < l.dense_limit) {
 +        const stamp = prof.span(k.prof, stream, .mla);
-+        try denseAttention(k, stream, l, c, v, pos, rows, nch, part_rows, scale);
++        try denseAttention(k, stream, l, c, v, pos, @min(rows, l.dense_limit - host_pos), nch, part_rows, scale, latent.headBlockFor(rows, l.row()));
 +        stamp.end();
 +    }
 +    if (sparseRows(l, host_pos, rows)) {
 +        const stamp = prof.span(k.prof, stream, .mla);
 +        defer stamp.end();
-+        try latent.sparseAttentionFormat(k.set, stream, qa, c.lc, c.ls, latTable(l, c), tokens, counts, sparse.width, v.partials, ol, rows, l.heads, l.lw, scale);
++        try latent.sparseAttentionFormat(k.set, stream, qa, c.lc, c.ls, latTable(l, c), tokens, counts, l.index.geom.width(), v.partials, ol, rows, l.heads, l.row(), scale);
      }
  }
  
-@@ -229,25 +279,30 @@ fn denseAttention(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scrat
+@@ -243,7 +294,7 @@ fn attendLastRow(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratc
+     const scale = l.scale();
+     if (host_pos < l.dense_limit) { // the same keys today's whole-chunk call read for this row
+         var stamp = prof.span(k.prof, stream, .mla);
+-        try latent.attentionFormat(k.set, stream, v.qa, c.lc, c.ls, .{ .pt = c.pt, .ps = c.ps }, at, v.partials, v.ol, v.dummy, 1, l.heads, l.row(), nch, scale, latent.headBlockFor(rows, l.row()));
++        try latent.attentionFormat(k.set, stream, v.qa, c.lc, c.ls, .{ .pt = c.latPt(), .ps = c.latPs() }, at, v.partials, v.ol, v.dummy, 1, l.heads, l.row(), nch, scale, latent.headBlockFor(rows, l.row()));
+         stamp.end();
+     }
+     if (sparseRows(l, host_pos, rows)) {
+@@ -270,16 +321,24 @@ fn denseAttention(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scrat
              at = s.at;
          }
-         const off = r0 * l.heads * l.lw * 2;
--        try latent.attentionFormat(k.set, stream, s.qa + off, c.lc, c.ls, .{ .pt = c.pt, .ps = c.ps }, at, s.partials, s.ol + off, s.dummy, n, l.heads, l.lw, nch, scale, hb);
-+        try latent.attentionFormat(k.set, stream, s.qa + off, c.lc, c.ls, .{ .pt = c.latPt(), .ps = c.latPs() }, at, s.partials, s.ol + off, s.dummy, n, l.heads, l.lw, nch, scale, hb);
+         const qa = s.qa + r0 * l.heads * l.row() * 2;
+-        try latent.attentionFormat(k.set, stream, qa, c.lc, c.ls, .{ .pt = c.pt, .ps = c.ps }, at, s.partials, s.ol + r0 * l.heads * l.lw * 2, s.dummy, n, l.heads, l.row(), nch, scale, hb);
++        try latent.attentionFormat(k.set, stream, qa, c.lc, c.ls, .{ .pt = c.latPt(), .ps = c.latPs() }, at, s.partials, s.ol + r0 * l.heads * l.lw * 2, s.dummy, n, l.heads, l.row(), nch, scale, hb);
      }
  }
  
  /// A cache's tables: latent rows `t`, and pooled keys `tk` (on their own device pages under TF_GLM_KV_HOST).
++/// The latent table is the latent pages' own (`latPt`/`latPs`): sharded (TF_GLM_KV_SHARD) they are not the key pages'.
  fn tables(l: Layer, c: Caches) !struct { latent.Table, latent.Table } {
--    if (c.ps % (l.lw * 2) != 0) return error.LatentShape; // pages whole latent rows apart (the token lists' unit)
-+    if (c.ps % (l.lw * 2) != 0 or c.latPs() % (l.lw * 2) != 0) return error.LatentShape; // pages whole latent rows apart (the token lists' unit)
-     // an E4M3 cache's sparse lists stay positions (its chunks take each key through the table); BF16's are page rows
-     const t: latent.Table = .{ .pt = c.pt, .ps = c.ps, .page_rows = c.ps / (l.lw * 2), .logical = c.ls != 0 };
-     return .{ t, .{ .pt = c.pt, .ps = if (c.pks != 0) c.pks else c.ps, .page_rows = t.page_rows } };
- }
- 
-+/// The latent rows' table (`tables`[0] but through Caches.latPt/latPs: the same unsharded).
-+fn latTable(l: Layer, c: Caches) latent.Table {
-+    return .{ .pt = c.latPt(), .ps = c.latPs(), .page_rows = c.latPs() / (l.lw * 2), .logical = c.ls != 0 };
+     const rb = l.row() * 2;
+-    if (c.ps % rb != 0) return error.LatentShape; // pages whole latent rows apart (the token lists' unit)
+-    const t: latent.Table = .{ .pt = c.pt, .ps = c.ps, .page_rows = c.ps / rb };
+-    return .{ t, .{ .pt = c.pt, .ps = if (c.pks != 0) c.pks else c.ps, .page_rows = t.page_rows } };
++    if (c.ps % rb != 0 or c.latPs() % rb != 0) return error.LatentShape; // pages whole latent rows apart (the token lists' unit)
++    const t = latTable(l, c);
++    // the pooled keys' table decides how tf_glm_dsa_tokens writes the lists, so it carries the latent table's units too
++    return .{ t, .{ .pt = c.pt, .ps = if (c.pks != 0) c.pks else c.ps, .page_rows = c.ps / rb, .logical = t.logical } };
 +}
 +
++/// The latent rows' table (`tables`[0] but through Caches.latPt/latPs: the same unsharded). An E4M3 cache's token
++/// lists stay positions (`logical`): its chunks read codes and scales, which are different units, through the table.
++fn latTable(l: Layer, c: Caches) latent.Table {
++    return .{ .pt = c.latPt(), .ps = c.latPs(), .page_rows = c.latPs() / (l.row() * 2), .logical = c.ls != 0 };
+ }
+ 
  fn writeKeys(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, rows: usize, pos: u64) !void {
-     const set = k.set;
-     const ix = l.index;
-     const kw_rows = ix.d + ix.heads;
--    const t, const tk = try tables(l, c);
-+    _, const tk = try tables(l, c);
-     var stamp = prof.span(k.prof, stream, .cache_write);
--    try latent.latentWriteFormat(set, stream, s.lat, l.lw, c.lc, c.ls, t, pos, rows, l.lw);
-+    try latent.latentWriteFormat(set, stream, s.lat, l.lw, c.lc, c.ls, latTable(l, c), pos, rows, l.lw);
-     stamp.end();
-     stamp = prof.span(k.prof, stream, .index_update);
-     try sparse.indexUpdate(set, stream, s.ikr, kw_rows, s.igr, ix.ln_w, ix.ln_b, ix.ape, c.ik, c.ig, c.pk, tk, pos, rows);
 diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
-index ac91dc2c2..b8353afba 100644
+index f69e7f72e..6ee553d43 100644
 --- a/zig/src/families/glm/cuda_engine.zig
 +++ b/zig/src/families/glm/cuda_engine.zig
 @@ -20,6 +20,9 @@ const prof_mod = @import("cuda_prof.zig");
@@ -713,7 +1163,7 @@ index ac91dc2c2..b8353afba 100644
          const place = mesh_mod.Mesh.init(.{ .tensor = std.math.cast(u32, world) orelse 0 }, std.math.cast(u32, rank) orelse std.math.maxInt(u32)) catch return error.BadRank;
          const tg = place.group(.tensor);
          const share = try shard.Share.of(&c, tg.rank, tg.world);
-@@ -209,6 +217,8 @@ pub const Engine = struct {
+@@ -212,6 +220,8 @@ pub const Engine = struct {
          errdefer e.bm.deinit();
          if (o.mtp) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
          errdefer if (e.bs) |*b| b.deinit();
@@ -722,7 +1172,7 @@ index ac91dc2c2..b8353afba 100644
          e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world * pick_rows);
          errdefer e.pairs.free();
          try d.check(d.api.cuMemsetD8_v2(e.pairs.ptr, 0, pair_bytes * world * pick_rows), "cuMemsetD8"); // each pair's padding stays zero
-@@ -253,6 +263,7 @@ pub const Engine = struct {
+@@ -267,6 +277,7 @@ pub const Engine = struct {
          e.bd.deinit();
          if (e.pair) |*p| p.deinit();
          e.bp.deinit();
@@ -730,12 +1180,12 @@ index ac91dc2c2..b8353afba 100644
          if (e.pages) |p| p.deinit();
          for (0..e.seqs.items.len) |i| e.free(i);
          e.seqs.deinit(e.gpa);
-@@ -283,7 +294,41 @@ pub const Engine = struct {
+@@ -297,7 +308,41 @@ pub const Engine = struct {
      pub fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
          out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
          const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
--        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = prompt_pair.piecesOf(e, b), .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .l2pf = if (e.l2pf) |*p| p else null };
-+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = prompt_pair.piecesOf(e, b), .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .l2pf = if (e.l2pf) |*p| p else null, .kv = e.kvCtx() };
+-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = prompt_pair.piecesOf(e, b), .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .l2pf = if (e.l2pf) |*p| p else null, .pair_experts = e.pair != null and e.settings.pair_experts };
++        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = prompt_pair.piecesOf(e, b), .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .l2pf = if (e.l2pf) |*p| p else null, .pair_experts = e.pair != null and e.settings.pair_experts, .kv = e.kvCtx() };
 +    }
 +
 +    /// TF_GLM_KV_SHARD: the exchange room for owner-computed attention (a prompt chunk's rows of this rank's heads,
@@ -773,7 +1223,7 @@ index ac91dc2c2..b8353afba 100644
      }
  
      /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
-@@ -385,6 +430,10 @@ pub const Engine = struct {
+@@ -399,6 +444,10 @@ pub const Engine = struct {
          var one: [1]fw.Rank = undefined;
          var f = e.view(&e.bp, &one);
          f.index_split = split;
@@ -784,7 +1234,7 @@ index ac91dc2c2..b8353afba 100644
          if (start + rows <= len -| @as(usize, @intCast(dflash.WIN))) f.taps = null; // none read (dflash.promptRun)
          const as_i32: []const i32 = @ptrCast(part);
          if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
-@@ -451,6 +500,7 @@ pub const Engine = struct {
+@@ -470,6 +519,7 @@ pub const Engine = struct {
      /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r.
      pub fn verify(e: *Engine, ids: []const u32, out: []u32, bits: u64) !void {
          if (ids.len == 0 or ids.len > fw.window_rows) return error.WindowTooWide;
@@ -792,7 +1242,7 @@ index ac91dc2c2..b8353afba 100644
          var one: [1]fw.Rank = undefined;
          var f = e.view(&e.bd, &one);
          const at = e.cur.st.pos;
-@@ -476,12 +526,13 @@ pub const Engine = struct {
+@@ -495,12 +545,13 @@ pub const Engine = struct {
              if (p.ids.len == 0 or p.ids.len > fw.window_rows or rows + p.ids.len > shared_rows) return error.WindowTooWide;
              for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
              try e.bind(p.slot);
@@ -821,15 +1271,15 @@ index 280f12aa2..2c6c7ba31 100644
  /// Where a prompt pass resumes: a kept state (every rank holds `id`) at `at`, a cold pass's cut (cuda_prompt_cuts).
  pub const Resume = struct { id: u64, at: usize };
 diff --git a/zig/src/families/glm/cuda_follow.zig b/zig/src/families/glm/cuda_follow.zig
-index 940dceac4..b72b915c1 100644
+index 3561a154b..5890a8b57 100644
 --- a/zig/src/families/glm/cuda_follow.zig
 +++ b/zig/src/families/glm/cuda_follow.zig
 @@ -16,13 +16,13 @@ const sparse = @import("cuda_sparse.zig");
  const prompt_pair = @import("cuda_prompt_pair.zig");
  const Engine = engine.Engine;
  
--pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, form, cuts };
-+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, form, cuts, layout };
+-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, form, cuts, disk };
++pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, form, cuts, disk, layout };
  
  /// One step as it crosses: 64 bytes, then `n` u32 ids.
  pub const Header = extern struct {
@@ -838,9 +1288,9 @@ index 940dceac4..b72b915c1 100644
 -    depth: u32 = 0, // draft: drafts to chain; chunk: where it starts; shared: its parts
 +    depth: u32 = 0, // draft: drafts to chain; chunk: where it starts; shared: its parts; begin: its twin's ids (KV shard)
      flags: u32 = 0, // begin: sampled; draft: from the prompt (1), chances (2); prefill, chunk: prompt_logprobs (1); chunk: indexer rows split (2); verify, shared: whole rows; snapshots: pages shared
-     a: u64 = 0, // begin: the prompt cache's pages first in its table; keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length
+     a: u64 = 0, // begin: the prompt cache's pages first in its table; keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length; form: a bit a window's rows
      seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position
-@@ -194,6 +194,9 @@ pub const Leader = struct {
+@@ -209,6 +209,9 @@ pub const Leader = struct {
          try x.flush();
          const c = sampler.check(s);
          var h: Header = .{ .kind = @backingInt(Kind.begin), .a = kept };
@@ -850,7 +1300,7 @@ index 940dceac4..b72b915c1 100644
          if (c) |v| {
              h.flags = 1;
              h.seed = v.seed;
-@@ -261,9 +264,22 @@ pub const Leader = struct {
+@@ -276,9 +279,22 @@ pub const Leader = struct {
          return .{ .first = first, .rows = @min(ids.len - start, n) };
      }
  
@@ -873,7 +1323,7 @@ index 940dceac4..b72b915c1 100644
          try x.send(.{ .kind = @backingInt(Kind.verify), .flags = @intFromBool(x.e.structured) }, ids);
          try x.e.verify(ids, out, bits);
      }
-@@ -272,6 +288,7 @@ pub const Leader = struct {
+@@ -287,6 +303,7 @@ pub const Leader = struct {
      pub fn verifyShared(x: Leader, parts: []const engine.Part) !void {
          if (parts.len == 0 or parts.len > engine.max_shared) return error.WindowTooWide;
          try x.flush();
@@ -881,12 +1331,12 @@ index 940dceac4..b72b915c1 100644
          var buf: [2 * engine.max_shared + engine.shared_rows]u32 = undefined;
          var n: usize = 2 * parts.len;
          for (parts, 0..) |p, i| {
-@@ -363,12 +380,12 @@ pub fn follow(e: *Engine, link: *Link) !void {
+@@ -386,12 +403,12 @@ pub fn follow(e: *Engine, link: *Link) !void {
          const step = try link.receive();
          const h = step.h;
          const kind: Kind = @fromBackingInt(@intCast(h.kind));
--        if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many and kind != .idle and kind != .snapshots and kind != .pool and kind != .form) try e.bind(h.slot);
-+        if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many and kind != .idle and kind != .snapshots and kind != .pool and kind != .form and kind != .layout) try e.bind(h.slot);
+-        if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many and kind != .idle and kind != .snapshots and kind != .pool and kind != .form and kind != .disk) try e.bind(h.slot);
++        if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many and kind != .idle and kind != .snapshots and kind != .pool and kind != .form and kind != .disk and kind != .layout) try e.bind(h.slot);
          e.prompt_logprobs = if (promptRows(h)) .{} else null;
          e.structured = structuredStep(h); // rank 0 alone masks them
          switch (kind) {
@@ -896,15 +1346,15 @@ index 940dceac4..b72b915c1 100644
                  try e.beginFollowing(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null);
              },
              .pool => {
-@@ -442,6 +459,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
-                 e.share_pages = h.flags & 1 != 0; // TF_KV_SHARE on rank 0: a kept state leaves the shared store's pages out
+@@ -466,6 +483,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                  try @import("cuda_snapshots.zig").agree(e, h.a);
              },
+             .disk => try @import("cuda_disk_ranks.zig").step(e, link, h, step.ids),
 +            .layout => try checkLayout(e, h.a),
              .drop => for (step.ids) |id| e.dropState(id),
              .release => e.release(h.slot),
              .idle => cuda.tp_watch.sleep(e.io),
-@@ -450,6 +468,16 @@ pub fn follow(e: *Engine, link: *Link) !void {
+@@ -474,6 +492,16 @@ pub fn follow(e: *Engine, link: *Link) !void {
      }
  }
  
@@ -922,10 +1372,10 @@ index 940dceac4..b72b915c1 100644
      const h: Header = .{ .kind = @backingInt(Kind.draft), .n = 3, .depth = 2, .flags = 1, .a = 7, .seed = 1 << 62, .temperature = 0.6, .top_p = 0.95, .top_k = 20 };
      const bytes = std.mem.asBytes(&h);
 diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_forward.zig
-index 34ace9226..5a6f0247d 100644
+index fbfef10c6..a2c552e4b 100644
 --- a/zig/src/families/glm/cuda_forward.zig
 +++ b/zig/src/families/glm/cuda_forward.zig
-@@ -27,6 +27,7 @@ const shared = @import("cuda_shared.zig");
+@@ -28,6 +28,7 @@ const shared = @import("cuda_shared.zig");
  const index_mod = @import("cuda_index.zig");
  const l2pf_mod = @import("cuda_l2pf.zig");
  const pieces_mod = @import("cuda_forward_pieces.zig");
@@ -933,7 +1383,7 @@ index 34ace9226..5a6f0247d 100644
  
  pub const prefill_rows = state.prefill_rows;
  pub const solo_rows = state.solo_rows;
-@@ -158,6 +159,7 @@ pub const Forward = struct {
+@@ -178,6 +179,7 @@ pub const Forward = struct {
      taps: ?taps_mod.Taps = null, // DFlash2 (--drafter): the tapped layers' rows, after each such layer
      index_split: bool = false, // TF_GLM_INDEX_SPLIT: this prompt chunk's indexer rows split across the ranks (rank 0's choice)
      l2pf: ?*const l2pf_mod.L2pf = null, // TF_GLM_L2PF: a decode window's sites read their next weights into L2
@@ -941,7 +1391,7 @@ index 34ace9226..5a6f0247d 100644
  
      /// TF_GLM_L2PF on this forward: a decode window of this process's one rank (a prompt chunk reads at full rate).
      pub fn prefetch(f: *const Forward) ?*const l2pf_mod.L2pf {
-@@ -217,7 +219,9 @@ pub const Forward = struct {
+@@ -237,7 +239,9 @@ pub const Forward = struct {
                  if (b.prefill) st.cur[li] = 1 - cur; // a prompt chunk keeps every row: the layer commits now
              },
              .mla => |a| {
@@ -952,12 +1402,282 @@ index 34ace9226..5a6f0247d 100644
                  if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
              },
          }
+diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue.zig
+index 597e220cf..fec63af5b 100644
+--- a/zig/src/families/glm/cuda_glue.zig
++++ b/zig/src/families/glm/cuda_glue.zig
+@@ -58,6 +58,7 @@ pub const Kernels = struct {
+     expand_v: cuda.Function,
+     lat_write: cuda.Function,
+     lat_write_fp8: cuda.Function,
++    lat_write_fp8_paged: cuda.Function,
+     index_write: cuda.Function,
+     pool_keys: cuda.Function,
+     select_rows: cuda.Function,
+@@ -76,6 +77,8 @@ pub const Kernels = struct {
+     chunks_32: cuda.Function,
+     chunks_16_fp8: cuda.Function,
+     chunks_32_fp8: cuda.Function,
++    chunks_16_fp8_paged: cuda.Function,
++    chunks_32_fp8_paged: cuda.Function,
+     merge: cuda.Function,
+     scores: cuda.Function,
+ 
+@@ -88,6 +91,8 @@ pub const Kernels = struct {
+         try k.chunks_32.allowDynamicShared(chunksSmem(32));
+         try k.chunks_16_fp8.allowDynamicShared(chunksSmem(16));
+         try k.chunks_32_fp8.allowDynamicShared(chunksSmem(32));
++        try k.chunks_16_fp8_paged.allowDynamicShared(chunksSmem(16));
++        try k.chunks_32_fp8_paged.allowDynamicShared(chunksSmem(32));
+         return k;
+     }
+ };
+diff --git a/zig/src/families/glm/cuda_kv8_test.zig b/zig/src/families/glm/cuda_kv8_test.zig
+index 8c17a3261..8e79838b1 100644
+--- a/zig/src/families/glm/cuda_kv8_test.zig
++++ b/zig/src/families/glm/cuda_kv8_test.zig
+@@ -138,24 +138,224 @@ test "GLM FP8 KV: real launchers preserve BF16 ABI and pass FP8 scale pointers f
+     try t.expectEqual(@as(u64, 400), Launch.scales[0]);
+ }
+ 
+-test "GLM FP8 KV: an FP8 cache takes no page table, so its writes and reads refuse one before they launch" {
++/// Every launch's kernel, grid, block, dynamic shared bytes and its first `arity[kernel]` arguments, 8 bytes read at
++/// each (a 4-byte argument is the low half); kernels are handles 16 + their Kernels field index (`recording`).
++const Rec = struct {
++    var n: usize = 0;
++    var arity: [128]u8 = @splat(0);
++    var ids: [16]usize = undefined;
++    var grid: [16][3]u32 = undefined;
++    var blocks: [16]u32 = undefined;
++    var shared: [16]u32 = undefined;
++    var args: [16][16]u64 = undefined;
++    fn run(f: cuda.abi.Function, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, _: c_uint, _: c_uint, sh: c_uint, _: cuda.abi.Stream, a: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) c_int {
++        const k = @intFromPtr(f);
++        ids[n] = k;
++        grid[n] = .{ gx, gy, gz };
++        blocks[n] = bx;
++        shared[n] = sh;
++        for (0..arity[k]) |i| args[n][i] = std.mem.readInt(u64, @as(*const [8]u8, @ptrCast(a.?[i].?)), .little);
++        n += 1;
++        return 0;
++    }
++    fn word(launch: usize, i: usize) u32 {
++        return @truncate(args[launch][i]);
++    }
++};
++fn recording(d: *cuda.Driver, ks: anytype) void {
++    d.api.cuLaunchKernel = Rec.run;
++    d.api.cuLaunchKernelEx = @import("cuda_pdl.zig").forwardEx(Rec.run);
++    d.func_name = null;
++    d.api.cuModuleGetFunction = Ops.function;
++    inline for (@typeInfo(@TypeOf(ks.*)).@"struct".field_names, 0..) |name, i| @field(ks, name) = .{ .d = d, .handle = @ptrFromInt(16 + i) };
++    Rec.n = 0;
++    Rec.arity = @splat(0);
++}
++fn kid(f: cuda.Function) usize {
++    return @intFromPtr(f.handle);
++}
++
++test "GLM FP8 KV: on pages an FP8 cache's write takes lat_write_fp8_paged, the window's arguments then the table" {
+     const glue = @import("cuda_glue.zig");
+     const latent = @import("cuda_latent.zig");
+     var d: cuda.Driver = undefined;
+-    d.api.cuLaunchKernel = Launch.run;
+-    d.api.cuLaunchKernelEx = @import("cuda_pdl.zig").forwardEx(Launch.run);
+-    d.func_name = null;
+     var ks: glue.Kernels = undefined;
+-    inline for (@typeInfo(glue.Kernels).@"struct".field_names) |name| @field(ks, name) = .{ .d = &d, .handle = @ptrFromInt(10) };
++    recording(&d, &ks);
++    Rec.arity[kid(ks.lat_write_fp8)] = 5;
++    Rec.arity[kid(ks.lat_write_fp8_paged)] = 7;
++    const set: glue.Set = .{ .glue = &ks };
++    const stream: cuda.Stream = .{ .d = &d, .handle = null };
++    // 11 DSA parts of 296,960 bytes a page; this cache's codes in page 0, its scales 262,144 bytes on
++    const paged: latent.Table = .{ .pt = 900, .ps = 11 * 296_960, .page_rows = 11 * 296_960 / 1024, .logical = true };
++    try latent.latentWriteFormat(set, stream, 100, 576, 200, 200 + 262_144, paged, 300, 7, 512);
++    try latent.latentWriteFormat(set, stream, 100, 576, 200, 200 + 262_144, .{}, 300, 7, 512);
++    try t.expectEqual(@as(usize, 2), Rec.n);
++    try t.expectEqualSlices(usize, &.{ kid(ks.lat_write_fp8_paged), kid(ks.lat_write_fp8) }, Rec.ids[0..2]);
++    try t.expectEqualSlices(u64, &.{ 100, 576, 200, 200 + 262_144, 300, 900, 11 * 296_960 }, Rec.args[0][0..7]);
++    try t.expectEqualSlices(u64, &.{ 100, 576, 200, 200 + 262_144, 300 }, Rec.args[1][0..5]);
++    for (0..2) |i| {
++        try t.expectEqual([3]u32{ 7, 1, 1 }, Rec.grid[i]);
++        try t.expectEqual(@as(u32, 512), Rec.blocks[i]);
++        try t.expectEqual(@as(u32, 0), Rec.shared[i]);
++    }
++    try t.expectError(error.LatentShape, latent.latentWriteFormat(set, stream, 100, 576, 200, 400, paged, 300, 7, 256));
++    try t.expectEqual(@as(usize, 2), Rec.n);
++}
++
++test "GLM FP8 KV: on pages an FP8 cache's dense and sparse chunks take the _paged kernels, the window's arguments then the table" {
++    const glue = @import("cuda_glue.zig");
++    const latent = @import("cuda_latent.zig");
++    var d: cuda.Driver = undefined;
++    var ks: glue.Kernels = undefined;
++    recording(&d, &ks);
++    Rec.arity[kid(ks.chunks_16)] = 15;
++    Rec.arity[kid(ks.chunks_32)] = 15;
++    Rec.arity[kid(ks.chunks_16_fp8)] = 14;
++    Rec.arity[kid(ks.chunks_32_fp8)] = 14;
++    Rec.arity[kid(ks.chunks_16_fp8_paged)] = 16;
++    Rec.arity[kid(ks.chunks_32_fp8_paged)] = 16;
++    Rec.arity[kid(ks.merge)] = 9;
+     const set: glue.Set = .{ .glue = &ks };
+     const stream: cuda.Stream = .{ .d = &d, .handle = null };
+-    const paged: latent.Table = .{ .pt = 900, .ps = 6_684_672, .page_rows = 6_528 };
++    const ps: u64 = 11 * 296_960;
++    const paged: latent.Table = .{ .pt = 900, .ps = ps, .page_rows = ps / 1024, .logical = true };
+     const p: latent.Partials = .{ .po = 1000, .pm = 2000, .pl = 3000 };
+-    Launch.n = 0;
+-    try t.expectError(error.Fp8OnPages, latent.latentWriteFormat(set, stream, 100, 512, 200, 400, paged, 300, 3, 512));
+-    try t.expectError(error.Fp8OnPages, latent.attentionFormat(set, stream, 100, 200, 400, paged, 300, p, 500, 600, 3, 32, 512, 1, 0.125, 16));
+-    try t.expectError(error.Fp8OnPages, latent.sparseAttentionFormat(set, stream, 100, 200, 400, paged, 500, 600, 2051, p, 700, 3, 32, 512, 0.125));
+-    try t.expectEqual(@as(usize, 0), Launch.n);
++    const scale: f32 = 0.0625;
++    // dense: rows 3 at hb 16 (2 head blocks of 32 heads), rows 64 at hb 32; 5 chunks
++    for ([_]usize{ 16, 32 }) |hb| {
++        const rows: usize = if (hb == 16) 3 else 64;
++        Rec.n = 0;
++        try latent.attentionFormat(set, stream, 100, 200, 200 + 262_144, paged, 300, p, 500, 600, rows, 32, 512, 5, scale, hb);
++        try t.expectEqual(@as(usize, 2), Rec.n);
++        try t.expectEqual(kid(if (hb == 16) ks.chunks_16_fp8_paged else ks.chunks_32_fp8_paged), Rec.ids[0]);
++        try t.expectEqualSlices(u64, &.{ 100, 200, 200 + 262_144, 300, 0, 0, 1000, 2000, 3000, rows, 32, 0 }, Rec.args[0][0..12]);
++        try t.expectEqual(@as(u32, @bitCast(scale)), Rec.word(0, 12));
++        try t.expectEqual(@as(u32, 0), Rec.word(0, 13));
++        try t.expectEqualSlices(u64, &.{ 900, ps }, Rec.args[0][14..16]);
++        try t.expectEqual([3]u32{ @intCast(rows), @intCast(32 / hb), 5 }, Rec.grid[0]);
++        try t.expectEqual(@as(u32, 256), Rec.blocks[0]);
++        try t.expectEqual(if (hb == 16) glue.chunksSmem(16) else glue.chunksSmem(32), Rec.shared[0]);
++        try t.expectEqual(kid(ks.merge), Rec.ids[1]);
++    }
++    // sparse: logical lists of 2,051 tokens (5 chunks), rows 3 (hb 16) and 64 (hb 32)
++    for ([_]usize{ 3, 64 }) |rows| {
++        Rec.n = 0;
++        try latent.sparseAttentionFormat(set, stream, 100, 200, 200 + 262_144, paged, 500, 600, 2051, p, 700, rows, 32, 512, scale);
++        try t.expectEqual(@as(usize, 2), Rec.n);
++        try t.expectEqual(kid(if (rows < 64) ks.chunks_16_fp8_paged else ks.chunks_32_fp8_paged), Rec.ids[0]);
++        try t.expectEqualSlices(u64, &.{ 100, 200, 200 + 262_144, 0, 500, 600, 1000, 2000, 3000, rows, 32, 2051 }, Rec.args[0][0..12]);
++        try t.expectEqual(@as(u32, 1), Rec.word(0, 13));
++        try t.expectEqualSlices(u64, &.{ 900, ps }, Rec.args[0][14..16]);
++        try t.expectEqual([3]u32{ @intCast(rows), if (rows < 64) 2 else 1, 5 }, Rec.grid[0]);
++        try t.expectEqual(kid(ks.merge), Rec.ids[1]);
++        try t.expectEqual(@as(u64, 600), Rec.args[1][4]);
++    }
++    // the window's FP8 kernels keep their 14 arguments, BF16 its table, on pages or not
++    Rec.n = 0;
++    try latent.attentionFormat(set, stream, 100, 200, 400, .{}, 300, p, 500, 600, 3, 32, 512, 1, scale, 16);
++    try latent.sparseAttentionFormat(set, stream, 100, 200, 400, .{}, 500, 600, 2051, p, 700, 64, 32, 512, scale);
++    try latent.attentionFormat(set, stream, 100, 200, 0, .{ .pt = 900, .ps = 6_684_672, .page_rows = 6_528 }, 300, p, 500, 600, 3, 32, 512, 1, scale, 32);
++    try latent.sparseAttentionFormat(set, stream, 100, 200, 0, .{ .pt = 900, .ps = 6_684_672, .page_rows = 6_528 }, 500, 600, 2051, p, 700, 3, 32, 512, scale);
++    try t.expectEqual(@as(usize, 8), Rec.n);
++    try t.expectEqualSlices(usize, &.{ kid(ks.chunks_16_fp8), kid(ks.chunks_32_fp8), kid(ks.chunks_32), kid(ks.chunks_16) }, &.{ Rec.ids[0], Rec.ids[2], Rec.ids[4], Rec.ids[6] });
++    try t.expectEqualSlices(u64, &.{ 100, 200, 400, 300 }, Rec.args[0][0..4]);
++    try t.expectEqual(@as(u32, 0), Rec.word(0, 13));
++    try t.expectEqual(@as(u32, 1), Rec.word(2, 13));
++    try t.expectEqualSlices(u64, &.{ 900, 6_684_672 }, Rec.args[4][13..15]);
++    try t.expectEqualSlices(u64, &.{ 900, 6_684_672 }, Rec.args[6][13..15]);
++}
++
++test "GLM FP8 KV: a paged sparse list in the other cache's units refuses before any launch" {
++    const glue = @import("cuda_glue.zig");
++    const latent = @import("cuda_latent.zig");
++    var d: cuda.Driver = undefined;
++    var ks: glue.Kernels = undefined;
++    recording(&d, &ks);
++    const set: glue.Set = .{ .glue = &ks };
++    const stream: cuda.Stream = .{ .d = &d, .handle = null };
++    const p: latent.Partials = .{ .po = 1000, .pm = 2000, .pl = 3000 };
++    // E4M3 on pages reads positions: a list of BF16 rows (logical false) would be read as positions
++    try t.expectError(error.TokenUnits, latent.sparseAttentionFormat(set, stream, 100, 200, 400, .{ .pt = 900, .ps = 3_266_560, .page_rows = 3_190 }, 500, 600, 2051, p, 700, 3, 32, 512, 0.125));
++    // BF16 on pages reads rows
++    try t.expectError(error.TokenUnits, latent.sparseAttentionFormat(set, stream, 100, 200, 0, .{ .pt = 900, .ps = 6_684_672, .page_rows = 6_528, .logical = true }, 500, 600, 2051, p, 700, 3, 32, 512, 0.125));
++    try t.expectEqual(@as(usize, 0), Rec.n);
++    // dense chunks read no list, and a window takes no table: neither refuses
++    try latent.attentionFormat(set, stream, 100, 200, 400, .{ .pt = 900, .ps = 3_266_560, .page_rows = 3_190 }, 300, p, 500, 600, 3, 32, 512, 1, 0.125, 16);
++    try latent.sparseAttentionFormat(set, stream, 100, 200, 400, .{ .logical = true }, 500, 600, 2051, p, 700, 3, 32, 512, 0.125);
++    try t.expectEqual(@as(usize, 4), Rec.n);
++    try t.expectEqual(kid(ks.chunks_16_fp8_paged), Rec.ids[0]);
++    try t.expectEqual(kid(ks.chunks_16_fp8), Rec.ids[2]);
++}
++
++test "GLM FP8 KV: a logical table keeps the assembled token lists positions, while the pooled keys still read the pages" {
++    const glue = @import("cuda_glue.zig");
++    const latent = @import("cuda_latent.zig");
++    const sparse = @import("cuda_sparse.zig");
++    var d: cuda.Driver = undefined;
++    var ks: glue.Kernels = undefined;
++    recording(&d, &ks);
++    Rec.arity[kid(ks.scores)] = 14;
++    Rec.arity[15] = 7; // tf_glm_dsa_tokens (Ops)
++    const set: glue.Set = .{ .glue = &ks };
++    const ops: cuda.Module = .{ .d = &d, .handle = null };
++    const stream: cuda.Stream = .{ .d = &d, .handle = null };
++    const s: sparse.Scratch = .{ .scores = 5000, .ls = 5100, .li = 5200, .pools = 5300, .at = 5400 };
++    for ([_]bool{ true, false }) |logical| {
++        Rec.n = 0;
++        const tab: latent.Table = .{ .pt = 900, .ps = 3_266_560, .page_rows = 3_190, .logical = logical };
++        try sparse.selectTokens(set, ops, stream, 100, 200, 576, 1000, tab, 300, 5000, 3, 32, 128, .{}, 2048, s, 6000, 7000);
++        try t.expectEqual(@as(usize, 3), Rec.n);
++        try t.expectEqual(kid(ks.scores), Rec.ids[0]);
++        try t.expectEqualSlices(u64, &.{ 900, 3_266_560 }, Rec.args[0][12..14]);
++        try t.expectEqual(@as(usize, 15), Rec.ids[2]);
++        try t.expectEqualSlices(u64, &.{ 5300, 300 }, Rec.args[2][0..2]);
++        try t.expectEqual(@as(u32, sparse.topk_pools), Rec.word(2, 2));
++        try t.expectEqualSlices(u64, &.{ 6000, 7000, if (logical) 0 else 900, 3_190 }, Rec.args[2][3..7]);
++    }
++}
++
++test "GLM FP8 KV: the glue resolves the paged symbols and opts their chunks into the window's shared memory" {
++    const glue = @import("cuda_glue.zig");
++    const Res = struct {
++        var names: [96][]const u8 = undefined;
++        var n: usize = 0;
++        var set_on: [16]usize = undefined;
++        var set_bytes: [16]c_int = undefined;
++        var sets: usize = 0;
++        fn function(out: *cuda.abi.Function, _: cuda.abi.Module, name: [*:0]const u8) callconv(.c) c_int {
++            names[n] = std.mem.span(name);
++            n += 1;
++            out.* = @ptrFromInt(16 + n - 1);
++            return 0;
++        }
++        fn attr(f: cuda.abi.Function, _: cuda.abi.FunctionAttribute, v: c_int) callconv(.c) c_int {
++            set_on[sets] = @intFromPtr(f);
++            set_bytes[sets] = v;
++            sets += 1;
++            return 0;
++        }
++        fn handleOf(name: []const u8) ?usize {
++            for (names[0..n], 0..) |x, i| if (std.mem.eql(u8, x, name)) return 16 + i;
++            return null;
++        }
++        fn bytesOn(h: usize) ?c_int {
++            for (set_on[0..sets], set_bytes[0..sets]) |x, b| if (x == h) return b;
++            return null;
++        }
++    };
++    var d: cuda.Driver = undefined;
++    d.api.cuModuleGetFunction = Res.function;
++    d.api.cuFuncSetAttribute = Res.attr;
++    const ks = try glue.Kernels.load(.{ .d = &d, .handle = null });
++    inline for (.{ .{ "tf_glm_lat_write_fp8_paged", 0 }, .{ "tf_glm_chunks_16_fp8_paged", glue.chunksSmem(16) }, .{ "tf_glm_chunks_32_fp8_paged", glue.chunksSmem(32) } }) |e| {
++        const h = Res.handleOf(e[0]) orelse return error.SymbolNotResolved;
++        if (e[1] == 0) try t.expect(Res.bytesOn(h) == null) else try t.expectEqual(@as(?c_int, @intCast(e[1])), Res.bytesOn(h));
++    }
++    try t.expectEqual(Res.handleOf("tf_glm_lat_write_fp8_paged").?, kid(ks.lat_write_fp8_paged));
++    try t.expectEqual(Res.handleOf("tf_glm_chunks_16_fp8_paged").?, kid(ks.chunks_16_fp8_paged));
++    try t.expectEqual(Res.handleOf("tf_glm_chunks_32_fp8_paged").?, kid(ks.chunks_32_fp8_paged));
++    try t.expectEqual(Res.bytesOn(kid(ks.chunks_16_fp8)), Res.bytesOn(kid(ks.chunks_16_fp8_paged)));
++    try t.expectEqual(Res.bytesOn(kid(ks.chunks_32_fp8)), Res.bytesOn(kid(ks.chunks_32_fp8_paged)));
+ }
+ 
+ const Ops = struct {
 diff --git a/zig/src/families/glm/cuda_kv_shard.zig b/zig/src/families/glm/cuda_kv_shard.zig
 new file mode 100644
-index 000000000..9b3707fa5
+index 000000000..1c92dca65
 --- /dev/null
 +++ b/zig/src/families/glm/cuda_kv_shard.zig
-@@ -0,0 +1,631 @@
+@@ -0,0 +1,636 @@
 +//! TF_GLM_KV_SHARD (GLM patch 0118 by Robert Wojciechowski, GitHub @wojo, X @rwojo; docs/glm-port/kv-shard-1104.md):
 +//! at TP=2 each stream's E4M3 latent rows live on one rank, its owner. The KV page ids are cut in two parts, part r
 +//! owned by rank r; a stream takes its pages from one part. Every page's pooled index keys stay on both ranks (the
@@ -1076,6 +1796,7 @@ index 000000000..9b3707fa5
 +        error.KvShardNeedsTwoRanks => "TF_GLM_KV_SHARD=1 needs two ranks (TP=2)",
 +        error.KvShardNeedsFp8 => "TF_GLM_KV_SHARD=1 needs --kv-cache fp8 (KV=fp8): it shards the E4M3 latent rows",
 +        error.KvShardNeedsPages => "TF_GLM_KV_SHARD=1 needs KV pages (TF_KV_PAGES unset or auto, and DSA layers loaded)",
++        error.KvShardWithLearn => "TF_GLM_KV_SHARD=1 does not run with --learn-conversations (LEARN_GIB): its disk images hold whole states, a sharded state's latent rows are one rank's",
 +        error.KvShardWithMtp => "TF_GLM_KV_SHARD=1 does not run with the target MTP head drafting (DRAFTER=mtp); DFlash2 is fine",
 +        error.KvShardNotBuilt => "TF_GLM_KV_SHARD=1: KV sharding's GPU paths are not in this build yet",
 +        error.KvShardNeedsParallel => "TF_GLM_KV_SHARD=1 needs --parallel above 1",
@@ -1588,6 +2309,10 @@ index 000000000..9b3707fa5
 +    try q.map(0, p.slots[0].ids.items, &.{});
 +    mutant = .digest_no_twin;
 +    try std.testing.expectEqual(p.digest(), q.digest()); // the twin's absence on q goes unseen
++}
++
++test "kv shard: --learn-conversations is refused by name beside it" {
++    try std.testing.expect(why(error.KvShardWithLearn) != null);
 +}
 diff --git a/zig/src/families/glm/cuda_kv_shard_attn.zig b/zig/src/families/glm/cuda_kv_shard_attn.zig
 new file mode 100644
@@ -2162,10 +2887,10 @@ index 000000000..b15606b0f
 +}
 diff --git a/zig/src/families/glm/cuda_kv_shard_keep_test.zig b/zig/src/families/glm/cuda_kv_shard_keep_test.zig
 new file mode 100644
-index 000000000..623d83e22
+index 000000000..2f92ec5ad
 --- /dev/null
 +++ b/zig/src/families/glm/cuda_kv_shard_keep_test.zig
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,135 @@
 +//! TF_GLM_KV_SHARD's kept states on a driver of addresses alone: a restore that skips its latent parts leaves their
 +//! bytes in place and every other part's offsets as they were; a carry's staging copy walks device pages; and the two
 +//! parts' leases over random admissions, twins and ends stay whole, placed alike on both ranks.
@@ -2209,12 +2934,13 @@ index 000000000..623d83e22
 +test "kv shard keep: a restore without its latent parts copies the others from their own offsets" {
 +    const gpa = std.testing.allocator;
 +    var d = driver();
-+    var pool = try snap_pages.Pool.init(gpa, &d, 3 * snap_pages.page);
++    var pool = try snap_pages.Pool.init(gpa, &d, 3 * snap_pages.page, false);
 +    defer pool.deinit();
 +    var plan: layout.Plan = .{};
 +    const live: [3]u64 = .{ 0x1000_0000, 0x2000_0000, 0x3000_0000 };
 +    plan.parts[0] = .{ .live = live[0], .len = 1 * MiB };
-+    plan.parts[1] = .{ .live = live[1], .len = 3 * MiB, .lat = true };
++    plan.parts[1] = .{ .live = live[1], .len = 3 * MiB };
++    plan.part_lat[1] = true;
 +    plan.parts[2] = .{ .live = live[2], .len = MiB / 2 };
 +    plan.count = 3;
 +    plan.len = 4 * MiB + MiB / 2;
@@ -2302,7 +3028,7 @@ index 000000000..623d83e22
 +}
 diff --git a/zig/src/families/glm/cuda_kv_shard_pages_test.zig b/zig/src/families/glm/cuda_kv_shard_pages_test.zig
 new file mode 100644
-index 000000000..1e9a1c6a1
+index 000000000..f917875c5
 --- /dev/null
 +++ b/zig/src/families/glm/cuda_kv_shard_pages_test.zig
 @@ -0,0 +1,332 @@
@@ -2589,26 +3315,26 @@ index 000000000..1e9a1c6a1
 +    try p.mapWith(1, &.{ 12, 9, 14 }, 0); // part 1's stream on rank 1: latent pages 4, 1, 6
 +    const st = f.st(1);
 +    const at = 1200;
-+    const full = try layout.Plan.initFor(st, &f.e.w.config, at, null, true);
-+    const bare = try layout.Plan.initFor(st, &f.e.w.config, at, null, false);
++    const full = try layout.Plan.initSharded(st, &f.e.w.config, at, null, 0, st.cur, true);
++    const bare = try layout.Plan.initSharded(st, &f.e.w.config, at, null, 0, st.cur, false);
 +    try expectEqual(full.len - at * (512 + 4), bare.len); // one DSA layer's codes and scales
-+    try expectEqual(full.len, try layout.Plan.size(st, &f.e.w.config, st.capacity, at, null));
++    try expectEqual(full.len, try layout.Plan.size(st, &f.e.w.config, st.capacity, at, null, 0));
 +    var lat: usize = 0;
-+    for (full.parts[0..full.count]) |part| {
-+        if (!part.lat) continue;
++    for (full.parts[0..full.count], 0..) |part, i| {
++        if (!full.part_lat[i]) continue;
 +        lat += 1;
 +        try expectEqual(@as(u64, 264_192), part.page);
 +        const x = p.shard.?;
 +        // row 600 lies on the stream's second page: latent page 1 of this rank's arena
 +        const span = part.span;
-+        const pc = full.piece(part, span + 5);
++        const pc = full.pieceAt(i, span + 5);
 +        try expectEqual(part.live + 1 * part.page + 5, pc.live);
 +        try expect(pc.live >= x.lat.?.ptr and pc.live < x.lat.?.ptr + 9 * 264_192);
 +    }
 +    try expectEqual(@as(usize, 2), lat); // codes, then scales
-+    for (bare.parts[0..bare.count]) |part| try expect(!part.lat);
++    for (bare.part_lat[0..bare.count]) |lat_part| try expect(!lat_part);
 +    // the pooled keys' part walks the key pages by the stream's ids
-+    for (full.parts[0..full.count]) |part| if (part.span != 0 and !part.lat) {
++    for (full.parts[0..full.count], 0..) |part, i| if (part.span != 0 and !full.part_lat[i]) {
 +        try expectEqual(@as(u64, 32_768), part.page);
 +        try expectEqual(part.live + 9 * part.page, full.piece(part, part.span).live);
 +    };
@@ -2633,16 +3359,27 @@ index 000000000..1e9a1c6a1
 +    var streams: [2]lanes.Stream = undefined;
 +    streams[0].reuse = .{ .saved = &kept, .at = 4096 };
 +    streams[1].reuse = .{};
-+    _ = try ln.seat(&streams[0], 600, 100); // both parts empty: the tie would pick part 0, its home is part 1
++    _ = try ln.seat(&streams[0], 600, 100, &.{}); // both parts empty: the tie would pick part 0, its home is part 1
 +    try expectEqual(@as(u8, 1), f.st(ln.lanes.get(&streams[0]).?.slot).hold.?.owner);
-+    _ = try ln.seat(&streams[1], 600, 100); // no kept state: the part with fewer live streams
++    _ = try ln.seat(&streams[1], 600, 100, &.{}); // no kept state: the part with fewer live streams
 +    try expectEqual(@as(u8, 0), f.st(ln.lanes.get(&streams[1]).?.slot).hold.?.owner);
 +}
 diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
-index 886475f58..a8cf27244 100644
+index c38cfbeb0..931d95a28 100644
 --- a/zig/src/families/glm/cuda_lanes.zig
 +++ b/zig/src/families/glm/cuda_lanes.zig
-@@ -338,20 +338,30 @@ pub const Lanes = struct {
+@@ -294,6 +294,10 @@ pub const Lanes = struct {
+         const marks: []const u32 = if (share) (try share_mod.begin(self.x.e, s, &owner, &adopt)).marks else &.{};
+         var held = true;
+         errdefer if (held) gpa.free(marks);
++        if (self.x.e.pages) |p| if (p.replyFor(ids.len, s.max_new)) |capped| if (capped < s.max_new) {
++            std.log.info("kv pool: a request of {d} prompt tokens asks {d} reply tokens and opens with {d}: the pool holds no more pages", .{ ids.len, s.max_new, capped });
++            s.max_new = @intCast(capped);
++        };
+         const pages = try self.seat(s, ids.len, s.max_new, adopt.items);
+         errdefer {
+             self.x.e.release(self.lanes.get(s).?.slot);
+@@ -335,25 +339,35 @@ pub const Lanes = struct {
              if (self.x.e.pages) |p| p.close(l.slot);
              _ = self.lanes.remove(s);
          }
@@ -2677,7 +3414,13 @@ index 886475f58..a8cf27244 100644
      }
  
      /// The lane host's admission: with a pool, a paged sequence and the request's pages are free.
-@@ -390,10 +400,28 @@ pub const Lanes = struct {
+     pub fn fits(self: *const Lanes, prompt: usize, max_tokens: usize) bool {
+-        const p = self.x.e.pages orelse return true;
++        const p = self.x.e.pages orelse return true; // its wait note is rank 0's, on the engine thread
+         return p.fits(prompt, max_tokens);
+     }
+ 
+@@ -387,10 +401,28 @@ pub const Lanes = struct {
              s.reuse_error = if (k.at == 0 or k.at >= len) error.SnapshotNotPrefix else if (k.at != s.reuse.at or !engine.prompt_cuts.resumes(len, s.chunks, k.at, k.below)) error.SnapshotOutOfStep else error.SnapshotStale;
              return null;
          }
@@ -2706,11 +3449,80 @@ index 886475f58..a8cf27244 100644
      /// The prompt pass stands at a mark: the lane host keeps the state there (cuda_native's snap_save).
      fn keptAt(ctx: *anyopaque, at: u32) void {
          const s: *lanes.Stream = @ptrCast(@alignCast(ctx));
+diff --git a/zig/src/families/glm/cuda_latent.zig b/zig/src/families/glm/cuda_latent.zig
+index c79cc58f2..f71927c96 100644
+--- a/zig/src/families/glm/cuda_latent.zig
++++ b/zig/src/families/glm/cuda_latent.zig
+@@ -92,16 +92,23 @@ pub fn cacheBytes(capacity: usize, lw: usize, kv8: bool) !usize {
+ }
+ 
+ /// On pages: the stream's table (i32 page ids) and the step from page to page in bytes and latent rows; 0: in order.
+-pub const Table = struct { pt: u64 = 0, ps: u64 = 0, page_rows: u64 = 0 };
++/// `logical`: the sparse token lists stay positions (an E4M3 cache, whose chunks take each key through `pt`, its codes
++/// and scales being different units); otherwise tf_glm_dsa_tokens writes each token's BF16 row on the pages.
++pub const Table = struct { pt: u64 = 0, ps: u64 = 0, page_rows: u64 = 0, logical: bool = false };
+ 
+-/// BF16 rows through `t`, or E4M3 rows and their scales (scales nonzero), which take no pages.
++/// BF16 rows through `t`, or E4M3 rows and their scales (scales nonzero): in order, or on pages through `t`, where
++/// `cache` and `scales` are this cache's codes and scales in page 0 and pages lie `t.ps` bytes apart.
+ pub fn latentWriteFormat(set: glue.Set, stream: cuda.Stream, lat: u64, lat_stride: usize, cache: u64, scales: u64, t: Table, pos: u64, rows: usize, lw: usize) !void {
+     if (scales == 0) return latentWrite(set, stream, lat, lat_stride, cache, t, pos, rows, lw);
+     if (lw != 512) return error.LatentShape;
+-    if (t.pt != 0) return error.Fp8OnPages;
+     var a: cuda.Args = .{};
+     inline for (.{ lat, @as(i64, @intCast(lat_stride)), cache, scales, pos }) |v| a.add(v);
+-    try cuda_pdl.launch(set.glue.lat_write_fp8, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 512 } }, stream, &a);
++    if (t.pt != 0) {
++        a.add(t.pt);
++        a.add(@as(i64, @intCast(t.ps)));
++    }
++    const f = if (t.pt != 0) set.glue.lat_write_fp8_paged else set.glue.lat_write_fp8;
++    try cuda_pdl.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 512 } }, stream, &a);
+ }
+ 
+ /// latent.latent_write: rows of `lat` (stride `lat_stride`) into slots pos .. pos + rows - 1 (pos an i32 on device).
+@@ -125,26 +132,30 @@ pub fn attentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64,
+ }
+ 
+ /// latent._dense_chunks (keys through pos + r) and _sparse_chunks (row r's `counts` of `tokens`); `lw` 512 or 576.
++/// BF16 takes the table always (pt 0: in order); E4M3 on pages its _paged kernels, the window's arguments then the table.
+ fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, pos: u64, tokens: u64, counts: u64, p: Partials, rows: usize, heads: usize, lw: usize, nch: usize, w: usize, scale: f32, hb: usize, sparse: bool) !void {
+     const rope_cols = try ropeOf(lw);
+-    if (scales != 0 and t.pt != 0) return error.Fp8OnPages;
++    const kv8 = scales != 0;
++    const paged8 = kv8 and t.pt != 0;
++    // a paged sparse list's units are the kernel's: positions for E4M3 (Table.logical), the BF16 rows otherwise
++    if (sparse and t.pt != 0 and t.logical != paged8) return error.TokenUnits;
+     if (rope_cols != 0) {
+-        if (scales != 0) return error.LatentShape; // the E4M3 cache holds the latent alone
++        if (kv8) return error.LatentShape; // the E4M3 cache holds the latent alone
+         if (hb != heads_tile) return error.HeadBlock;
+         const on: cuda.mla.On = .{ .pt = t.pt, .ps = t.ps, .tokens = tokens, .counts = counts, .w = w, .sparse = sparse };
+         return (try roped(set)).chunksOn(stream, qa, cache, pos, on, .{ .po = p.po, .pm = p.pm, .pl = p.pl }, rows, heads, nch, scale);
+     }
+     const f = switch (hb) {
+-        heads_tile => if (scales == 0) set.glue.chunks_16 else set.glue.chunks_16_fp8,
+-        heads_tile_wide => if (scales == 0) set.glue.chunks_32 else set.glue.chunks_32_fp8,
++        heads_tile => if (!kv8) set.glue.chunks_16 else if (paged8) set.glue.chunks_16_fp8_paged else set.glue.chunks_16_fp8,
++        heads_tile_wide => if (!kv8) set.glue.chunks_32 else if (paged8) set.glue.chunks_32_fp8_paged else set.glue.chunks_32_fp8,
+         else => return error.HeadBlock,
+     };
+     var a: cuda.Args = .{};
+     a.add(qa);
+     a.add(cache);
+-    if (scales != 0) a.add(scales);
++    if (kv8) a.add(scales);
+     inline for (.{ pos, tokens, counts, p.po, p.pm, p.pl, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(i64, @intCast(w)), scale, @as(c_int, @intFromBool(sparse)) }) |v| a.add(v);
+-    if (scales == 0) {
++    if (!kv8 or paged8) {
+         a.add(t.pt);
+         a.add(@as(i64, @intCast(t.ps)));
+     }
 diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
-index 7fd90d91b..b8eada986 100644
+index 5015f7c4b..cd87242cc 100644
 --- a/zig/src/families/glm/cuda_native.zig
 +++ b/zig/src/families/glm/cuda_native.zig
-@@ -78,6 +78,7 @@ pub const Loaded = struct {
+@@ -83,6 +83,7 @@ pub const Loaded = struct {
      layout: ?kv.Layout = null, // every stream's memory as one pool of KV pages (null: a window each, by TF_KV_PAGES)
      engine_paged: bool = false, // with a layout, the engine's own sequence takes pages too: the plan sets a window aside
      host_snaps: bool = false, // TF_GLM_HOST_CACHE: kept states in pinned host memory, --prompt-cache-gib of it
@@ -2718,7 +3530,7 @@ index 7fd90d91b..b8eada986 100644
  };
  
  pub fn benchmark(p: *anyopaque) struct { ranks: ?u32, group: ?[]const u8 } {
-@@ -89,9 +90,12 @@ pub fn benchmark(p: *anyopaque) struct { ranks: ?u32, group: ?[]const u8 } {
+@@ -94,9 +95,12 @@ pub fn benchmark(p: *anyopaque) struct { ranks: ?u32, group: ?[]const u8 } {
  pub fn attach(p: *anyopaque, streams: u32, pages: usize) !void {
      const own: *Owned = @ptrCast(@alignCast(p));
      const l = own.layout orelse return error.NoPages;
@@ -2731,7 +3543,16 @@ index 7fd90d91b..b8eada986 100644
  }
  
  /// TF_KV_SHARE: the plan's `snaps` slots on each rank, a state each at the window's last mark (the layout's slot).
-@@ -391,9 +395,17 @@ fn finishRank(a: OpenArgs) !Loaded {
+@@ -189,6 +193,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         return err;
+     };
+     ranks.wirePieces(&set, p.world, &ranks.environment);
++    // TF_GLM_KV_SHARD keeps a stream's latent rows on one rank; the disk images --learn-conversations writes are whole
++    if (set.kv_shard.on and o.learn_conversations) return error.KvShardWithLearn;
+     try @import("cuda_roce_multi.zig").validate(p.world, p.rank, set.roce_multi);
+     set.kv8 = o.kv8;
+     if (share_mod.moved((@import("sys").environment.Process{}).get("TF_GLM_KV_SHARE") orelse "")) return error.GlmKvShareMoved; // before any rank opens
+@@ -374,9 +380,17 @@ fn finishRank(a: OpenArgs) !Loaded {
          .layout = own.layout,
          .engine_paged = set.pages,
          .host_snaps = try snapshots.pages.onHost(),
@@ -2749,7 +3570,16 @@ index 7fd90d91b..b8eada986 100644
  // Each rank keeps a copy under rank 0's id, in the room rank 0 admitted by (the smallest over the ranks).
  
  /// The rounded pages for a committed prefix, including the head's possible verify window.
-@@ -532,7 +544,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+@@ -498,7 +512,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.RendezvousDisagree => "NCCL_COMM_ID differs from --master:--master-port: give one of them, or equal values",
+         error.MasterTooLong => "--master: too long for NCCL's root address (host:port in 320 bytes); give rank 0's address",
+         error.RankMismatch => "the ranks' settings differ (each rank's log names the one): start them alike",
+-        error.Fp8OnPages => "--kv-cache fp8 keeps a window per stream: unset TF_KV_PAGES, or set it to auto or off",
++        error.PoolTooSmall => "this request's prompt needs more KV pages than the whole pool holds, even with every other stream done: shorten the prompt, raise TENSORFOLD_MEMORY_RESERVE_GIB? No — lower it or --context to give the pool more room",
+         error.BadKvShare => "TF_KV_SHARE: give how many states the prompt store over the KV pages keeps, or 0 or unset for off",
+         error.GlmKvShareMoved => "TF_GLM_KV_SHARE is now TF_KV_SHARE, the prompt store every family on the KV pool shares: set that instead",
+         error.GlmRequestStartsWithSharedKv => "TF_GLM_REQUEST_STARTS=1 cannot be used with TF_KV_SHARE above 0: unset request starts or disable shared KV",
+@@ -512,7 +526,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
          error.NotModelOpt, error.UnsupportedQuant => "GLM-5.3-Flash on CUDA reads ModelOpt NVFP4, MIXED_PRECISION and EXL3 mcg checkpoints (the log names what config.json has)",
          error.UnreadableExl3 => "an EXL3 routed expert is not an mcg trellis of 1 to 8 bits with its marker and fp16 scales (the log names the tensor)",
          error.UnreadableFormat => "a projection is stored in a format GLM-5.3-Flash on CUDA does not read (the log names its module, recipe and tensors)",
@@ -2758,11 +3588,43 @@ index 7fd90d91b..b8eada986 100644
      };
  }
  
+@@ -528,7 +542,7 @@ test "TF_KV_SHARE past the slots a startup plan holds is refused, and the refusa
+     try std.testing.expect(share_mod.tooMany(kv.most_snaps + 1) and explain(null, error.GlmShareTooMany) != null);
+ }
+ 
+-test "TF_KV_PAGES: auto pages from two ranks, off and 0 give windows, all and other values page like on" {
++test "TF_KV_PAGES: auto pages from two ranks, off and 0 give windows, all and 1 page like on, others are refused" {
+     try std.testing.expect(!try paging(null, 1, false));
+     try std.testing.expect(!try paging("auto", 1, false));
+     for ([_]usize{ 2, 3, 16 }) |w| {
+@@ -541,18 +555,19 @@ test "TF_KV_PAGES: auto pages from two ranks, off and 0 give windows, all and ot
+         try std.testing.expect(!try paging("off", w, false));
+         try std.testing.expect(!try paging("0", w, false));
+         try std.testing.expect(try paging("all", w, false));
++        try std.testing.expect(try paging("yes", w, true)); // E4M3 pages too: no text refuses
+     }
+ }
+ 
+-test "TF_KV_PAGES with --kv-cache fp8: auto and off keep windows at every rank count, on and all are refused by name" {
++test "TF_KV_PAGES with --kv-cache fp8: auto and off keep windows at every rank count, on and all page" {
+     for ([_]usize{ 1, 2, 3, 16 }) |w| {
+         try std.testing.expect(!try paging(null, w, true));
+         try std.testing.expect(!try paging("auto", w, true));
+         try std.testing.expect(!try paging("off", w, true));
+         try std.testing.expect(!try paging("0", w, true));
+-        for ([_][]const u8{ "on", "1", "all" }) |v| try std.testing.expectError(error.Fp8OnPages, paging(v, w, true));
++        for ([_][]const u8{ "on", "1", "all" }) |v| try std.testing.expect(try paging(v, w, true));
+     }
+-    try std.testing.expect(explain(null, error.Fp8OnPages) != null);
++    try std.testing.expect(explain(null, error.PoolTooSmall) != null);
+     try std.testing.expect(explain(null, error.GlmKvHostNeedsPages) != null);
+ }
+ 
 diff --git a/zig/src/families/glm/cuda_pages.zig b/zig/src/families/glm/cuda_pages.zig
-index b05ff6972..7a2aac4ef 100644
+index a3d1a4a96..cba30d539 100644
 --- a/zig/src/families/glm/cuda_pages.zig
 +++ b/zig/src/families/glm/cuda_pages.zig
-@@ -8,6 +8,8 @@ const state = @import("cuda_state.zig");
+@@ -8,18 +8,40 @@ const state = @import("cuda_state.zig");
  const types = @import("cuda_engine_types.zig");
  const Engine = @import("cuda_engine.zig").Engine;
  const kv_host = @import("cuda_kv_host.zig");
@@ -2771,19 +3633,22 @@ index b05ff6972..7a2aac4ef 100644
  
  /// Table entries a sequence of `capacity` rows takes.
  pub fn tableLen(capacity: usize) usize {
-@@ -16,11 +18,20 @@ pub fn tableLen(capacity: usize) usize {
+     return (capacity + state.page_rows - 1) / state.page_rows;
+ }
  
- /// What a stream of engine `e` holds: its fixed part and table (and `extra`, its other buffers), and a token's bytes
- /// on the pages: 13,056 in bf16 with the target MTP head, 6,380 in E4M3 beside DFlash2 (no head part).
+-/// What a stream of engine `e` holds: its fixed part and table (and `extra`, its other buffers), 13,056 bytes a token.
++/// What a stream of engine `e` holds: its fixed part and table (and `extra`, its other buffers), and a token's bytes
++/// on the pages: 13,056 in bf16 with the target MTP head, 6,380 in E4M3 beside DFlash2 (no head part).
 +/// Sharded (TF_GLM_KV_SHARD): a token's bytes are every page's pooled keys and half its latent rows (3,542 on
 +/// GLM-5.3-Flash beside DFlash2), and a stream holds a second (latent) table.
  pub fn layout(gpa: std.mem.Allocator, e: *const Engine, extra: u64) !kv.Layout {
--    const fixed = try state.State.pagedBytesOf(gpa, &e.w, e.capacity, tableLen(e.capacity), e.mtp);
+-    const fixed = try state.State.pagedBytes(gpa, &e.w, e.capacity, tableLen(e.capacity));
 +    const sharded = e.settings.kv_shard.on;
 +    const fixed = try state.State.pagedBytesFor(gpa, &e.w, e.capacity, tableLen(e.capacity), e.mtp, sharded);
      // TF_GLM_KV_HOST: a page costs the device only its pooled keys (the pages themselves are in host memory)
-     const page = if (kv_host.onHost()) state.pkPageBytes(&e.w) else pageBytes(e);
+-    const page = if (kv_host.onHost()) state.pkPageBytes(&e.w) else state.pageBytes(&e.w);
 -    return .{ .fixed_bytes = fixed + extra, .token_bytes = page / state.page_rows, .page_tokens = state.page_rows, .snap_bytes = 0 };
++    const page = if (kv_host.onHost()) state.pkPageBytes(&e.w) else pageBytes(e);
 +    const token = if (sharded) geometry(e).tokenBytes() else page / state.page_rows;
 +    return .{ .fixed_bytes = fixed + extra, .token_bytes = token, .page_tokens = state.page_rows, .snap_bytes = 0 };
 +}
@@ -2791,19 +3656,29 @@ index b05ff6972..7a2aac4ef 100644
 +/// The sharded page's parts for engine `e`: its DSA layers' latent rows and pooled keys (the MTP head is refused).
 +pub fn geometry(e: *const Engine) kvs.Geometry {
 +    return kvs.Geometry.of(&e.w.config, state.mlaLayers(&e.w) + @intFromBool(e.mtp));
++}
++
++/// A page's bytes for engine `e`: its cache format's parts, the target MTP head's only when it is loaded.
++pub fn pageBytes(e: *const Engine) u64 {
++    return state.pageBytesOf(&e.w, e.settings.kv8, e.mtp);
++}
++
++/// A paged sequence of engine `e`'s format on the pages at `at`.
++fn pagedState(e: *const Engine, at: state.Paged) !fw.State {
++    return fw.State.initPagedFormat(e.gpa, e.d, &e.w, e.capacity, at, e.settings.kv8, e.mtp);
  }
  
- /// A page's bytes for engine `e`: its cache format's parts, the target MTP head's only when it is loaded.
-@@ -49,7 +60,7 @@ pub fn ownSequence(e: *Engine) !void {
+ /// TF_KV_SHARE: a kept state's slot (`e.share_pages`: its prefix's pages left to the store), at the window's last mark.
+@@ -38,7 +60,7 @@ pub fn ownSequence(e: *Engine) !void {
      if (e.seqs.items[0] != null) return error.SlotTaken;
      const q = try e.gpa.create(types.Seq);
      errdefer e.gpa.destroy(q);
--    q.* = .{ .st = try pagedState(e, on(e, 0, pageBytes(e))) };
+-    q.* = .{ .st = try fw.State.initPaged(e.gpa, e.d, &e.w, e.capacity, on(e, 0, state.pageBytes(&e.w))) };
 +    q.* = .{ .st = try pagedState(e, if (e.settings.kv_shard.on) onShard(e, 0, 0) else on(e, 0, pageBytes(e))) };
      e.seqs.items[0] = q;
      e.cur = q;
      e.slot = 0;
-@@ -60,6 +71,26 @@ fn on(e: *const Engine, kv_at: u64, page: u64) state.Paged {
+@@ -49,6 +71,26 @@ fn on(e: *const Engine, kv_at: u64, page: u64) state.Paged {
      return .{ .kv = kv_at, .pages = tableLen(e.capacity), .page_bytes = page };
  }
  
@@ -2830,15 +3705,16 @@ index b05ff6972..7a2aac4ef 100644
  pub const Pages = struct {
      gpa: std.mem.Allocator,
      e: *Engine,
-@@ -77,6 +108,7 @@ pub const Pages = struct {
+@@ -65,6 +107,8 @@ pub const Pages = struct {
+     leader: bool,
      poison: bool, // TF_KV_POISON=1: a stream's pages start as NaN, so a row read before its write shows in the reply
      prompts: ?kp.Prompts = null, // TF_KV_SHARE: the shared prompt store over this pool (rank 0's), from the server
-     waiting: ?usize = null, // the page count of the request admission is holding back (for one-line wait logs)
++    waiting: ?usize = null, // the page count of the request admission is holding back (for one-line wait logs)
 +    shard: ?*Shard = null, // TF_GLM_KV_SHARD: the pool's two parts (then `pool` holds no page)
  
      /// `streams` sequences from slot 0 on `pages` pages: the engine's own (`ownSequence`) placed, the others made now.
      pub fn init(gpa: std.mem.Allocator, e: *Engine, l: kv.Layout, streams: usize, pages: usize, leader: bool) !*Pages {
-@@ -85,11 +117,14 @@ pub const Pages = struct {
+@@ -73,11 +117,14 @@ pub const Pages = struct {
          const p = try gpa.create(Pages);
          errdefer gpa.destroy(p);
          const page = if (kv_host.onHost()) state.pageBytes(&e.w) else l.pageBytes();
@@ -2856,7 +3732,7 @@ index b05ff6972..7a2aac4ef 100644
          if (host) {
              if (kv_host.shared()) {
                  p.shared = try kv_host.SharedPages.open(e.d, pages * page, leader, e.share.world);
-@@ -120,7 +155,7 @@ pub const Pages = struct {
+@@ -108,7 +155,7 @@ pub const Pages = struct {
              q.* = null;
          };
          errdefer cuda.completion.drain(e.d, e.stream, "GLM page construction did not drain");
@@ -2865,7 +3741,16 @@ index b05ff6972..7a2aac4ef 100644
          if (p.pk_arena) |a| {
              at.pk = a.ptr;
              at.pk_page = state.pkPageBytes(&e.w);
-@@ -158,11 +193,40 @@ pub const Pages = struct {
+@@ -117,7 +164,7 @@ pub const Pages = struct {
+             if (q.* != null) return error.SlotTaken; // attach comes before any stream
+             const s = try e.gpa.create(types.Seq);
+             errdefer e.gpa.destroy(s);
+-            s.* = .{ .st = try fw.State.initPaged(e.gpa, e.d, &e.w, e.capacity, at) };
++            s.* = .{ .st = try pagedState(e, at) };
+             q.* = s;
+             made += 1;
+         }
+@@ -146,11 +193,40 @@ pub const Pages = struct {
          return std.mem.eql(u8, std.mem.span(v), "1");
      }
  
@@ -2907,15 +3792,57 @@ index b05ff6972..7a2aac4ef 100644
          }
          p.gpa.free(p.leases);
          p.gpa.free(p.used);
-@@ -198,6 +262,7 @@ pub const Pages = struct {
-         const free_seq = for (p.used) |u| {
-             if (!u) break true;
-         } else false;
+@@ -167,10 +243,45 @@ pub const Pages = struct {
+         return slot < p.used.len;
+     }
+ 
+-    /// Whether a request's pages fit now and a paged sequence is free for it.
+-    pub fn fits(p: *const Pages, prompt: usize, max_tokens: usize) bool {
+-        for (p.used) |u| if (!u) return p.pool.fits(need(p.layout, prompt, max_tokens));
+-        return false;
++    /// The reply a request opens with: the asked one when its pages fit the pool, else the longest the pool holds
++    /// for its prompt (its window and run included), or null when even the prompt and its window take more pages
++    /// than the whole pool — no reply ever fits, so its opening refuses it (error.PoolTooSmall).
++    pub fn replyFor(p: *const Pages, prompt: usize, max_tokens: usize) ?usize {
++        const budget = p.pool.total();
++        if (need(p.layout, prompt, max_tokens) <= budget) return max_tokens;
++        const rows = (budget -| p.layout.runPages()) * @as(usize, p.layout.page_tokens);
++        if (prompt + fw.window_rows > rows) return null;
++        return rows - prompt - fw.window_rows;
++    }
++
++    /// Whether a request's pages fit now and a paged sequence is free for it. A reply longer than the pool holds
++    /// counts as the pool's longest (its opening takes that); a prompt that never fits even alone is admitted at
++    /// once, so its opening refuses it (error.PoolTooSmall) instead of it waiting forever.
++    pub fn fits(p: *Pages, prompt: usize, max_tokens: usize) bool {
++        const n = need(p.layout, prompt, p.replyFor(prompt, max_tokens) orelse max_tokens);
++        const free_seq = for (p.used) |u| {
++            if (!u) break true;
++        } else false;
 +        if (p.shard) |x| return free_seq and x.parts.fits(n); // a stream's pages lie in one part
-         const ok = free_seq and (n > p.pool.total() or p.pool.fits(n));
-         p.noteWait(n, prompt, max_tokens, ok, free_seq);
-         return ok;
-@@ -231,9 +296,35 @@ pub const Pages = struct {
++        const ok = free_seq and (n > p.pool.total() or p.pool.fits(n));
++        p.noteWait(n, prompt, max_tokens, ok, free_seq);
++        return ok;
++    }
++
++    /// One line when admission starts holding a request back, saying for what, and one when it fits again.
++    fn noteWait(p: *Pages, n: usize, prompt: usize, max_tokens: usize, ok: bool, free_seq: bool) void {
++        if (@import("builtin").is_test) return;
++        if (ok) { // the held-back request's own admission ends its wait (another request fitting beside it does not)
++            if (p.waiting == n) {
++                std.log.info("kv pool: the request waiting for {d} pages fits now ({d} free of {d})", .{ n, p.pool.available(), p.pool.total() });
++                p.waiting = null;
++            }
++            return;
++        }
++        if (p.waiting == n) return;
++        p.waiting = n;
++        if (!free_seq) return std.log.info("kv pool: a request ({d} prompt + {d} reply tokens, {d} pages) waits for a stream: all {d} paged sequences are busy", .{ prompt, max_tokens, n, p.used.len });
++        std.log.info("kv pool: a request ({d} prompt + {d} reply tokens) waits for {d} pages: {d} free and {d} reclaimable of {d}, while the running streams hold the rest", .{ prompt, max_tokens, n, p.pool.available(), p.pool.reclaimable(), p.pool.total() });
+     }
+ 
+     /// Rank 0: paged slot `slot` takes the pages of a prompt, its reply and a last window; LaneMemory: not yet.
+@@ -185,13 +296,41 @@ pub const Pages = struct {
  
      /// `open` with the prompt cache's `adopted` pages (held for this call) first: their rows stay as the cache kept.
      pub fn openWith(p: *Pages, slot: u32, prompt: usize, max_tokens: usize, adopted: []const u32) ![]const u32 {
@@ -2950,8 +3877,23 @@ index b05ff6972..7a2aac4ef 100644
 +        }
          const n = need(p.layout, prompt, max_tokens);
          if (n > tableLen(p.e.capacity) or adopted.len > n) return error.PromptTooLong;
-         const reply = p.replyFor(prompt, max_tokens) orelse return error.PoolTooSmall; // never fits, even with every other stream done
-@@ -254,6 +345,26 @@ pub const Pages = struct {
++        const reply = p.replyFor(prompt, max_tokens) orelse return error.PoolTooSmall; // never fits, even with every other stream done
++        const m = need(p.layout, prompt, reply);
+         const l = &p.leases[slot];
+-        try p.pool.promise(l, n - adopted.len);
++        try p.pool.promise(l, m - adopted.len);
+         errdefer p.pool.finish(l);
+         if (adopted.len > 0) {
+             held = false;
+@@ -199,13 +338,33 @@ pub const Pages = struct {
+         }
+         var up: Upload = .{ .p = p, .slot = slot };
+         if (adopted.len > 0) try Upload.write(&up, l.ids.items, 0);
+-        try p.pool.cover(l, n, .{ .ctx = &up, .write = Upload.write });
++        try p.pool.cover(l, m, .{ .ctx = &up, .write = Upload.write });
+         try p.mapped(slot, l.ids.items, adopted.len);
+         return l.ids.items;
+     }
  
      /// Another rank: paged slot `slot` maps rank 0's page ids (its begin step's), the prompt cache's `kept` first.
      pub fn map(p: *Pages, slot: u32, ids: []const u32, kept: usize) !void {
@@ -2978,7 +3920,17 @@ index b05ff6972..7a2aac4ef 100644
          if (!p.paged(slot) or ids.len == 0 or ids.len > tableLen(p.e.capacity) or kept > ids.len) return error.BadStep;
          if (p.used[slot]) return error.BadStep;
          for (ids) |id| if (id >= p.pool.total()) return error.BadStep;
-@@ -288,12 +399,75 @@ pub const Pages = struct {
+@@ -220,6 +379,9 @@ pub const Pages = struct {
+ 
+     /// The slot's sequence reaches its pages' rows (past the `kept` first, NaN first under TF_KV_POISON).
+     fn mapped(p: *Pages, slot: u32, ids: []const u32, kept: usize) !void {
++        // every id names a page of this pool, on every rank (the kernels read pt[pos / 512] for pos under the capacity
++        // set below, and State.ready refuses a pass past it), so no table can send a kernel past the pages' arena
++        for (ids) |id| if (id >= p.pool.total()) return error.BadStep;
+         const st = &p.e.seqs.items[slot].?.st;
+         const page = p.page;
+         if (p.poison) for (ids[kept..]) |id| try p.e.d.check(p.e.d.api.cuMemsetD32Async(p.base() + id * page, 0xFFFF_FFFF, page / 4, p.e.stream.handle), "cuMemsetD32Async");
+@@ -237,12 +399,75 @@ pub const Pages = struct {
          st.capacity = 0;
          p.used[slot] = false;
          if (kv_host.active) |*g| g.invalidate(p.e.stream) catch {};
@@ -3054,7 +4006,7 @@ index b05ff6972..7a2aac4ef 100644
      /// The idle server's line: nothing promised, every page free or, under TF_KV_SHARE, the store's.
      fn report(p: *const Pages) void {
          if (@import("builtin").is_test) return;
-@@ -302,17 +476,19 @@ pub const Pages = struct {
+@@ -251,17 +476,19 @@ pub const Pages = struct {
          std.log.info("kv pool idle{s}: promised {d}, free {d} + store {d} == total {d}", .{ if (ok) "" else " (UNEVEN)", c.promised, c.free, c.kept, c.total });
      }
  
@@ -3076,8 +4028,77 @@ index b05ff6972..7a2aac4ef 100644
          }
      };
  };
+diff --git a/zig/src/families/glm/cuda_pages_test.zig b/zig/src/families/glm/cuda_pages_test.zig
+index a84a95863..afd4c396a 100644
+--- a/zig/src/families/glm/cuda_pages_test.zig
++++ b/zig/src/families/glm/cuda_pages_test.zig
+@@ -90,6 +90,7 @@ const Fake = struct {
+         f.e.pages = null;
+         f.e.images = null;
+         f.e.settings = .{};
++        f.e.mtp = true; // the target MTP head's part on every page (DFlash2 tests turn it off)
+         f.e.w = undefined;
+         f.e.w.config = .{};
+         f.e.w.share = try shard.Share.of(&f.e.w.config, 0, 2);
+@@ -536,3 +537,56 @@ test "capacity keeps a verify window past the context and a multiple of 64" {
+     try expectEqual(@as(usize, 330624), native.capacity(330529));
+     try expect(native.capacity(330529) % 64 == 0);
+ }
++
++test "E4M3 pages beside DFlash2: a page holds each DSA layer's codes, scales and pooled keys, no MTP part" {
++    var f: Fake = undefined;
++    try f.init(std.testing.allocator);
++    f.e.settings.kv8 = true;
++    f.e.mtp = false;
++    const l = try pages_mod.layout(std.testing.allocator, &f.e, 0);
++    try expectEqual(@as(u64, 512 + 4 + 64), l.token_bytes); // one DSA layer: codes, its scale, pooled keys
++    const p = try f.pool(l, 3, 8, true);
++    defer f.deinit(p);
++    _ = try p.open(1, 600, 100);
++    const st = &f.e.seqs.items[1].?.st;
++    const x = st.caches[0];
++    try expect(st.kv8 and !st.head);
++    try expectEqual(x.lc + 512 * 512, x.ls); // the part's scales after its codes
++    try expectEqual(x.ls + 512 * 4, x.pk); // its pooled keys last
++    try expectEqual(l.pageBytes(), x.ps);
++    try expectEqual(@as(u64, 296_960), l.pageBytes());
++    p.close(1);
++}
++
++test "a request needing more pages than the whole pool is admitted at once and refused, never left waiting" {
++    var f: Fake = undefined;
++    try f.init(std.testing.allocator);
++    const l = try pages_mod.layout(std.testing.allocator, &f.e, 0);
++    const p = try f.pool(l, 3, 4, true); // 4 pages: 2,048 rows in all
++    defer f.deinit(p);
++    try expect(p.fits(3000, 100)); // 7 pages: past the pool, inside the window's table of 8
++    try std.testing.expectError(error.PoolTooSmall, p.open(1, 3000, 100));
++    try expectEqual(@as(usize, 0), f.e.seqs.items[1].?.st.capacity);
++    try expect(p.pool.idle() and p.pool.census().free == 4); // nothing promised or taken
++    _ = try p.open(1, 1500, 100); // 4 pages: the whole pool
++    try expect(!p.fits(600, 100)); // waits: the running stream holds every page
++    try expect(p.fits(3000, 100)); // still refused at once, not left waiting
++    p.close(1);
++    try expect(p.fits(600, 100));
++}
++
++test "a request needing more pages opens with the pool's longest reply, not a refusal" {
++    var f: Fake = undefined;
++    try f.init(std.testing.allocator);
++    const l = try pages_mod.layout(std.testing.allocator, &f.e, 0);
++    const p = try f.pool(l, 3, 4, true); // 4 pages: 2,048 rows in all
++    defer f.deinit(p);
++    try expectEqual(@as(?usize, 1016), p.replyFor(1000, 3000)); // 2,048 rows minus the prompt and its window of 32
++    try expect(p.fits(1000, 3000)); // the capped ask: the whole pool, free while nothing runs
++    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, try p.open(1, 1000, 1016)); // the lanes' capped ask
++    try expectEqual(@as(usize, 2048), f.e.seqs.items[1].?.st.capacity);
++    try expect(!p.fits(600, 100)); // waits: the running stream holds every page
++    p.close(1);
++    try expect(p.pool.idle() and p.pool.census().free == 4);
++    try std.testing.expectError(error.PoolTooSmall, p.open(1, 2049, 10)); // the prompt alone passes the pool's rows
++}
 diff --git a/zig/src/families/glm/cuda_prompts.zig b/zig/src/families/glm/cuda_prompts.zig
-index b66392f44..931087290 100644
+index 6b04b3155..16eea7237 100644
 --- a/zig/src/families/glm/cuda_prompts.zig
 +++ b/zig/src/families/glm/cuda_prompts.zig
 @@ -39,6 +39,14 @@ pub fn pass(e: anytype, parts: []const engine.Prompt, firsts: []u32, comptime Fo
@@ -3096,7 +4117,7 @@ index b66392f44..931087290 100644
      if (e.drafter) |dr| for (parts, segs[0..parts.len]) |p, g|
          try dr.promptSegment(e, p.slot, 0, g.rows, p.ids.len, g.row0);
 diff --git a/zig/src/families/glm/cuda_ranks.zig b/zig/src/families/glm/cuda_ranks.zig
-index e60f789e5..dc761a368 100644
+index 1d0425452..031ada090 100644
 --- a/zig/src/families/glm/cuda_ranks.zig
 +++ b/zig/src/families/glm/cuda_ranks.zig
 @@ -4,6 +4,7 @@ const std = @import("std");
@@ -3107,15 +4128,15 @@ index e60f789e5..dc761a368 100644
  const Sha256 = std.crypto.hash.sha2.Sha256;
  
  /// The forward's knobs a rank reads from its environment (the Python family's names and defaults).
-@@ -30,6 +31,7 @@ pub const Settings = struct {
-     kv_host_gib: f64 = 0, // TF_GLM_KV_HOST_GIB: the host pages' GiB (0: one full window)
+@@ -32,6 +33,7 @@ pub const Settings = struct {
      l2pf: l2pf.Options = .{}, // TF_GLM_L2PF and its knobs: a decode window's next weights read into L2 beside it
      kv_live_half: bool = false, // TF_GLM_KV_LIVE_HALF=1: a keep carries the live KDA half alone (cuda_snapshot_layout.zig)
+     draft_split: bool = false, // TF_GLM_DRAFT_SPLIT=1: three ranks or more split the drafter MLP without TF_ROCE=1
 +    kv_shard: kv_shard.Switches = .{}, // TF_GLM_KV_SHARD and its knobs: each stream's latent rows on one rank
  
-     /// The settings `get` gives, blank text as unset; `problem` names a value that is not one of the choices.
-     pub fn read(comptime get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
-@@ -144,6 +146,10 @@ pub const Settings = struct {
+     /// Whether three ranks or more split the DFlash2 drafter's MLP (dflash.mlpSplit's `wide`); two ranks always do.
+     pub fn draftWide(s: Settings) bool {
+@@ -155,6 +157,10 @@ pub const Settings = struct {
              problem.* = "TF_HEAT_HIGH and TF_HEAT_LOW: both or neither, in degrees, with low at or under high";
              return error.BadSetting;
          };
@@ -3126,16 +4147,16 @@ index e60f789e5..dc761a368 100644
          if (s.prompt_fixed_k and !s.tiled) {
              problem.* = "TF_GLM_PROMPT_K=shape requires TF_GLM_MM=1";
              return error.BadSetting;
-@@ -207,7 +213,7 @@ fn wireOpens(get: *const fn ([:0]const u8) ?[]const u8) bool {
+@@ -230,7 +236,7 @@ pub fn toolPieces(s: *Settings, comptime get: *const fn ([:0]const u8) ?[]const
  
  /// What every rank must agree on, as bytes the communicator carries.
  pub const Fingerprint = extern struct {
--    layout: u32 = 21, // this struct's version (20, main's kv_live_half, plus roce_wide)
-+    layout: u32 = 22, // this struct's version (21 had no kv_shard words)
+-    layout: u32 = 23, // this struct's version (22, plus pair_experts)
++    layout: u32 = 24, // this struct's version (23, plus kv_shard's words)
      world: u32,
      rank: u32,
      kv8: u32 = 0,
-@@ -233,6 +239,8 @@ pub const Fingerprint = extern struct {
+@@ -258,6 +264,8 @@ pub const Fingerprint = extern struct {
      solo: u32 = 0, // TF_GLM_CHUNK_SOLO: rank 0's solo passes need the wider prompt buffers on every rank
      l2pf: [4]u32 = @splat(0), // TF_GLM_L2PF's words: every rank prefetches alike, so none waits on a slower one's windows
      bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
@@ -3144,7 +4165,7 @@ index e60f789e5..dc761a368 100644
      capacity: u64, // tokens a sequence holds
      heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
      heat_low: f64,
-@@ -268,6 +276,8 @@ pub const Fingerprint = extern struct {
+@@ -295,6 +303,8 @@ pub const Fingerprint = extern struct {
          solo,
          l2pf,
          bits,
@@ -3153,7 +4174,7 @@ index e60f789e5..dc761a368 100644
          capacity,
          heat_high,
          heat_low,
-@@ -309,6 +319,8 @@ pub const Fingerprint = extern struct {
+@@ -338,6 +348,8 @@ pub const Fingerprint = extern struct {
              .solo = @intFromBool(s.solo),
              .l2pf = s.l2pf.words(),
              .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
@@ -3162,7 +4183,7 @@ index e60f789e5..dc761a368 100644
              .capacity = capacity,
              .heat_high = if (s.heat) |b| b.high_c else 0,
              .heat_low = if (s.heat) |b| b.low_c else 0,
-@@ -352,6 +364,8 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
+@@ -383,6 +395,8 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
              "solo",
              "l2pf",
              "bits",
@@ -3171,7 +4192,7 @@ index e60f789e5..dc761a368 100644
              "capacity",
              "heat_high",
              "heat_low",
-@@ -477,6 +491,8 @@ fn explain(f: Fingerprint.Field) []const u8 {
+@@ -510,6 +524,8 @@ fn explain(f: Fingerprint.Field) []const u8 {
          .solo => "TF_GLM_CHUNK_SOLO",
          .l2pf => "TF_GLM_L2PF, _MB, _CTAS or _PACE_GBPS",
          .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
@@ -3181,10 +4202,10 @@ index e60f789e5..dc761a368 100644
          .heat_high => "TF_HEAT_HIGH",
          .heat_low => "TF_HEAT_LOW",
 diff --git a/zig/src/families/glm/cuda_ranks_test.zig b/zig/src/families/glm/cuda_ranks_test.zig
-index 5ef4b8275..4b35e3a76 100644
+index 739f8d263..7273a4149 100644
 --- a/zig/src/families/glm/cuda_ranks_test.zig
 +++ b/zig/src/families/glm/cuda_ranks_test.zig
-@@ -582,3 +582,48 @@ test "TF_GLM_L2PF: read with the settings, carried in the fingerprint, and ranks
+@@ -589,3 +589,48 @@ test "TF_GLM_L2PF: read with the settings, carried in the fingerprint, and ranks
      all[1].l2pf[3] = 0; // rank 1 unpaced
      try std.testing.expectEqual(Mismatch{ .field = .l2pf, .rank = 1 }, mismatch(&all).?);
  }
@@ -3219,7 +4240,7 @@ index 5ef4b8275..4b35e3a76 100644
 +    const f0 = Fingerprint.of(2, 0, .{}, 8192, true, h0, h0, hashBytes("/c"));
 +    try std.testing.expectEqual(@as(u32, 0), f0.kv_shard);
 +    try std.testing.expectEqual(@as(u32, 0), f0.kv_shard_check);
-+    try std.testing.expectEqual(@as(u32, 22), f0.layout);
++    try std.testing.expectEqual(@as(u32, 24), f0.layout);
 +    var all = [_]Fingerprint{ f0, Fingerprint.of(2, 1, s, 8192, true, h0, h0, hashBytes("/c")) };
 +    try std.testing.expectEqual(Mismatch{ .field = .kv_shard, .rank = 1 }, mismatch(&all).?); // on one rank only
 +    all[0] = Fingerprint.of(2, 0, s, 8192, true, h0, h0, hashBytes("/c"));
@@ -3250,15 +4271,15 @@ index 1c669938d..92be40e5d 100644
              for (r.segs) |g| sparse_any = sparse_any or dsa_block.sparseRows(a, g.st.pos, g.rows);
              try dsa_block.prepare(f.set(), f.stream, a, b.dsa, b.normed, c.hidden, rows, sparse_any);
 diff --git a/zig/src/families/glm/cuda_snapshot_layout.zig b/zig/src/families/glm/cuda_snapshot_layout.zig
-index 97fe10236..c3297a77b 100644
+index f31cec74b..e01a9cfd2 100644
 --- a/zig/src/families/glm/cuda_snapshot_layout.zig
 +++ b/zig/src/families/glm/cuda_snapshot_layout.zig
-@@ -24,41 +24,56 @@ pub fn halfOf(cur: []const u1, layers: usize, on: bool) ?u1 {
- /// `len` bytes from `live`, or on a paged sequence's pages `span` bytes a page `page` bytes apart, from byte `from`.
- pub const Part = walk.Part;
+@@ -26,41 +26,56 @@ pub const Part = walk.Part;
+ /// Latent caches a plan carries at most: full GLM-5.3's 78 DSA layers and its MTP layer (GLM-5.3-Flash: 12).
+ pub const max_caches = 79;
  pub const Plan = struct {
--    parts: [5 * (@import("config.zig").max_layers + 1) + 2]Part = undefined,
-+    pub const max_parts = 5 * (@import("config.zig").max_layers + 1) + 2;
+-    parts: [5 * max_caches + 2]Part = undefined,
++    pub const max_parts = 5 * max_caches + 2;
 +    parts: [max_parts]Part = undefined,
 +    part_lat: [max_parts]bool = @splat(false), // sharded (TF_GLM_KV_SHARD): true for a latent cache part (`lids`)
      count: usize = 0,
@@ -3309,7 +4330,7 @@ index 97fe10236..c3297a77b 100644
  
 -    fn make(st: *const State, c: *const Config, at: usize, head: ?usize, shared: usize, sizing: bool, half: ?u1) !Plan {
 +    fn make(st: *const State, c: *const Config, at: usize, head: ?usize, shared: usize, sizing: bool, half: ?u1, latent: bool) !Plan {
-         if (at > st.capacity or st.caches.len > @import("config.zig").max_layers) return error.SnapshotShape;
+         if (at > st.capacity or st.caches.len >= max_caches) return error.SnapshotShape;
          if (st.rings.len != 2 * (st.caches.len + 1)) return error.SnapshotShape;
          if (shared > 0 and (st.table == 0 or shared * page_rows > at)) return error.SnapshotShape; // pages below `at` only
 -        var p: Plan = .{ .ids = st.pages, .sizing = sizing, .shared = shared, .half = half };
@@ -3317,22 +4338,22 @@ index 97fe10236..c3297a77b 100644
          // a paged sequence's caches are its pages: its fields up to them end at its first ring
          const first = if (st.table != 0) st.rings[0] else if (st.caches.len > 0) st.caches[0].lc else st.mtp_caches.lc;
          if (first < st.arena.buf.ptr) return error.SnapshotShape;
-@@ -88,9 +103,11 @@ pub const Plan = struct {
+@@ -90,8 +105,12 @@ pub const Plan = struct {
+         const latent = try std.math.mul(usize, at, s.row * @as(usize, if (x.ls == 0) 2 else 1));
          const ring = try std.math.mul(usize, @min(at, st.ring_rows), st.ring_row);
-         const pooled = try std.math.mul(usize, @min(at / sparse.pool + 2, x.pk_rows), @as(usize, c.i_dim) * 2);
-         const latent_row = @as(usize, c.kv_lora) * @as(usize, if (x.ls == 0) 2 else 1);
--        try p.addCache(st, x, x.lc, latent, page_rows * latent_row, x.ps);
--        // E4M3 scales: beside the codes in the arena, or on pages a part's 512 after its codes
--        if (x.ls != 0) try p.addCache(st, x, x.ls, try std.math.mul(usize, at, @sizeOf(f32)), page_rows * @sizeOf(f32), x.ps);
+         const pooled = try std.math.mul(usize, @min(at / s.pool + 2, x.pk_rows), s.i_dim * 2);
+-        try p.addCache(st, x, x.lc, latent, s.latentBytes(), x.ps);
+-        if (x.ls != 0) try p.add(st, x.ls, try std.math.mul(usize, at, @sizeOf(f32)));
 +        if (p.latent) {
-+            try p.addLatent(st, x, x.lc, latent, page_rows * latent_row, x.lps);
-+            // E4M3 scales: beside the codes in the arena, or on pages a part's 512 after its codes
++            // bf16 rows, or E4M3 codes and then their scales: on pages a part's codes, then its scales after them
++            const e8 = s.format(true);
++            try p.addLatent(st, x, x.lc, latent, if (x.ls == 0) s.latentBytes() else e8.scalesAt(), x.lps);
 +            if (x.ls != 0) try p.addLatent(st, x, x.ls, try std.math.mul(usize, at, @sizeOf(f32)), page_rows * @sizeOf(f32), x.lps);
 +        }
          try p.add(st, st.rings[2 * j], ring);
          try p.add(st, st.rings[2 * j + 1], ring);
-         try p.addCache(st, x, x.pk, pooled, page_rows / sparse.pool * @as(usize, c.i_dim) * 2, if (x.pks != 0) x.pks else x.ps);
-@@ -107,11 +124,28 @@ pub const Plan = struct {
+         try p.addCache(st, x, x.pk, pooled, s.pkBytes(), if (x.pks != 0) x.pks else x.ps);
+@@ -108,11 +127,28 @@ pub const Plan = struct {
          p.count += 1;
      }
  
@@ -3362,7 +4383,7 @@ index 97fe10236..c3297a77b 100644
          if (len == 0) return;
          if (live < st.arena.buf.ptr) return error.SnapshotShape;
 diff --git a/zig/src/families/glm/cuda_snapshot_pages.zig b/zig/src/families/glm/cuda_snapshot_pages.zig
-index 2e48cb6d4..4a65946bc 100644
+index 2b6f8040e..af0a6a6fe 100644
 --- a/zig/src/families/glm/cuda_snapshot_pages.zig
 +++ b/zig/src/families/glm/cuda_snapshot_pages.zig
 @@ -81,11 +81,49 @@ pub const Pool = struct {
@@ -3417,10 +4438,10 @@ index 2e48cb6d4..4a65946bc 100644
  };
  
 diff --git a/zig/src/families/glm/cuda_snapshots.zig b/zig/src/families/glm/cuda_snapshots.zig
-index 77a0119b3..0ffc03c35 100644
+index 8986ea836..8f4fb4f0a 100644
 --- a/zig/src/families/glm/cuda_snapshots.zig
 +++ b/zig/src/families/glm/cuda_snapshots.zig
-@@ -4,6 +4,13 @@ const cuda = @import("cuda");
+@@ -4,6 +4,23 @@ const cuda = @import("cuda");
  const types = @import("cuda_engine_types.zig");
  pub const pages = @import("cuda_snapshot_pages.zig");
  pub const layout = @import("cuda_snapshot_layout.zig");
@@ -3429,55 +4450,67 @@ index 77a0119b3..0ffc03c35 100644
 +
 +/// TF_GLM_KV_SHARD: which ranks hold the bound stream's latent rows (null: unsharded, or the switch off).
 +fn holdOf(e: anytype) ?kvs.Hold {
-+    return if (e.settings.kv_shard.on) e.cur.st.hold else null;
++    return if (sharded(e)) e.cur.st.hold else null;
++}
++
++/// This engine's rank (0 for an engine without one, as a test's).
++fn rankOf(e: anytype) u8 {
++    return if (@hasField(@TypeOf(e.*), "share")) @intCast(e.share.rank) else 0;
++}
++
++/// Whether TF_GLM_KV_SHARD is on for engine `e` (an engine without the settings, as a test's, is unsharded).
++fn sharded(e: anytype) bool {
++    return if (@hasField(@TypeOf(e.*), "settings")) e.settings.kv_shard.on else false;
 +}
  
  pub const Setup = struct { ptr: *anyopaque, run: *const fn (*anyopaque, u64) anyerror!void };
  
-@@ -45,8 +52,14 @@ pub fn keepAs(e: anytype, id: u64) !void {
-     if (e.cur.st.pending != 0 or e.cur.st.mtp_len > e.cur.st.pos + @import("cuda_state.zig").window_rows)
-         return error.NotAtMark;
+@@ -47,8 +64,14 @@ pub fn keepAs(e: anytype, id: u64) !void {
      const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
+     const profiled = e.prompt_profs[0] != null;
+     const started: i96 = if (profiled) std.Io.Clock.awake.now(e.io).toNanoseconds() else 0;
 -    const plan = try layout.Plan.init(&e.cur.st, &e.c, e.cur.st.pos, if (e.mtp) e.cur.st.mtp_len else null, heldPages(e, e.cur.st.pos));
 -    var lease = try pool.take(plan.len);
 +    const hold = holdOf(e);
 +    const head = if (e.mtp) e.cur.st.mtp_len else null;
 +    const shared = heldPages(e, e.cur.st.pos);
 +    // TF_GLM_KV_SHARD: the latent rows on their owner's copy alone; every rank leases the whole state's bytes
-+    const own = kv_keep.keepsLatent(hold, e.share.rank);
++    const own = kv_keep.keepsLatent(hold, rankOf(e));
 +    const plan = try layout.Plan.initSharded(&e.cur.st, &e.c, e.cur.st.pos, head, shared, e.cur.st.cur, own);
 +    const latent_bytes = if (own) 0 else (try layout.Plan.initSharded(&e.cur.st, &e.c, e.cur.st.pos, head, shared, e.cur.st.cur, true)).len - plan.len;
 +    var lease = try pool.take(plan.len + latent_bytes);
      errdefer {
          cuda.completion.drain(e.d, e.stream, "a failed GLM snapshot copy did not drain");
          pool.give(&lease);
-@@ -55,22 +68,100 @@ pub fn keepAs(e: anytype, id: u64) !void {
+@@ -57,7 +80,7 @@ pub fn keepAs(e: anytype, id: u64) !void {
      errdefer e.gpa.free(cur);
      try pool.move(e.stream, &lease, &plan, true);
      try e.stream.synchronize();
 -    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = plan.len, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .bases = .{ e.cur.st.base, e.cur.st.mtp_base }, .shared = plan.shared });
 +    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = plan.len, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .bases = .{ e.cur.st.base, e.cur.st.mtp_base }, .shared = plan.shared, .home = if (hold) |h| h.owner else null });
- }
- 
- pub fn restore(e: anytype, id: u64) !void {
+     if (profiled) {
+         const wall_ms: f64 = @as(f64, @floatFromInt(std.Io.Clock.awake.now(e.io).toNanoseconds() - started)) / 1e6;
+         std.log.info("glm prof snapshot rank={d} slot={d} id={d} pos={d} bytes={d} parts={d} wall_ms={d:.4}", .{ e.share.rank, e.slot, id, e.cur.st.pos, plan.len, plan.count, wall_ms });
+@@ -101,16 +124,94 @@ pub fn restore(e: anytype, id: u64) !void {
      const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
+     if (s.len == 0) return error.UnsealedState;
      const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
 +    const hold = holdOf(e);
-+    const home: ?u8 = if (e.settings.kv_shard.on) s.home else null;
-+    const own = if (home) |h| h == e.share.rank else true; // this rank's copy holds the latent rows
++    const home: ?u8 = if (sharded(e)) s.home else null;
++    const own = if (home) |h| h == rankOf(e) else true; // this rank's copy holds the latent rows
      // the kept state's own parity picks the half a live-half keep carries; the slot's dead half stays as it is
 -    const plan = try layout.Plan.initFor(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, s.shared, s.cur);
 +    const plan = try layout.Plan.initSharded(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, s.shared, s.cur, own);
      if (plan.len != s.len) return error.SnapshotSize;
      errdefer cuda.completion.drain(e.d, e.stream, "a failed GLM snapshot restore did not drain");
 -    try pool.move(e.stream, &s.lease, &plan, false);
-+    try pool.moveParts(e.stream, &s.lease, &plan, false, !own or kv_keep.restoresLatent(home, hold, e.share.rank));
++    try pool.moveParts(e.stream, &s.lease, &plan, false, !own or kv_keep.restoresLatent(home, hold, rankOf(e)));
 +    // TF_GLM_KV_SHARD: the latent rows to the rank that holds the new stream's rows but not the state's copy of them
-+    switch (kv_keep.carry(home, hold, e.share.rank)) {
++    if (comptime @hasField(@TypeOf(e.*), "settings")) switch (kv_keep.carry(home, hold, rankOf(e))) {
 +        .none => {},
 +        .send => try carrySend(e, s, &plan),
 +        .recv => try carryRecv(e, s),
-+    }
++    };
      try e.cur.st.restoreHost(e.stream, s.pos, s.mtp_len, s.cur, s.bases);
      e.cur.in_head = 0;
      try e.stream.synchronize();
@@ -3555,11 +4588,111 @@ index 77a0119b3..0ffc03c35 100644
  /// The pages below `at` the shared prompt store holds (TF_KV_SHARE): a kept state's copy leaves them out.
  fn heldPages(e: anytype, at: usize) usize {
      return if (e.share_pages) at / @import("cuda_state.zig").page_rows else 0;
+diff --git a/zig/src/families/glm/cuda_sparse.zig b/zig/src/families/glm/cuda_sparse.zig
+index 77ce903b8..aa9c816a0 100644
+--- a/zig/src/families/glm/cuda_sparse.zig
++++ b/zig/src/families/glm/cuda_sparse.zig
+@@ -142,7 +142,8 @@ pub fn splitAt(start: usize, from: usize, world: usize) bool {
+     return from > 0 and world > 1 and start >= from;
+ }
+ 
+-/// sparse.select_tokens: rows' tokens (i32 [rows][g.width()], ascending, -1 padded; on pages their rows); 0 if dense.
++/// sparse.select_tokens: rows' tokens (i32 [rows][g.width()], ascending, -1 padded; on pages their rows unless
++/// `t.logical`); 0 if dense. The pooled keys are read through `t.pt` either way.
+ pub fn selectTokens(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64, wts: u64, w_stride: usize, pk: u64, t: latent.Table, pos: u64, host_pos: usize, rows: usize, heads: usize, d: usize, g: Geometry, np_max_cap: usize, s: Scratch, tokens: u64, counts: u64) !void {
+     return selectTokensProfile(set, ops, stream, qi, wts, w_stride, pk, t, pos, host_pos, rows, heads, d, g, np_max_cap, s, tokens, counts, null, null);
+ }
+@@ -211,7 +212,7 @@ pub fn selectTokensProfile(set: glue.Set, ops: cuda.Module, stream: cuda.Stream,
+     args.add(@as(c_int, @intCast(g.topk)));
+     args.add(tokens);
+     args.add(counts);
+-    args.add(t.pt);
++    args.add(if (t.logical) @as(u64, 0) else t.pt); // an E4M3 cache's lists stay positions; its chunks take the table
+     args.add(@as(i64, @intCast(t.page_rows)));
+     args.add(@as(c_int, @intCast(g.pool)));
+     try cuda_pdl.launch(assemble, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &args);
+diff --git a/zig/src/families/glm/cuda_start.zig b/zig/src/families/glm/cuda_start.zig
+index b339144e6..7f38cb072 100644
+--- a/zig/src/families/glm/cuda_start.zig
++++ b/zig/src/families/glm/cuda_start.zig
+@@ -48,11 +48,11 @@ pub fn pagesText() ?[:0]const u8 {
+     return @import("core").profile.given(.TF_KV_PAGES);
+ }
+ 
+-/// TF_KV_PAGES keeps FP8 on whole windows; explicit pages with FP8 are refused on every rank.
++/// TF_KV_PAGES: auto pages bf16 from two ranks and keeps FP8 on whole windows; on (1, all) pages either format, its
++/// E4M3 codes and scales in each page (one shared pool: a stream takes the pages its request needs).
+ pub fn paging(text: ?[]const u8, world: usize, kv8: bool) !bool {
+     const v = text orelse "auto";
+     if (std.mem.eql(u8, v, "auto")) return world >= 2 and !kv8;
+     if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off")) return false;
+-    if (kv8) return error.Fp8OnPages;
+-    return true;
++    return true; // any other text pages, as it always has (the legacy matrix): bf16 rows, or E4M3 codes and scales
+ }
+diff --git a/zig/src/families/glm/cuda_start_test.zig b/zig/src/families/glm/cuda_start_test.zig
+index 3b7fff9f2..21e7d5b03 100644
+--- a/zig/src/families/glm/cuda_start_test.zig
++++ b/zig/src/families/glm/cuda_start_test.zig
+@@ -61,35 +61,9 @@ fn run(w: *World, rank: usize, world: usize, text: ?[]const u8, kv8: bool) !void
+     return startup.open(std.testing.io, Place{ .rank = rank, .world = world }, text, Settings{ .kv8 = kv8 }, Watch{ .world = w, .rank = rank }, Args{ .world = w, .rank = rank }, construct, recordReport);
+ }
+ 
+-fn refusal(rank: usize) !void {
+-    for ([_][]const u8{ "on", "all", "1" }) |mode| {
+-        var w: World = .{};
+-        const peer = 1 - rank;
+-        try run(&w, peer, 2, "auto", true);
+-        try std.testing.expect(w.waiting[peer]);
+-        try std.testing.expectError(error.Fp8OnPages, run(&w, rank, 2, mode, true));
+-        try std.testing.expectEqualStrings("Fp8OnPages", w.refused[peer] orelse "waiting for missing rank");
+-        try std.testing.expect(!w.waiting[peer]);
+-        try std.testing.expect(w.connected[rank] and w.connected[peer]);
+-        try std.testing.expect(!w.constructed[rank]);
+-        try std.testing.expectEqual(@as(usize, 2), w.starts);
+-        try std.testing.expectEqual(@as(usize, 1), w.notifications);
+-        try std.testing.expectEqual(@as(usize, 1), w.reports);
+-    }
+-}
+-
+-test "GLM startup: refusing rank zero promptly tells the waiting follower Fp8OnPages" {
+-    try refusal(0);
+-}
+-
+-test "GLM startup: refusing follower promptly tells waiting rank zero Fp8OnPages" {
+-    try refusal(1);
+-}
+-
+ test "GLM startup: valid modes reach construction with every other setting intact" {
+     for ([_]bool{ false, true }) |kv8| for ([_][]const u8{ "auto", "off", "0", "on", "all" }) |mode| {
+-        if (kv8 and (std.mem.eql(u8, mode, "on") or std.mem.eql(u8, mode, "all"))) continue;
+-        var w: World = .{};
++        var w: World = .{}; // E4M3 pages too: on and all reach construction with pages
+         try run(&w, 0, 2, mode, kv8);
+         try std.testing.expect(w.connected[0]);
+         try std.testing.expect(w.constructed[0]);
+@@ -146,14 +120,8 @@ test "GLM startup: legacy paging matrix preserves settings and reports each rank
+         const last_rank = @min(world, 2);
+         for (0..last_rank) |rank| {
+             var w: World = .{ .expected_world = world };
+-            if (kv8 and c.fp8_refuses) {
+-                try std.testing.expectError(error.Fp8OnPages, run(&w, rank, world, c.raw, kv8));
+-                try std.testing.expect(!w.constructed[rank]);
+-                try std.testing.expectEqual(@as(usize, 0), w.reports);
+-                try std.testing.expectEqual(@as(usize, 1), w.notifications);
+-                continue;
+-            }
+-            const pages = !kv8 and (if (world == 1) c.single else c.multi);
++            // E4M3 pages wherever TF_KV_PAGES names them (the cases that refused Fp8OnPages before), never under auto
++            const pages = if (kv8) c.fp8_refuses else if (world == 1) c.single else c.multi;
+             try run(&w, rank, world, c.raw, kv8);
+             try std.testing.expectEqualDeep(Settings{ .kv8 = kv8, .pages = pages }, w.settings[rank].?);
+             try std.testing.expectEqual(@as(usize, 1), w.reports);
 diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_state.zig
-index ae3cedd63..41e31d2af 100644
+index b2cd0a738..980360336 100644
 --- a/zig/src/families/glm/cuda_state.zig
 +++ b/zig/src/families/glm/cuda_state.zig
-@@ -56,7 +56,9 @@ fn arena(d: *const cuda.Driver, sizes: []const usize, out: []u64) !Arena {
+@@ -57,7 +57,9 @@ fn arena(d: *const cuda.Driver, sizes: []const usize, out: []u64) !Arena {
  pub const page_rows = latent.chunk;
  
  /// Where a paged sequence's caches are: the pool's pages at `kv`, `page_bytes` apart, through a table of `pages`.
@@ -3570,51 +4703,113 @@ index ae3cedd63..41e31d2af 100644
  
  /// The DSA (MLA) layers among the loaded ones; the MTP layer's caches come after theirs.
  pub fn mlaLayers(w: *const weights.Weights) usize {
-@@ -92,8 +94,19 @@ pub fn pageBytesOf(w: *const weights.Weights, kv8: bool, head: bool) u64 {
+@@ -66,21 +68,35 @@ pub fn mlaLayers(w: *const weights.Weights) usize {
+     return nd;
  }
  
- /// Cache `j`'s rows on pages: its part of page 0 at `p.kv`, the others through the table. In E4M3 its codes come
--/// first, then the part's scales (`ls`), then the pooled keys.
--fn onPages(x: *dsa_block.Caches, c: anytype, p: Paged, table: u64, j: usize, kv8: bool) void {
+-/// The latent caches' shape: their count (DSA layers and the MTP layer's), a row's values, index key dims, pool rows.
++/// The latent caches' shape: their count (DSA layers and the MTP layer's), a row's values, index key dims, pool rows,
++/// and the rows' format (`kv8`: E4M3 codes then one fp32 scale a row, which on pages sit in each cache's part).
+ pub const Shape = struct {
+     caches: usize,
+     row: usize, // kv_lora + qk_rope: 512 on GLM-5.3-Flash
+     i_dim: usize,
+     pool: usize, // rows a pooled key sums: 4 on GLM-5.3-Flash
+     keys: usize, // index key and gate rows a cache holds: a ring of index_ring, or maxInt for a whole sequence's
++    kv8: bool = false,
+ 
+     pub fn of(c: anytype, caches: usize) Shape {
+         return .{ .caches = caches, .row = c.latentRow(), .i_dim = c.i_dim, .pool = c.kpool, .keys = index_ring };
+     }
+ 
+-    /// One cache's latent rows on a page, and their pooled keys.
++    /// This shape in a cache format: `kv8` E4M3 rows (codes, then their fp32 scales) or bf16.
++    pub fn format(s: Shape, kv8: bool) Shape {
++        var f = s;
++        f.kv8 = kv8;
++        return f;
++    }
++
++    /// One cache's latent rows on a page (bf16, or E4M3 codes then their scales).
+     pub fn latentBytes(s: Shape) usize {
+-        return page_rows * s.row * 2;
++        return if (s.kv8) page_rows * (s.row + 4) else page_rows * s.row * 2;
++    }
++
++    /// In E4M3, the scales' offset in a cache's latent rows: after its codes.
++    pub fn scalesAt(s: Shape) usize {
++        return page_rows * s.row;
+     }
+ 
+     pub fn pkBytes(s: Shape) usize {
+@@ -114,20 +130,41 @@ pub fn pkPageBytes(w: *const weights.Weights) u64 {
+ 
+ /// A page's bytes: every DSA layer's part, then the MTP layer's.
+ pub fn pageBytes(w: *const weights.Weights) u64 {
+-    return shapeOf(w).pageBytes();
++    return pageBytesOf(w, false, true);
+ }
+ 
+-/// Cache `j`'s rows on pages: its part of page 0 at `p.kv`, the others through the table.
+-fn onPages(x: *dsa_block.Caches, s: Shape, p: Paged, table: u64, j: usize) void {
++/// A page's bytes for this cache format: every DSA layer's part, then the target MTP head's if it is loaded
++/// (without it, as beside DFlash2, the head's rows take no part of a page).
++pub fn pageBytesOf(w: *const weights.Weights, kv8: bool, head: bool) u64 {
++    return Shape.of(&w.config, mlaLayers(w) + @intFromBool(head)).format(kv8).pageBytes();
++}
++
++/// Cache `j`'s rows on pages: its part of page 0 at `p.kv`, the others through the table. In E4M3 its codes come
 +/// first, then the part's scales (`ls`), then the pooled keys. Sharded, the codes and scales are cache `j`'s part of
 +/// latent page 0 at `p.lat` (through `ltable`) and the pooled keys its part of key page 0 at `p.kv`.
-+fn onPages(x: *dsa_block.Caches, c: anytype, p: Paged, table: u64, ltable: u64, j: usize, kv8: bool) void {
++fn onPages(x: *dsa_block.Caches, s: Shape, p: Paged, table: u64, ltable: u64, j: usize) void {
 +    if (p.shard) {
-+        x.lc = p.lat + j * page_rows * (c.kv_lora + 4);
-+        x.ls = x.lc + page_rows * c.kv_lora;
-+        x.pk = p.kv + j * (page_rows / sparse.pool * c.i_dim * 2);
++        const e8 = s.format(true);
++        x.lc = p.lat + j * e8.latentBytes();
++        x.ls = x.lc + e8.scalesAt();
++        x.pk = p.kv + j * s.pkBytes();
 +        x.pt = table;
 +        x.ps = p.page_bytes;
 +        x.lpt = ltable;
 +        x.lps = p.lat_page;
 +        return;
 +    }
-     x.lc = p.kv + j * pageCacheBytes(c, kv8);
-     if (kv8) x.ls = x.lc + page_rows * c.kv_lora;
-     x.pk = if (p.pk != 0) p.pk + j * pkCacheBytes(c) else if (kv8) x.ls + page_rows * 4 else x.lc + page_rows * c.kv_lora * 2;
-@@ -102,8 +115,9 @@ fn onPages(x: *dsa_block.Caches, c: anytype, p: Paged, table: u64, j: usize, kv8
+     x.lc = p.kv + j * s.cacheBytes();
++    if (s.kv8) x.ls = x.lc + s.scalesAt();
+     x.pk = if (p.pk != 0) p.pk + j * s.pkBytes() else x.lc + s.latentBytes();
+     x.pks = p.pk_page;
+     x.pt = table;
      x.ps = p.page_bytes;
  }
  
 -/// A State's fields in order; on pages (a table of `table` entries) no latent or pooled rows, and the table last.
--fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize, kv8: bool, table: ?usize, head: bool) ![]usize {
+-fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize, kv8: bool, table: ?usize) ![]usize {
 +/// A State's fields in order; on pages (a table of `table` entries) no latent or pooled rows, and the table last
 +/// (sharded, `ltable`: the latent table after it).
 +fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize, kv8: bool, table: ?usize, head: bool, ltable: bool) ![]usize {
      const c = &w.config;
      const s = &w.share;
      const nd = mlaLayers(w);
-@@ -124,6 +138,7 @@ fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize
-     }
+@@ -142,9 +179,13 @@ fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize
+     try sizes.appendSlice(gpa, &.{ 4, nk * 3 * 3 * n * 2, 2 * nk * s.kda.len() * kda.dk * kda.dv * 4, nk * window_rows * kw * 2 });
+     try sizes.appendSlice(gpa, &.{ nk * window_rows * n * 4, nk * window_rows * n * 2, nk * window_rows * n * 4, nk * window_rows * s.kda.len() * 4 });
+     const lc_bytes = try latent.cacheBytes(capacity, c.latentRow(), kv8);
+-    for (0..nd + 1) |_| try sizes.appendSlice(gpa, &.{ rows * lc_bytes, ring_rows * c.i_dim * 2, ring_rows * c.i_dim * 2, rows * pk_rows * c.i_dim * 2 });
++    for (0..nd + 1) |j| {
++        const keep: usize = @intFromBool(j < nd or head);
++        try sizes.appendSlice(gpa, &.{ rows * keep * lc_bytes, keep * ring_rows * c.i_dim * 2, keep * ring_rows * c.i_dim * 2, rows * keep * pk_rows * c.i_dim * 2 });
++    }
      try sizes.appendSlice(gpa, &.{ 4, c.hidden * 2 }); // MTP position and sequence-owned first-draft row
      if (table) |t| try sizes.append(gpa, t * 4);
 +    if (table) |t| if (ltable) try sizes.append(gpa, t * 4);
      return sizes.toOwnedSlice(gpa);
  }
  
-@@ -414,6 +429,9 @@ pub const State = struct {
-     kv8: bool = false, // E4M3 latent rows (codes and fp32 scales): on pages each part holds both
-     head: bool = true, // the target MTP head's cache holds rows (and on pages takes the pages' last part)
+@@ -444,31 +485,52 @@ pub const State = struct {
+     mtp_base: usize = 0,
+     prompt_hidden: u64, // first-draft row owned and charged by this sequence arena
+     table: u64 = 0, // on pages: its page table (i32, `pages` entries), else 0
++    kv8: bool = false, // E4M3 latent rows (codes and fp32 scales): on pages each part holds both
++    head: bool = true, // the target MTP head's cache holds rows (and on pages takes the pages' last part)
      pages: []const u32 = &.{}, // on pages: the page ids its table holds, in row order (none while no stream holds it)
 +    ltable: u64 = 0, // sharded (TF_GLM_KV_SHARD): its latent table (i32 this rank's latent pages, `pages` entries)
 +    lpages: []const u32 = &.{}, // sharded: the latent pages that table holds (cuda_kv_shard.latentIds)
@@ -3622,11 +4817,33 @@ index ae3cedd63..41e31d2af 100644
  
      pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize) !State {
          return initFormat(gpa, d, w, capacity, false);
-@@ -441,7 +459,12 @@ pub const State = struct {
+     }
  
-     /// `pagedBytes` with or without the target MTP head's rings (its rows are the pages' part).
-     pub fn pagedBytesOf(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize, pages: usize, head: bool) !usize {
--        const sizes = try stateSizes(gpa, w, capacity, false, pages, head);
+     pub fn initFormat(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, kv8: bool) !State {
+-        return make(gpa, d, w, capacity, kv8, null);
++        return make(gpa, d, w, capacity, kv8, null, true);
+     }
+ 
+     /// A sequence whose latent rows and pooled keys are pages of `p`; it holds no rows until a stream maps some.
+     pub fn initPaged(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, p: Paged) !State {
+-        return make(gpa, d, w, capacity, false, p);
++        return make(gpa, d, w, capacity, false, p, true);
++    }
++
++    /// `initPaged` for a cache format (`kv8`: E4M3 codes and scales on the pages) and with or without the target MTP
++    /// head's part (`head`): the pages must be `pageBytesOf(w, kv8, head)` bytes.
++    pub fn initPagedFormat(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, p: Paged, kv8: bool, head: bool) !State {
++        return make(gpa, d, w, capacity, kv8, p, head);
+     }
+ 
+     /// Bytes a sequence on pages allocates at any length (its fixed part, as `arena` rounds it), a table of `pages`.
+     pub fn pagedBytes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize, pages: usize) !usize {
+-        const sizes = try stateSizes(gpa, w, capacity, false, pages);
++        return pagedBytesOf(gpa, w, capacity, pages, true);
++    }
++
++    /// `pagedBytes` with or without the target MTP head's rings (its rows are the pages' part).
++    pub fn pagedBytesOf(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize, pages: usize, head: bool) !usize {
 +        return pagedBytesFor(gpa, w, capacity, pages, head, false);
 +    }
 +
@@ -3636,39 +4853,53 @@ index ae3cedd63..41e31d2af 100644
          defer gpa.free(sizes);
          var total: usize = 0;
          for (sizes) |n| total += std.mem.alignForward(usize, n, 256);
-@@ -456,7 +479,7 @@ pub const State = struct {
+         return total;
+     }
+ 
+-    fn make(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, kv8: bool, paged: ?Paged) !State {
++    fn make(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, kv8: bool, paged: ?Paged, head: bool) !State {
+         const c = &w.config;
+         const s = &w.share;
+         const nk = w.layers.len - mlaLayers(w);
+@@ -476,7 +538,7 @@ pub const State = struct {
          const n = s.kda.len() * c.kda_dim;
          const kw = @import("cuda_kda_block.zig").rowWidth(s.kda.len()); // TF_GLM_KDA_PAD
-         const pk_rows = capacity / sparse.pool + 2;
--        const sizes = try stateSizes(gpa, w, capacity, kv8, if (paged) |q| q.pages else null, head);
+         const pk_rows = capacity / c.kpool + 2;
+-        const sizes = try stateSizes(gpa, w, capacity, kv8, if (paged) |q| q.pages else null);
 +        const sizes = try stateSizes(gpa, w, capacity, kv8, if (paged) |q| q.pages else null, head, if (paged) |q| q.shard else false);
          defer gpa.free(sizes);
          const p = try gpa.alloc(u64, sizes.len);
          defer gpa.free(p);
-@@ -474,6 +497,7 @@ pub const State = struct {
-         var st: State = .{ .ring_rows = ring_rows, .ring_row = c.i_dim * 2, .rings = rings, .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = p[8 + 4 * nd], .ls = if (kv8) p[8 + 4 * nd] + @intFromBool(head) * capacity * c.kv_lora else 0, .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = p[11 + 4 * nd], .pk_rows = pk_rows }, .mtp_pos_dev = p[12 + 4 * nd], .prompt_hidden = p[13 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw, .kv8 = kv8, .head = head };
+@@ -491,9 +553,10 @@ pub const State = struct {
+         const rings = try gpa.alloc(u64, 2 * (nd + 1));
+         for (0..nd + 1) |j| rings[2 * j ..][0..2].* = .{ p[9 + 4 * j], p[10 + 4 * j] };
+         const ring_rows = @min(capacity, shapeOf(w).keys);
+-        var st: State = .{ .pool = c.kpool, .ring_rows = ring_rows, .ring_row = c.i_dim * 2, .rings = rings, .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = p[8 + 4 * nd], .ls = if (kv8) p[8 + 4 * nd] + capacity * c.latentRow() else 0, .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = p[11 + 4 * nd], .pk_rows = pk_rows }, .mtp_pos_dev = p[12 + 4 * nd], .prompt_hidden = p[13 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw };
++        var st: State = .{ .pool = c.kpool, .ring_rows = ring_rows, .ring_row = c.i_dim * 2, .rings = rings, .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = p[8 + 4 * nd], .ls = if (kv8) p[8 + 4 * nd] + @intFromBool(head) * capacity * c.latentRow() else 0, .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = p[11 + 4 * nd], .pk_rows = pk_rows }, .mtp_pos_dev = p[12 + 4 * nd], .prompt_hidden = p[13 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw, .kv8 = kv8, .head = head };
          if (paged) |q| {
              st.table = p[14 + 4 * nd];
 +            if (q.shard) st.ltable = p[15 + 4 * nd];
              st.capacity = 0; // no rows until a stream's pages are mapped
              st.place(w, q);
          }
-@@ -482,8 +506,8 @@ pub const State = struct {
+@@ -502,9 +565,9 @@ pub const State = struct {
  
      /// A paged sequence's caches on the pages of `p` (the engine's own, made before its pool, placed when it is made).
      pub fn place(st: *State, w: *const weights.Weights, p: Paged) void {
--        for (st.caches, 0..) |*x, j| onPages(x, &w.config, p, st.table, j, st.kv8);
--        if (st.head) onPages(&st.mtp_caches, &w.config, p, st.table, st.caches.len, st.kv8);
-+        for (st.caches, 0..) |*x, j| onPages(x, &w.config, p, st.table, st.ltable, j, st.kv8);
-+        if (st.head) onPages(&st.mtp_caches, &w.config, p, st.table, st.ltable, st.caches.len, st.kv8);
+-        const s = shapeOf(w);
+-        for (st.caches, 0..) |*x, j| onPages(x, s, p, st.table, j);
+-        onPages(&st.mtp_caches, s, p, st.table, st.caches.len);
++        const s = shapeOf(w).format(st.kv8);
++        for (st.caches, 0..) |*x, j| onPages(x, s, p, st.table, st.ltable, j);
++        if (st.head) onPages(&st.mtp_caches, s, p, st.table, st.ltable, st.caches.len);
      }
  
      pub fn deinit(st: *State) void {
 diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
-index f5aca4e1a..cdd9407c2 100644
+index e8940718b..577664e31 100644
 --- a/zig/src/native/cuda.zig
 +++ b/zig/src/native/cuda.zig
-@@ -71,6 +71,7 @@ pub const Host = struct {
+@@ -70,6 +70,7 @@ pub const Host = struct { // One loaded model behind the lane host: everything t
      kv_plan: ?@import("cuda_ledger.zig").Plan = null, // the KV ledger's budget and cost, read by the lane host
      prompts: ?*prompt_pages.Adapter = null, // TF_KV_SHARE: the family's prompts as its pool's pages (no `store` then)
      learn: ?api.Learner = null, // the family's Sliding Weights learner (--slide), called with the context current
@@ -3676,15 +4907,15 @@ index f5aca4e1a..cdd9407c2 100644
      slide: ?*anyopaque = null, // that learner's adapter, freed by slide_free before the family
      slide_free: ?*const fn (Allocator, *anyopaque) void = null,
      dir: []u8 = &.{}, // the model folder the learner writes its lessons into
-@@ -374,7 +375,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, asked: a
-     };
+@@ -380,7 +381,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, asked: a
+     paged = counted.paged;
      const h = try gpa.create(Host);
      errdefer gpa.destroy(h);
 -    h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = served.backend, .served = served, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = if (@hasField(L, "lone")) loaded.lone else null };
 +    h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = served.backend, .served = served, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = if (@hasField(L, "lone")) loaded.lone else null, .kv_parts = if (@hasField(L, "kv_parts")) loaded.kv_parts else null };
      h.readiness(F);
-     h.kv_plan = counted.ledger;
-     // a ledger's plan placed the cache already, beside --parallel full-window requests
+     h.kv_plan = counted.ledger; // a ledger's plan placed the cache already, beside --parallel full-window requests
+     const kept = if (host_cache) kv_pages.kept(F, loaded, paged, o, room, held, final_host_budget, true) else if (counted.ledger) |lp| lp.kept else kv_pages.kept(F, loaded, paged, o, room, held, 0, false);
 diff --git a/zig/src/native/cuda_startup_phase.zig b/zig/src/native/cuda_startup_phase.zig
 index 6a680b3ef..3971dbe4d 100644
 --- a/zig/src/native/cuda_startup_phase.zig
@@ -3697,127 +4928,18 @@ index 6a680b3ef..3971dbe4d 100644
      h.host.warm_quiet = if (info.warm_turns) warm_quiet else 0;
      if (h.lone != null) h.host.lone = .{ .ctx = h, .run = callbacks.loneRun, .sampled = true, .logprobs = h.inner.vtable.first_row != null, .structures = h.inner.vtable.first_masked != null, .min_budget = nemotron.native.lone_min_budget, .resumes = true };
      if (h.learn != null) h.host.learner = callbacks.learner(h);
-diff --git a/zig/src/server/metrics.zig b/zig/src/server/metrics.zig
-index aba3ed5ef..1f944a303 100644
---- a/zig/src/server/metrics.zig
-+++ b/zig/src/server/metrics.zig
-@@ -235,9 +235,44 @@ pub const Metrics = struct {
-         if (snap.phases) try histogram(w, "request_queue_time_seconds", "Seconds a finished request waited before admission, under vLLM's name.", snap.queue);
-         try gauge(w, "client_disconnections_total", "counter", "Requests a client left before the reply left the server.", snap.disconnects);
-         if (status.preemptions) |p| try gauge(w, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.", p);
-+        if (status.kv_parts) |k| try kvShard(w, k);
-     }
- };
- 
-+/// A sharded KV pool's families (GLM's TF_GLM_KV_SHARD): `kv_shard_*` gauges and counters, then each part's pages.
-+pub fn kvShard(w: *std.Io.Writer, k: api.Status.KvParts) !void {
-+    const S = api.Status.KvParts;
-+    inline for (@typeInfo(S).@"struct".field_names) |n| {
-+        if (comptime std.mem.eql(u8, n, "part")) continue;
-+        const kind = comptime for (S.gauges) |g| {
-+            if (std.mem.eql(u8, g, n)) break "gauge";
-+        } else "counter";
-+        try gauge(w, "kv_shard_" ++ n ++ if (comptime std.mem.eql(u8, kind, "counter")) "_total" else "", kind, @field(S.help, n), @field(k, n));
-+    }
-+    const P = @TypeOf(k.part[0]);
-+    inline for (@typeInfo(P).@"struct".field_names) |n| {
-+        try family(w, "kv_shard_part_" ++ n, "gauge", @field(P.help, n));
-+        for (k.part[0..@min(k.parts, k.part.len)], 0..) |x, i| try w.print("{s}kv_shard_part_{s}{{part=\"{d}\"}} {d}\n", .{ prefix, n, i, @field(x, n) });
-+    }
-+}
-+
-+test "a sharded pool's kv_shard families: gauges, counters with _total, a part label each" {
-+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-+    defer out.deinit();
-+    var k: api.Status.KvParts = .{ .parts = 2, .part_pages = 900, .page_tokens = 512, .owner_layers = 33, .twins_made = 4 };
-+    k.part[1] = .{ .free = 12, .live_pages = 400, .twin_pages = 8, .live = 3 };
-+    try kvShard(&out.writer, k);
-+    const text = out.written();
-+    for ([_][]const u8{
-+        "# TYPE tensorfold:kv_shard_parts gauge\ntensorfold:kv_shard_parts 2\n",
-+        "tensorfold:kv_shard_part_pages 900\n",
-+        "# TYPE tensorfold:kv_shard_owner_layers_total counter\ntensorfold:kv_shard_owner_layers_total 33\n",
-+        "tensorfold:kv_shard_twins_made_total 4\n",
-+        "tensorfold:kv_shard_part_live_pages{part=\"1\"} 400\n",
-+        "tensorfold:kv_shard_part_free{part=\"0\"} 0\n",
-+    }) |want| try std.testing.expect(std.mem.indexOf(u8, text, want) != null);
-+}
-+
- fn family(w: *std.Io.Writer, name: []const u8, kind: []const u8, help: []const u8) !void {
-     try w.print("# HELP {s}{s} {s}\n# TYPE {s}{s} {s}\n", .{ prefix, name, help, prefix, name, kind });
- }
-diff --git a/zig/src/server/status_routes.zig b/zig/src/server/status_routes.zig
-index 58b3aeb07..126b1ced3 100644
---- a/zig/src/server/status_routes.zig
-+++ b/zig/src/server/status_routes.zig
-@@ -59,6 +59,7 @@ pub fn openHealth(srv: *Server, a: Allocator, reset_peak: bool) !Value {
-     }
-     try o.put(a, "memory", .{ .object = memory });
-     try o.put(a, "live", try live.snapshot(a, status));
-+    if (status.kv_parts) |k| try o.put(a, "kv_shard", try kvShardValue(a, k));
-     const ident = srv.config.identity;
-     for ([_][2][]const u8{
-         .{ "version", ident.version },
-@@ -69,6 +70,23 @@ pub fn openHealth(srv: *Server, a: Allocator, reset_peak: bool) !Value {
-     return .{ .object = o };
- }
- 
-+/// /health's `kv_shard` (GLM's TF_GLM_KV_SHARD): every gauge and counter by name, and `per_part` (each part's pages).
-+pub fn kvShardValue(a: Allocator, k: api.Status.KvParts) !Value {
-+    const o = try json.newObject(a);
-+    inline for (@typeInfo(api.Status.KvParts).@"struct".field_names) |n| {
-+        if (comptime std.mem.eql(u8, n, "part")) continue;
-+        try o.put(a, n, try json.intValue(a, @field(k, n)));
-+    }
-+    const parts = try a.alloc(Value, @min(k.parts, k.part.len));
-+    for (parts, k.part[0..parts.len]) |*slot, x| {
-+        const p = try json.newObject(a);
-+        inline for (@typeInfo(@TypeOf(x)).@"struct".field_names) |n| try p.put(a, n, try json.intValue(a, @field(x, n)));
-+        slot.* = .{ .object = p };
-+    }
-+    try o.put(a, "per_part", .{ .array = parts });
-+    return .{ .object = o };
-+}
-+
- /// Facts an attached benchmark may copy. A missing or rejected manifest leaves the run unranked.
- pub fn manifestRoute(srv: *Server, conn: *Conn, a: Allocator) !void {
-     if (srv.draining.load(.seq_cst)) return routes.sendDraining(conn, "{\"status\":\"draining\"}");
-@@ -349,6 +367,22 @@ test "model discovery distinguishes speech row and frame budgets from context" {
-     try std.testing.expect(text_only.get("speech") == null);
- }
- 
-+test "health's kv_shard: every gauge and counter by name and each part's pages" {
-+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-+    defer arena.deinit();
-+    var k: api.Status.KvParts = .{ .parts = 2, .part_pages = 900, .page_tokens = 512, .owner_bytes = 1 << 20, .carries = 3 };
-+    k.part[0] = .{ .free = 10, .live_pages = 800, .twin_pages = 90, .live = 4 };
-+    const v = try kvShardValue(arena.allocator(), k);
-+    try std.testing.expectEqual(@as(i64, 900), v.object.get("part_pages").?.int64().?);
-+    try std.testing.expectEqual(@as(i64, 3), v.object.get("carries").?.int64().?);
-+    try std.testing.expectEqual(@as(i64, 1 << 20), v.object.get("owner_bytes").?.int64().?);
-+    const parts = v.object.get("per_part").?.array;
-+    try std.testing.expectEqual(@as(usize, 2), parts.len);
-+    try std.testing.expectEqual(@as(i64, 800), parts[0].object.get("live_pages").?.int64().?);
-+    try std.testing.expectEqual(@as(i64, 0), parts[1].object.get("live").?.int64().?);
-+    try std.testing.expect(v.object.get("part") == null);
-+}
-+
- test "model discovery adds reasoning to an entry only when the model has it" {
-     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-     defer arena.deinit();
 diff --git a/zig/tests/cuda/glm_kv_shard_check.zig b/zig/tests/cuda/glm_kv_shard_check.zig
 new file mode 100644
-index 000000000..95e7b9134
+index 000000000..7e44c8dd6
 --- /dev/null
 +++ b/zig/tests/cuda/glm_kv_shard_check.zig
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,162 @@
 +//! GLM-5.3-Flash's KV sharding (TF_GLM_KV_SHARD, GLM patch 0118 by Robert Wojciechowski, GitHub @wojo, X @rwojo) on
 +//! two ranks: a sharded paged stream against its twin on a whole window (unsharded), byte for byte, through every path
 +//! the sharded stream can take: a prompt with a twin (both ranks hold its rows) and without (owner-computed), each
 +//! part as its owner, decode windows of 1 to 16 rows after the twin goes back (owner-computed), a kept state resumed
-+//! in its home part and outside it (the carry), with and without a twin, and the counters and layout after. A kept
-+//! state also goes through its --learn-conversations disk image (each rank's held bytes over the disk steps, read back
-+//! into a home part rank 0 picks) and resumes from the copy read back, at home and carried.
++//! in its home part and outside it (the carry), with and without a twin, and the counters and layout after
++//! (--learn-conversations, whose disk images hold whole states, is refused beside sharding).
 +const std = @import("std");
 +const cuda = @import("cuda");
 +const check = @import("check.zig");
@@ -3975,10 +5097,10 @@ index 000000000..95e7b9134
 +    check.pass("kv shard at TP=2: {d} prompt paths (twins, owner-computed, both parts, resumes at home and carried) and {d} window rows equal the unsharded twin's logits and tokens byte for byte; {d} owner layers ({d} MiB sent by rank 0), {d} twins, {d} carries ({d} MiB), {d} layout checks; both parts empty after", .{ cases.len, compared, counts.owner_layers, counts.owner_bytes >> 20, counts.twins_made, counts.carries, counts.carry_bytes >> 20, counts.checks });
 +}
 diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
-index 3c9b88582..8f7bf72a1 100644
+index 08ec3579f..18a8ceffa 100644
 --- a/zig/tests/cuda/main.zig
 +++ b/zig/tests/cuda/main.zig
-@@ -64,6 +64,7 @@ const glm_pair_tests = @import("glm_pair_tests.zig");
+@@ -62,6 +62,7 @@ const glm_pair_tests = @import("glm_pair_tests.zig");
  const glm_split_tests = @import("glm_split_tests.zig");
  const glm_solo_tests = @import("glm_solo_tests.zig");
  const glm_paged_tests = @import("glm_paged_tests.zig");
@@ -3986,11 +5108,10 @@ index 3c9b88582..8f7bf72a1 100644
  const glm_kv_host_slots = @import("glm_kv_host_slots.zig");
  const glm_tap_tests = @import("glm_tap_tests.zig");
  const glm_synth = @import("glm_synth.zig");
-@@ -365,6 +366,8 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+@@ -394,6 +395,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
      if (std.mem.eql(u8, cmd, "train-pack")) return train_pack.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) try std.fmt.parseInt(usize, rest[2], 10) else 24);
      if (std.mem.eql(u8, cmd, "glm-lanes-cover")) return glm_lanes_tests.coverCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
      if (std.mem.eql(u8, cmd, "glm-paged-check")) return glm_paged_tests.pagedCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
-+    if (std.mem.eql(u8, cmd, "glm-kv-shard-check")) return glm_kv_shard_check.shardCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
 +    if (std.mem.eql(u8, cmd, "glm-kv-shard-check")) return glm_kv_shard_check.shardCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
      if (std.mem.eql(u8, cmd, "glm-shared-check")) return glm_lanes_tests.sharedCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
      if (std.mem.eql(u8, cmd, "glm-pair-check")) return glm_pair_tests.pairCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));

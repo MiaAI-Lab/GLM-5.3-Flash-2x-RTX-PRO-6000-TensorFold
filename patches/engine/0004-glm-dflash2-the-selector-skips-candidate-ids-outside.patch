@@ -1,9 +1,10 @@
-From 89c9139da16bda0165dd4090d75cddca8cf1f15c Mon Sep 17 00:00:00 2001
-From: local <local@x>
-Date: Fri, 20 Nov 2026 16:33:41 +0200
-Subject: [PATCH] glm dflash2: the selector skips candidate ids outside the
- vocabulary (no-winner id 0x7fffffff crashed the host)
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MiaAI_Lab <mia.ailab1@gmail.com>
+Date: Thu, 26 Nov 2026 09:00:37 +0200
+Subject: [PATCH 4/4] glm dflash2: the selector skips candidate ids outside the
+ vocabulary
 
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  zig/src/families/glm/dflash_select.zig | 3 ++-
  1 file changed, 2 insertions(+), 1 deletion(-)

@@ -29,7 +29,7 @@ unset _cfg_key _cfg_line _cfg_value
 
 # --- pinned engine build (hashed into the image tag with docker/ and patches/engine/*.patch) ----------------------
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
-TF_REF="${TF_REF:-81de26f649677aa72ae0034d4af6e010cd947038}"
+TF_REF="${TF_REF:-02b324ae9767253d9911d753d5c835a5070eed1b}"
 ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 ZIG_SHA256="${ZIG_SHA256:-1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026}"
 SM="${SM:-120}"                                  # RTX PRO 6000 Blackwell: sm_120
@@ -113,7 +113,7 @@ CONTEXT_FIT_MARGIN="${CONTEXT_FIT_MARGIN:-0.93}" # share of the computed window 
 KV="${KV:-fp8}"                                  # --kv-cache: fp8 (a window per stream, or one shared pool with KV_PAGES=on) | bf16 (shared KV pages)
 # TF_KV_PAGES. on: every stream draws its KV from one shared pool of 512-row pages, and CONTEXT becomes one request's
 # cap (prompt + max_tokens), up to 1048576; a request that doesn't fit waits for pages. off: with KV=fp8 a fixed window
-# per stream. auto: the engine's default (bf16 on pages, fp8 windows). fp8 on pages needs engine patches 0017-0025.
+# per stream. auto: the engine's default (bf16 on pages, fp8 windows). fp8 on pages needs engine patch 0001.
 KV_PAGES="${KV_PAGES:-on}"
 DENSE="${DENSE:-q8}"                             # TF_GLM_DENSE_BITS: bf16 (16) | q8 | q6 | q4 (symmetric int codes, groups of 64)
 HEAD="${HEAD:-bf16}"                             # TF_GLM_HEAD_BITS for the LM head, same choices
@@ -125,24 +125,24 @@ PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-}"         # --prompt-cache-gib (empty: en
 # desktop's share varies), and PROMPT_CACHE_GIB only caps them. With a value here, start.sh reads that line and stops
 # the server (E_CACHE) before it is called LIVE when it funds less. Empty (default): no check.
 PROMPT_CACHE_MIN_GIB="${PROMPT_CACHE_MIN_GIB:-}"
-# LEARN_GIB (engine patch 0103, --learn-conversations): kept prompt states also go to disk under CACHE_DIR/learn, every
+# LEARN_GIB (upstream --learn-conversations; refused beside KV_SHARD=1): kept prompt states also go to disk under CACHE_DIR/learn, every
 # rank's part in one store, so a conversation resumes after its memory copy is evicted or the server restarts. The GiB
 # of disk the states may take; 0 (default): off, as before. LEARN_MIN_FREE_GIB: no state is written while the disk has
 # less free.
 LEARN_GIB="${LEARN_GIB:-0}"
 LEARN_MIN_FREE_GIB="${LEARN_MIN_FREE_GIB:-15}"
-# KV_SHARD=1 (engine patch 0104, TF_GLM_KV_SHARD): each stream's FP8 latent rows live on one GPU (its owner) instead of
+# KV_SHARD=1 (engine patch 0001, TF_GLM_KV_SHARD): each stream's FP8 latent rows live on one GPU (its owner) instead of
 # both, so the same memory holds about 1.8x the tokens; the other GPU's queries go to the owner for attention. Needs
 # GPUS with two GPUs, KV=fp8, KV_PAGES=on, DRAFTER=dflash2 or none, PARALLEL above 1. 0 (default): off, as before.
 KV_SHARD="${KV_SHARD:-0}"
-# L2PF=1 (engine patch 0105, TF_GLM_L2PF, from upstream): each decode window reads the next layer's mixer weights, this
+# L2PF=1 (TF_GLM_L2PF, upstream): each decode window reads the next layer's mixer weights, this
 # layer's router and KDA's o_proj into L2 on a side stream while the gathers and chains run (not the EXL3 routed
 # experts). Upstream turns it on by default on GB10 at TP>=2 only; on the 2x DGX Spark pair it gave +2% at one stream
 # and nothing measurable at four or eight, and it is not measured on RTX PRO 6000. Every rank must agree (the
 # fingerprint carries it). 0 (default): off, as before.
 L2PF="${L2PF:-0}"
 VISION="${VISION:-1}"                            # --vision: images (rank 0's tower)
-VISION_MAX_IMAGES="${VISION_MAX_IMAGES:-100}"    # --vision-max-images: images per request (engine default 4, at most 100 with patch 0102)
+VISION_MAX_IMAGES="${VISION_MAX_IMAGES:-100}"    # --vision-max-images: images per request (engine default 4, at most 100 with engine patch 0003)
 # --chat-template: auto = with VISION=1, templates/glm-5.3-flash-vision.jinja (the checkpoint's own template, whose media
 # branch writes GLM's image and video markers instead of a "cannot see" note); none = the checkpoint's; or a file path
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-auto}"
@@ -154,12 +154,12 @@ CHAT_TEMPLATE="${CHAT_TEMPLATE:-auto}"
 # which the engine passes with thinking on only; always: the template as it is. CHAT_TEMPLATE=auto only; a template
 # of your own decides for itself.
 EFFORT_LINE="${EFFORT_LINE:-thinking}"
-# EXTRA_EOS (engine patch 0108, TF_EXTRA_EOS): tokens that end a reply besides the checkpoint's EOS ids
+# EXTRA_EOS (engine patch 0003, TF_EXTRA_EOS): tokens that end a reply besides the checkpoint's EOS ids
 # (<|endoftext|>, <|user|>, <|observation|>), comma-separated. GLM-5.3 can close a reply with <|assistant|>, which
 # its generation_config leaves out: the token then reaches the reply as text and the model writes a second turn of
 # its own until MAX_TOKENS. none: the checkpoint's list only.
 EXTRA_EOS="${EXTRA_EOS:-<|assistant|>}"
-# THINK_OFF_SPLIT (engine patch 0109, TF_THINK_OFF_SPLIT): with thinking off, GLM-5.3 sometimes drafts in its reasoning
+# THINK_OFF_SPLIT (engine patch 0003, TF_THINK_OFF_SPLIT): with thinking off, GLM-5.3 sometimes drafts in its reasoning
 # voice anyway and writes </think> before its answer. A chat reply that writes that token within its first
 # THINK_OFF_SPLIT tokens gets the text before it as reasoning_content and the rest as content, as a thinking reply
 # does. While a reply streams, its content waits until the token, the end or THINK_OFF_SPLIT tokens (whichever comes

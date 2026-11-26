@@ -1,5 +1,30 @@
 # Changelog
 
+- **2026-11-26** -- Updated to **TensorFold 1.3.5 (`02b324ae`)**, 2,261 upstream commits past 1.3.0 (`81de26f6`):
+  - **5 engine patches instead of 16.** `0001`–`0003` (EXL3 mixed widths, 3-bit prompt kernels and their tests) are
+    upstream now. The rest is ported onto upstream's reworked GLM cache layout (latent rows of `kv_lora + qk_rope`, the
+    pool size and index geometry as parameters, the roped 576-wide path), regrouped by area:
+    `0001` E4M3 KV pages + KV sharding (was `0004`–`0006`, `0008`, `0012`, `0013`, `0015`, `0016`), `0002` the reply
+    grammar fix (was `0007`), `0003` the server patches (was `0009`–`0011`), `0004` the DFlash2 selector fix (was `0014`), and new `0005`: the refusal below names the window that fits.
+  - **Behaviour changes.** `TF_KV_PAGES` parses as upstream's does again: any text other than `auto`, `off` or `0`
+    pages (E4M3 included) instead of being refused. `KV_SHARD=1` is refused by name beside `LEARN_GIB`
+    (`--learn-conversations`, upstream for GLM since 1.3.x): its disk images hold whole states. With tools offered, a
+    call whose arguments cannot be converted is now logged as a rejected envelope too (upstream's new path).
+  - **Checked.** Host suites on the patched tree: `test-cuda-host` 1,486 of 1,488 passed (2 skipped), `test-server-cpu`,
+    `test-glm-snapshots-host`, `test-glm-kv-pages-host`, `test-glm-fp8-kv-host`, `test-glm-startup-host`,
+    `test-think-off-split-host`, `test-tool-parse-host`, `test-tool-visibility-http-host` all green.
+    GPU: `tf-cuda-test glm-kv-shard-check` PASS on both GPUs (7 prompt paths and 357 window rows byte-identical to the
+    unsharded twin, 2 carries, 10 twins, 28 layout checks).
+  - **Less room for the 1M window.** 1.3.5 leaves 4.3 GiB of KV room a GPU after the 2.0 GiB reserve where 1.3.0 left
+    5.2 GiB (same 1.89 MiB pages and 304 MiB fixed a stream; the difference is outside the model and the pool), so
+    `PARALLEL=4` at 1,048,576 tokens is refused. With patch `0005`, `CONTEXT=auto` retries at the window the refusal
+    names: 1,022,976 tokens here (`KV_SHARD=1`, DFlash2); a lower `MEMORY_RESERVE_GIB` or `PARALLEL=3` gets the full
+    window back.
+  - **Verified live** (1,022,976 context, 4 streams, `KV=fp8`, `KV_SHARD=1`, DFlash2, thinking off): hidden-code
+    retrieval correct at 758, 7.4k, 37k and 74k tokens; a tool call parsed (`finish_reason: tool_calls`); a 24k-token
+    second turn resumed 22,528 tokens from the host prompt cache (0.6 s against 6.6 s); 136-140 tok/s at one stream and
+    241-243 tok/s summed at four (400-token replies, prefill included).
+
 - **2026-11-20 (fixes)** -- Engine patches `0014`–`0016`, found on the 2x RTX PRO 6000 host and verified there (rebuild the image to pick them up):
   - `0014` DFlash2 selector: a draft row with NaN or -inf logits returned the kernel's no-winner id `0x7fffffff`, which the host used to index the successor codebook and crashed the server (general protection exception). Ids outside the vocabulary are skipped now.
   - `0015` `KV=fp8` on the page pool: the sparse token lists were written as BF16 page rows but read as positions by the E4M3 kernel, so prompts past `index_topk` (2,048 keys) attended the wrong rows (garbled replies, `!!!!` runs, echoed prompts; issue #64 on the Sparks recipe). `KV=bf16` and `KV_PAGES=off` were unaffected.

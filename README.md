@@ -304,22 +304,18 @@ full overlay measured about 15% below the parent on code. Not measured on this h
   128K prompt as the desktop grew, so this recipe uses 4.
 - To free memory: lower `PARALLEL`, use `DENSE=q8` (or `q6`, `q4`) or `HEAD=q8`, use `KV=fp8`, set `VISION=0` (rank 0
   only), or use `DRAFTER=mtp`. Raise `MEMORY_RESERVE_GIB` if requests fail with CUDA out-of-memory errors while serving.
-- **KV sharding: `KV_SHARD=1`** (engine patch 0104, off by default). At TP=2 both GPUs hold every stream's FP8 latent
+- **KV sharding: `KV_SHARD=1`** (engine patch 0001, off by default). At TP=2 both GPUs hold every stream's FP8 latent
   rows; sharded, each stream's rows live on one GPU, its owner (the pooled index keys stay on both), so a token costs
   3,542 bytes a GPU instead of 6,380. The other GPU's queries go to the owner for attention over P2P. Measured on this
-  host (2026-11-07, `PARALLEL=4`, `CONTEXT=auto`, DFlash2, `DENSE=q8 HEAD=q8`, a 2.8 GiB reserve, the published
-  weights): the full 1,048,576-token window fits beside four streams (2,052 pages), where the same image unsharded
-  fitted a 702,464-token window (1,396 pages; 486,400 and 954 pages at another start with 1 GiB less room). Greedy
-  replies identical; decode 169-170 tok/s at one stream against 171-172 unsharded, 293-295 summed at four against
-  294-296; `tf-cuda-test glm-kv-shard-check` passes on both GPUs. A store written sharded (`LEARN_GIB`) is not read
-  unsharded or the reverse, so turning it on or off starts an empty one.
-- **Conversations on disk: `LEARN_GIB=30`** (engine patch 0103, `--learn-conversations`, off by default). Kept prompt
+  host (2026-11-07, TensorFold before 1.3.0, `PARALLEL=4`, `CONTEXT=auto`, DFlash2, `DENSE=q8 HEAD=q8`, a 2.8 GiB
+  reserve, the published weights): the full 1,048,576-token window fits beside four streams (2,052 pages), where the
+  same image unsharded fitted a 702,464-token window (1,396 pages). Greedy replies identical; decode 169-170 tok/s at
+  one stream against 171-172 unsharded, 293-295 summed at four against 294-296.
+- **Conversations on disk: `LEARN_GIB=30`** (upstream's `--learn-conversations` for GLM, off by default). Kept prompt
   states also go to disk in `CACHE_DIR/learn`, every rank's part, so a conversation whose memory copy was evicted, or
   that outlived a restart, resumes from disk instead of prefilling again. No state is written while the disk has under
-  `LEARN_MIN_FREE_GIB` (15) free. Measured here with `KV_SHARD=1` (2026-11-07): after a restart an 18.5k-token
-  conversation resumed 16,384 tokens cached (first token 0.75 s; 0.49 s from memory) and a 101k-token one 98,304
-  (1.16 s; 0.79 s from memory), replies byte-identical; the two states took 1,477 MiB. A state read from disk restarts
-  DFlash2 at its mark. Off: replies byte-identical.
+  `LEARN_MIN_FREE_GIB` (15) free. Refused beside `KV_SHARD=1` on TensorFold 1.3.5: the disk images hold whole states,
+  a sharded state's latent rows are one rank's.
 - `PROMPT_CACHE_MIN_GIB` stops a start whose prompt cache came out smaller than you need: both tiers depend on that
   start's room (the host tier is a quarter of the host's available memory, which the desktop changes).
 - Host RAM (89 GB) cannot cache the 164 GiB checkpoint. Each start reads it from disk, with eight reader threads per
@@ -327,51 +323,20 @@ full overlay measured about 15% below the parent on code. Not measured on this h
 
 ## Engine patches
 
-`patches/engine/` holds 109 patches on TensorFold `f350cd3e`, applied in order at image build. Grouped by purpose:
+`patches/engine/` holds 5 patches on TensorFold 1.3.5 (`02b324ae`), applied in order at image build. Most of the
+older stack is upstream now (EXL3 mixed widths and 3-bit prompt kernels, E4M3 KV and MoE kernels, DFlash2, PDL, the
+pinned host-RAM prompt tier, GLM `--learn-conversations`); these carry what is not:
 
-| Patches | What they do |
+| Patch | What it does |
 | --- | --- |
-| 0001–0004 | EXL3 experts at mixed whole bit widths (for mixed-width quants), and 3-bit prompt kernels |
-| 0005–0012 | Decode: FP8 attention loads, the shared expert on a side stream. Prefill: one expert call a pass, no MTP pass beside DFlash2, 2-stage int8 prompt GEMMs |
-| 0013 | Upstream #1623: DFlash2 reads complete prompt taps at TP>1 |
-| 0014–0016 | No target MTP layer beside DFlash2 (about 2 GiB a GPU back), and a pinned host-RAM prompt-state tier (8 GiB a rank by default; `TF_GLM_HOST_CACHE_GIB`) |
-| 0017–0025 | FP8 KV on shared pages (`KV_PAGES=on`): paged E4M3 attention kernels, page planning, snapshots, admission |
-| 0026–0033 | Decode: EXL3 load-ahead (upstream #1505/#1534), fused MoE glue with new EXL3 decode tiles, KDA f_b/g_b in one launch, one broadcast a follower step |
-| 0034–0035 | A one-shot peer-to-peer all-gather for decode exchanges, and the copy-engine prompt exchange (`CE_EXCHANGE`) |
-| 0036–0040 | DFlash2 copy rounds without the drafter pass, 16-row copy windows |
-| 0041 | `ABSORB_MMA` (opt-in) |
-| 0042–0048 | Review fixes (rank-consistent begin failure, exact-`--context` requests, thin models, no-MTP checkpoints), "fits:" refusals, device prompt-cache share into the pool, integration fixes |
-| 0049–0063 | Paired prompt chunks (upstream #1423) extended to DFlash2, with a smaller twin buffer |
-| 0064–0066 | `W8A8` (opt-in) and test fixes |
-| 0067–0068 | Decode DSA select on many CTAs (long context); prompt sparse attention merged in the kernel (frees 353 MiB a GPU) |
-| 0069–0071, 0077, 0083–0084 | Audited programmatic dependent launch (PDL) along the decode chain: glm_mm_reduce, the HC chain, the P2P gather, router glue; KDA step warps by row count |
-| 0072–0075 | Decode glue: greedy picks in one launch, two-problem projection launches, fused router select-and-group, a shared window's KDA chains and latent attention in one launch each |
-| 0078–0080 | Faster EXL3 prompt experts and packed int8 prompt GEMMs (prefill) |
-| 0081–0082 | Grouped EXL3 decode reads each trellis word once, and runs as a dependent-launch chain |
-| 0086, 0088–0090 | Split hc_finish, batched shared-window cache writes, hc_partial8 split by outputs, and the PDL waits the split kernels need (0090 must ship with 0086 and 0089) |
-| 0091 | Decode DSA index scores for 4–16-row windows |
-| 0092 | A JSON answer stays JSON beside offered tools: `response_format`, `guided_json` and `structured_outputs` replies are never parsed as tool calls, on chat, Responses and Messages |
-| 0093 | A reply grammar is freed when its stream cannot start |
-| 0096 | A tool call after prose that quotes its opener (`Qwen's <tool_call>{}`) is parsed as the call; before, the quoted opener began the envelope and the whole reply came back as content with no `tool_calls` |
-| 0101 | `TF_TOOL_CALL_GUARD=1` (opt-in, off by default; the 2x DGX Spark recipe's 0107): a chat request that offers no tools although its history called them gets a closing system note and its call markup hidden from the reply, streamed or whole, each hiding logged |
-| 0102 | A request may hold up to 100 images: the `--vision-max-images` bound rises from 64 (Qwen-VL's M-RoPE span table, sized by the same bound, follows) |
-| 0097 | Warm turns for GLM: after a reply the server prefills the next turn's prompt in the background, so a user message after an agent loop resumes past the loop instead of re-reading it (GLM's template drops the loop's reasoning once the next message comes); the pass yields to real work at its next chunk gate, and (every family) to a request admitted ahead of it into the fill queue; each pass's outcome is logged (`next turn: background prefill of N tokens done` / `stepped aside` / `failed: ...`) |
-| 0103 | `--learn-conversations` for GLM on CUDA (`LEARN_GIB`, off by default), a backport of upstream [#1411](https://github.com/ashhart/TensorFold/pull/1411) by its author (the 2x DGX Spark recipe's 0109): kept prompt states on disk, every rank's part, written behind the request and read back after an eviction or a restart. `--spill-gib` and `--checkpoint-slots` are refused for GLM. Off: replies byte-identical |
-| 0104 | KV sharding (`KV_SHARD=1`, `TF_GLM_KV_SHARD`, off by default) at TP=2, toward upstream [#1431](https://github.com/ashhart/TensorFold/issues/1431) (the Spark recipe's 0110, one hunk moved): each stream's FP8 latent rows on its owner GPU, owner-computed decode and verify, prompts on a borrowed twin, kept states carried between owners, and 0103's disk image under it. Refused by name with the MTP drafter, `--parallel 1`, other KV caches, or a part under 131k tokens. `tf-cuda-test glm-kv-shard-check` checks it against an unsharded twin byte for byte. Off: replies byte-identical |
-| 0105 | From upstream (8cc6ac420, a0ddae24d; opt-in): `TF_GLM_L2PF=1` (`L2PF=1`) reads a decode window's next weights into L2 on a side stream while the gathers and chains run, with DeepSeek V4.1's `l2pf` / `l2pace` kernels and their contract records; the ranks' fingerprint carries it (layout 16). Off: no change |
-| 0106 | From upstream (b10fda39f, 1b5ac18bb, 7faa962a0): a reply `max_tokens` cuts inside a JSON `<tool_call>` that has named an offered tool returns that call with its arguments as far as written, as XML and GLM calls already did, and a whole `/v1/messages` reply closes the cut call's input instead of answering 500. Two local fixes: a key with no value no longer indexes an empty slice, and offered names match in any case |
-| 0107 | From upstream (6d4191a95, #2257, adapted): decode windows of 32 rows (16 before), so a context copy verifies up to 31 tokens a round; DFlash2 still drafts 7. Shared-window scratch is flagged outright (a 32-row segment no longer shrinks the KDA projection buffer or drops 0075/0088's one-launch segment attention), the follower's draws hold 32 rows, and the window width joins `--learn-conversations`' store identity. On the 2x DGX Spark pair a one-stream file rewrite went from 151 to 201-205 tok/s decode, prose unchanged, token hashes identical; not measured here |
-| 0108 | `TF_EXTRA_EOS=<token>[,<token>...]` (`EXTRA_EOS`, on by default with `<\|assistant\|>`): the named tokens end a reply like the checkpoint's EOS ids. A name the tokenizer does not hold refuses the start |
-| 0109 | `TF_THINK_OFF_SPLIT=<tokens>` (`THINK_OFF_SPLIT`, opt-in, off by default): a thinking-off chat reply that writes the think close token within the hold is split like a thinking reply, its draft as `reasoning_content` |
-| 0111 | The clean image build compiles without a compiler warning (the 2x DGX Spark recipe's 0111): two fp8 prompt kernels' unread `RW`, prefill_attention's readerless `SMEM_MAX`, glm_mm's unused `Tile::SMEM`, and the flashnext_fact/flashnext_attn unroll loops behind an inverted `if constexpr`; no kernel's arithmetic, launch shape or output changes (all six files' fatbins byte-identical there) |
-| 0112 | Each rejected tool envelope is logged one by one with its reason, and `TF_TOOL_CALL_DEBUG=1` adds its text (the 2x DGX Spark recipe's 0112): with `TF_TOOL_CALL_GUARD=1` and tools offered, only well-formed calls to unoffered tools are hidden — a malformed call stays as text, and a reply that hiding would leave empty keeps its calls, so an agent never retries a blank reply blind |
-| 0076, 0079, 0085, 0087 | Test and contract-record changes |
+| 0001 | GLM on CUDA. E4M3 (`KV=fp8`) latent caches on KV pages (`KV_PAGES=on`): each cache's part of a page holds its codes, their fp32 scales, then the pooled keys, with paged E4M3 chunk and latent-write kernels, snapshot parts and contract records; an E4M3 cache's sparse token lists stay positions. A reply the pool cannot hold opens with the longest reply it holds. KV sharding (`KV_SHARD=1`, `TF_GLM_KV_SHARD`, off by default) at TP=2: each stream's FP8 latent rows on its owner GPU, owner-computed decode and verify, prompts on a borrowed twin, kept states carried between owners, latent rows always through the latent table (the target MTP head's prompt rows too). Refused by name with the MTP drafter, `--parallel 1`, other KV caches, a part under 131k tokens, or `--learn-conversations`. `tf-cuda-test glm-kv-shard-check` checks it against an unsharded twin byte for byte. Off: replies byte-identical |
+| 0002 | A reply grammar is freed when its stream cannot start |
+| 0003 | Server: `TF_EXTRA_EOS=<token>[,...]` (`EXTRA_EOS`, on by default with `<\|assistant\|>`); `TF_THINK_OFF_SPLIT=<tokens>` (`THINK_OFF_SPLIT`, opt-in): a thinking-off reply that writes the think close within the hold is split like a thinking reply; up to 100 images a request; `TF_TOOL_CALL_GUARD=1` (opt-in): a request that offers no tools although its history called them gets a closing system note and its call markup hidden, and with tools offered only well-formed calls to unoffered tools are hidden; each rejected tool envelope logged with its reason, `TF_TOOL_CALL_DEBUG=1` adds its text |
+| 0004 | The DFlash2 selector skips candidate ids outside the vocabulary (a row with NaN or -inf logits returned the kernel's no-winner id and crashed the host) |
+| 0005 | A paged engine's refusal of its other streams (`--parallel N needs ... GiB for its other streams' fixed parts`) ends `; fits: --parallel N, --context T`, the largest window beside them, which `CONTEXT=auto` retries with |
 
-Every default-on patch was A/B tested against the image before it: greedy (T=0) replies identical, plus a measured
-gain. Opt-in settings change rounding and are off unless set. Patches 0067–0091 each keep an exact off switch for
-diagnosis (export it in `scripts/local.sh`): `TF_GLM_DSEL=0`, `TF_GLM_PDL_CHAIN=0`, `TF_GLM_MM_TWO=0`,
-`TF_GLM_TOPK_SUM=0`, `TF_GLM_SHARED_SEGS=0`, `TF_EXL3_SHFL=0`, `TF_EXL3_PDL=0`, `TF_GLM_KDA_STEP_WARPS=8`,
-`TF_GLM_HC_SPLIT=0`, `TF_GLM_SHARED_WRITES=0`, `TF_GLM_HC_PART=0`, `TF_GLM_DSCORES=0`.
+`TF_KV_PAGES` reads as upstream's does: `auto` (the default) pages bf16 from two ranks and keeps E4M3 on whole
+windows, `off` or `0` keeps windows, and any other text pages, E4M3 included.
 
 ## The effort line
 
