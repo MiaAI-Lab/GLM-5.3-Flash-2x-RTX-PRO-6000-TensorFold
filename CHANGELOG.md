@@ -22,11 +22,11 @@
     `test-think-off-split-host`, `test-tool-parse-host`, `test-tool-visibility-http-host` all green.
     GPU: `tf-cuda-test glm-kv-shard-check` PASS on both GPUs (7 prompt paths and 357 window rows byte-identical to the
     unsharded twin, 2 carries, 10 twins, 28 layout checks).
-  - **Less room for the 1M window.** 1.3.5 leaves 4.3 GiB of KV room a GPU after the 2.0 GiB reserve where 1.3.0 left
-    5.2 GiB (same 1.89 MiB pages and 304 MiB fixed a stream; the difference is outside the model and the pool), so
-    `PARALLEL=4` at 1,048,576 tokens is refused. With patch `0005`, `CONTEXT=auto` retries at the window the refusal
-    names: 1,022,976 tokens here (`KV_SHARD=1`, DFlash2); a lower `MEMORY_RESERVE_GIB` or `PARALLEL=3` gets the full
-    window back.
+  - **The 1M window's room varies by start.** The KV room after the 2.0 GiB reserve was 4.3-4.6 GiB on the first
+    1.3.5 starts and 5.23 GiB after a reboot, the same as 1.3.0's 5.2 GiB (same 1.89 MiB pages and 304 MiB fixed a
+    stream), so the dip was that session's device memory, not 1.3.5. Below about 4.6 GiB, `PARALLEL=4` at 1,048,576
+    tokens is refused; with patch `0005`, `CONTEXT=auto` then retries at the window the refusal names (1,022,976 on
+    one start); a lower `MEMORY_RESERVE_GIB` or `PARALLEL=3` keeps the full window.
   - **Verified live** (1,022,976 context, 4 streams, `KV=fp8`, `KV_SHARD=1`, DFlash2, thinking off): hidden-code
     retrieval correct at 758, 7.4k, 37k and 74k tokens; a tool call parsed (`finish_reason: tool_calls`); a 24k-token
     second turn resumed 22,528 tokens from the host prompt cache (0.6 s against 6.6 s); 136-140 tok/s at one stream and
