@@ -1,5 +1,12 @@
 # Changelog
 
+- **2026-11-26 (fix)** -- Engine patch `0006`: with `KV_SHARD=1` a long chat no longer fails with `this request's
+  prompt needs more KV pages than the whole pool holds`. A sharded stream's pages lie in one GPU's part, but the reply
+  cap (0008 on 1.3.0, here in `0001`) measured the whole pool and the sharded open counted the asked reply, so a turn
+  past about half the window asking a long reply was refused (seen at 389k tokens). The cap now uses one part: a
+  187,593-token prompt asking 700,000 reply tokens opens with 361,239 and answers. Present since KV sharding's port
+  to 1.3.0. Host suites green (`test-cuda-host` 1,523 of 1,525, 2 skipped).
+
 - **2026-11-26** -- Updated to **TensorFold 1.3.5 (`02b324ae`)**, 2,261 upstream commits past 1.3.0 (`81de26f6`):
   - **5 engine patches instead of 16.** `0001`–`0003` (EXL3 mixed widths, 3-bit prompt kernels and their tests) are
     upstream now. The rest is ported onto upstream's reworked GLM cache layout (latent rows of `kv_lora + qk_rope`, the

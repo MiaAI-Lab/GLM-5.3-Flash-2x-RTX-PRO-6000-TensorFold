@@ -323,7 +323,7 @@ full overlay measured about 15% below the parent on code. Not measured on this h
 
 ## Engine patches
 
-`patches/engine/` holds 5 patches on TensorFold 1.3.5 (`02b324ae`), applied in order at image build. Most of the
+`patches/engine/` holds 6 patches on TensorFold 1.3.5 (`02b324ae`), applied in order at image build. Most of the
 older stack is upstream now (EXL3 mixed widths and 3-bit prompt kernels, E4M3 KV and MoE kernels, DFlash2, PDL, the
 pinned host-RAM prompt tier, GLM `--learn-conversations`); these carry what is not:
 
@@ -334,6 +334,7 @@ pinned host-RAM prompt tier, GLM `--learn-conversations`); these carry what is n
 | 0003 | Server: `TF_EXTRA_EOS=<token>[,...]` (`EXTRA_EOS`, on by default with `<\|assistant\|>`); `TF_THINK_OFF_SPLIT=<tokens>` (`THINK_OFF_SPLIT`, opt-in): a thinking-off reply that writes the think close within the hold is split like a thinking reply; up to 100 images a request; `TF_TOOL_CALL_GUARD=1` (opt-in): a request that offers no tools although its history called them gets a closing system note and its call markup hidden, and with tools offered only well-formed calls to unoffered tools are hidden; each rejected tool envelope logged with its reason, `TF_TOOL_CALL_DEBUG=1` adds its text |
 | 0004 | The DFlash2 selector skips candidate ids outside the vocabulary (a row with NaN or -inf logits returned the kernel's no-winner id and crashed the host) |
 | 0005 | A paged engine's refusal of its other streams (`--parallel N needs ... GiB for its other streams' fixed parts`) ends `; fits: --parallel N, --context T`, the largest window beside them, which `CONTEXT=auto` retries with |
+| 0006 | `KV_SHARD=1`: a stream's reply is capped to what one GPU's part of the pool holds for its prompt, as unsharded streams are capped to the whole pool. Before, a chat past about half the window that asked a long reply (a client's `max_tokens`, or the server's clamp to the window) failed with `this request's prompt needs more KV pages than the whole pool holds` |
 
 `TF_KV_PAGES` reads as upstream's does: `auto` (the default) pages bf16 from two ranks and keeps E4M3 on whole
 windows, `off` or `0` keeps windows, and any other text pages, E4M3 included.

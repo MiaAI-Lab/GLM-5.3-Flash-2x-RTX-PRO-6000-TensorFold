@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MiaAI_Lab <mia.ailab1@gmail.com>
+Date: Thu, 26 Nov 2026 10:56:46 +0200
+Subject: [PATCH] glm cuda: a sharded stream's reply is capped to what one part
+ holds, not refused
+
+With TF_GLM_KV_SHARD=1 a stream's pages lie in one part, but the reply cap (the longest reply the pool holds for
+a prompt) measured the whole pool and the sharded open counted the asked reply. A client's max_tokens is clamped
+to the window left after the prompt, so a chat past about half the window asked more pages than a part holds
+and failed with PoolTooSmall ('this request's prompt needs more KV pages than the whole pool holds'), e.g. a
+389k-token turn at a 1,022,976 window. The cap now uses one part's pages sharded, and the sharded open takes it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ zig/glm_image_cache_host.zig                  |  1 +
+ .../families/glm/cuda_kv_shard_pages_test.zig | 19 +++++++++++++++++++
+ zig/src/families/glm/cuda_pages.zig           | 11 +++++++----
+ 3 files changed, 27 insertions(+), 4 deletions(-)
+
+diff --git a/zig/glm_image_cache_host.zig b/zig/glm_image_cache_host.zig
+index 3763d3082..18e214892 100644
+--- a/zig/glm_image_cache_host.zig
++++ b/zig/glm_image_cache_host.zig
+@@ -73,6 +73,7 @@ const Cache = struct {
+     e: glm.engine.Engine = undefined, // what GLM's share glue reads: the allocator and the pages
+     fn init(c: *Cache) !void {
+         c.pages.pool = try core.kv_pool.Pool.init(a, 64, 512);
++        c.pages.shard = null; // replyFor reads it: an unsharded pool
+         errdefer c.pages.pool.deinit();
+         c.pages.layout = .{ .fixed_bytes = 0, .token_bytes = 1, .page_tokens = 512, .snap_bytes = 0 };
+         c.pages.leases = &c.leases;
+diff --git a/zig/src/families/glm/cuda_kv_shard_pages_test.zig b/zig/src/families/glm/cuda_kv_shard_pages_test.zig
+index f917875c5..da31bea0e 100644
+--- a/zig/src/families/glm/cuda_kv_shard_pages_test.zig
++++ b/zig/src/families/glm/cuda_kv_shard_pages_test.zig
+@@ -201,6 +201,25 @@ test "kv shard pages: a request past a part is admitted at once and refused, nev
+     try expect(!p.used[1] and p.shard.?.parts.pools[0].available() == 5);
+ }
+ 
++test "kv shard pages: a reply longer than a part holds opens with the part's longest, not a refusal" {
++    const gpa = std.testing.allocator;
++    var f: Fake = undefined;
++    Fake.reset();
++    try f.init(gpa, 0, true);
++    const p = try f.pool(2, 14, true); // parts of 5 pages
++    defer f.deinit(p);
++    // a short prompt asking the rest of the window (as the server's clamp to it does): more than one part holds
++    const part_rows = (p.shard.?.parts.h - p.layout.runPages()) * p.layout.page_tokens;
++    const ask = f.e.capacity - 1000 - 64;
++    try expect(1000 + ask > part_rows);
++    const reply = p.replyFor(1000, ask).?;
++    try expect(reply < ask and 1000 + reply + 32 <= part_rows);
++    try expect(p.fits(1000, ask));
++    _ = try p.openFor(1, 1000, ask, null); // the stream's ids, then its twin's
++    const own = p.shard.?.parts.slots[1].ids.items.len;
++    try expect(own > 0 and own <= p.shard.?.parts.h);
++}
++
+ test "kv shard pages: a follower maps rank 0's ids and twin, its latent table on the twin, the digests alike" {
+     const gpa = std.testing.allocator;
+     var lead: Fake = undefined;
+diff --git a/zig/src/families/glm/cuda_pages.zig b/zig/src/families/glm/cuda_pages.zig
+index cba30d539..fbca04b30 100644
+--- a/zig/src/families/glm/cuda_pages.zig
++++ b/zig/src/families/glm/cuda_pages.zig
+@@ -245,9 +245,10 @@ pub const Pages = struct {
+ 
+     /// The reply a request opens with: the asked one when its pages fit the pool, else the longest the pool holds
+     /// for its prompt (its window and run included), or null when even the prompt and its window take more pages
+-    /// than the whole pool — no reply ever fits, so its opening refuses it (error.PoolTooSmall).
++    /// than the whole pool — no reply ever fits, so its opening refuses it (error.PoolTooSmall). Sharded, the budget
++    /// is one part's pages: a stream's pages lie in one part.
+     pub fn replyFor(p: *const Pages, prompt: usize, max_tokens: usize) ?usize {
+-        const budget = p.pool.total();
++        const budget = if (p.shard) |x| x.parts.h else p.pool.total();
+         if (need(p.layout, prompt, max_tokens) <= budget) return max_tokens;
+         const rows = (budget -| p.layout.runPages()) * @as(usize, p.layout.page_tokens);
+         if (prompt + fw.window_rows > rows) return null;
+@@ -312,8 +313,10 @@ pub const Pages = struct {
+         errdefer if (held) for (adopted) |id| p.pool.release(id);
+         if (!p.paged(slot) or p.used[slot]) return error.SlotTaken;
+         if (p.shard) |x| {
+-            const n = need(p.layout, prompt, max_tokens);
+-            if (n > tableLen(p.e.capacity)) return error.PromptTooLong;
++            if (need(p.layout, prompt, max_tokens) > tableLen(p.e.capacity)) return error.PromptTooLong;
++            // the reply a part holds for this prompt (cuda_lanes caps the stream's to it); none: the prompt never fits
++            const reply = p.replyFor(prompt, max_tokens) orelse return error.PoolTooSmall;
++            const n = need(p.layout, prompt, reply);
+             if (n > x.parts.h) return error.PoolTooSmall; // a stream's pages lie in one part
+             const part = x.parts.choose(n, home) orelse return error.LaneMemory;
+             try x.parts.open(slot, part, n, if (x.switches.twins) p.layout.pages(prompt) else 0);
+-- 
+2.53.0
+
