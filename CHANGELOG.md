@@ -1,5 +1,14 @@
 # Changelog
 
+- **2026-11-27 (fix)** -- Engine patch `0007`: a tool call no longer comes back as text when the reply opens a
+  `<tool_call>` before its prose (`<tool_call>Let me set up a plan...<tool_call>update_plan<arg_key>...`). The parser
+  paired the first opener with the call's closer, so the call's name read as the prose and the reply was kept as
+  content (`tool call rejected ... malformed [''] ... kept as text`), ending the agent's turn. It now retries such an
+  envelope from the last opener inside it (up to 4 back). This is the recipe's 0096 from 2026-11-04, lost in the port
+  to 1.3.0; the DERISKED checkpoint hit it in 2 of its first 5 replies. `test-tool-parse-host` 116/116 (the two new
+  tests fail without the patch), `test-tool-visibility-http-host` 42/42, `test-think-off-split-host` 38/38. Serving
+  `DERISKED=1` on image `85aba02f9430`.
+
 - **2026-11-26 (fix)** -- Engine patch `0006`: with `KV_SHARD=1` a long chat no longer fails with `this request's
   prompt needs more KV pages than the whole pool holds`. A sharded stream's pages lie in one GPU's part, but the reply
   cap (0008 on 1.3.0, here in `0001`) measured the whole pool and the sharded open counted the asked reply, so a turn

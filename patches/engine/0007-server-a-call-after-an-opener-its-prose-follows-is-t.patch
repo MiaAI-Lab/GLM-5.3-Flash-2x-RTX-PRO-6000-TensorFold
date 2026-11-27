@@ -1,0 +1,232 @@
+From b6de8f6b756fa1c7dc007954f6359d9425e8d892 Mon Sep 17 00:00:00 2001
+From: MiaAI_Lab <mia.ailab1@gmail.com>
+Date: Fri, 27 Nov 2026 13:52:25 +0200
+Subject: [PATCH] server: a call after an opener its prose follows is the call
+ (0096 on 1.3.5)
+
+A <tool_call> ahead of a call - prose quoting the opener ("Qwen's <tool_call>{}"), or a stray opener the
+model writes before its prose - begins the envelope, which the first </tool_call> closes, so the call's
+name read as the prose and the whole reply came back as content: "tool call rejected ... malformed ['']
+... kept as text", the agent's turn ended with the raw call on screen. Seen 2 of the first 5 replies
+from the DERISKED checkpoint on 2026-11-27 ("<tool_call>Let me set up a plan...<tool_call>update_plan
+<arg_key>todos</arg_key>...").
+
+parseWith now retries an envelope whose calls do not all name offered tools from the last opener inside
+it (up to 4 openers back, so a reply of quoted openers stays linear); the first that parses whole to
+offered tools is the call, and the text before it stays content. Otherwise the envelope is rejected as
+before. Ported from the recipe's 0096 on f350cd3 onto 1.3.5's parseWith (rejections, hidden unoffered
+calls). Tests: 0096's (GLM, JSON and XML calls after quoting prose; a value quoting the opener; offered
+names and whole parses still required; closeCall past an earlier opener; linear time) and the
+DERISKED reply. test-tool-parse-host 116/116 (the two new tests fail on the unpatched parser),
+test-tool-visibility-http-host 42/42, test-think-off-split-host 38/38.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ zig/src/server/tool_parse.zig      | 62 +++++++++++++++++++-
+ zig/src/server/tool_parse_test.zig | 92 +++++++++++++++++++++++++++++-
+ 2 files changed, 151 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/server/tool_parse.zig b/zig/src/server/tool_parse.zig
+index aba442c..0d739dd 100644
+--- a/zig/src/server/tool_parse.zig
++++ b/zig/src/server/tool_parse.zig
+@@ -155,7 +155,7 @@ pub fn parseWith(a: Allocator, text: []const u8, tools: []const Value, max_calls
+             continue;
+         }
+         if (max_calls) |m| if (calls.items.len >= m) continue;
+-        const parsed: ?[]Call = blk: {
++        var parsed: ?[]Call = blk: {
+             if (tool_dsml.whole(env.payload)) |b| {
+                 break :blk tool_dsml.calls(a, b.inner, b.spelling) catch |e| switch (e) {
+                     error.OutOfMemory => return error.OutOfMemory,
+@@ -173,6 +173,27 @@ pub fn parseWith(a: Allocator, text: []const u8, tools: []const Value, max_calls
+             }
+             break :blk null;
+         };
++        // A ``<tool_call>`` ahead of the call (prose quoting the opener, or a stray opener before prose) begins the
++        // envelope, so the call does not parse as its payload: the call is the last opener inside it (or one before
++        // that, when a value quotes the opener too), and what precedes it stays content.
++        var start = env.start;
++        if (!try allOffered(a, parsed, &known) and std.ascii.startsWithIgnoreCase(text[env.start..], "<tool_call>")) {
++            const closer = env.end - "</tool_call>".len;
++            const first = env.start + "<tool_call>".len;
++            var inner = lastOpener(text, first, closer);
++            var tries: usize = 0;
++            while (inner) |s| : (inner = lastOpener(text, first, s)) {
++                tries += 1;
++                if (tries > inner_tries) break;
++                const retry = try offeredCalls(a, strip(text[s + "<tool_call>".len .. closer]), &schemas, max_calls != null);
++                if (try allOffered(a, retry, &known)) {
++                    parsed = retry;
++                    start = s;
++                    break;
++                }
++            }
++        }
++        if (start != env.start) try residue.appendSlice(a, text[env.start..start]);
+         var unoffered_name: []const u8 = "";
+         const reject: enum { none, unoffered, malformed } = blk: {
+             const list = parsed orelse break :blk .malformed;
+@@ -201,7 +222,7 @@ pub fn parseWith(a: Allocator, text: []const u8, tools: []const Value, max_calls
+         for (parsed.?) |c| {
+             if (max_calls != null and calls.items.len >= max_calls.?) continue;
+             const call = (try openaiCall(a, (try callName(a, c, &known)).?, c.arguments)) orelse {
+-                try residue.appendSlice(a, text[env.start..env.end]);
++                try residue.appendSlice(a, text[start..env.end]);
+                 try rejections.append(a, .{ .reason = .malformed, .name = leadName(env.payload), .envelope = text[env.start..env.end] });
+                 rejected += 1;
+                 kept_malformed += 1;
+@@ -222,6 +243,43 @@ pub fn parseWith(a: Allocator, text: []const u8, tools: []const Value, max_calls
+     };
+ }
+ 
++/// Openers inside a rejected envelope tried, from the last: a bound keeps a reply of quoted openers linear.
++const inner_tries = 4;
++
++/// The last ``<tool_call>`` that starts at or after ``from`` and ends by ``before``.
++fn lastOpener(text: []const u8, from: usize, before: usize) ?usize {
++    var last: ?usize = null;
++    var pos = from;
++    while (findCI(text[0..before], "<tool_call>", pos)) |s| : (pos = s + 1) last = s;
++    return last;
++}
++
++/// A payload's calls when it parses whole (DSML or one call); null when it does not.
++fn offeredCalls(a: Allocator, block: []const u8, schemas: ?*const tool_params.Schemas, complete: bool) Allocator.Error!?[]Call {
++    if (tool_dsml.whole(block)) |b| {
++        return tool_dsml.calls(a, b.inner, b.spelling) catch |e| switch (e) {
++            error.OutOfMemory => return error.OutOfMemory,
++            error.Invalid => null,
++        };
++    }
++    const one = payload(a, block, schemas, complete) catch |e| switch (e) {
++        error.OutOfMemory => return error.OutOfMemory,
++        error.Invalid => return null,
++    };
++    const c = one orelse return null;
++    const list = try a.alloc(Call, 1);
++    list[0] = c;
++    return list;
++}
++
++/// Whether ``parsed`` is at least one call and every call names an offered tool.
++fn allOffered(a: Allocator, parsed: ?[]Call, known: *const std.StringArrayHashMapUnmanaged([]const u8)) Allocator.Error!bool {
++    const list = parsed orelse return false;
++    if (list.len == 0) return false;
++    for (list) |c| if ((try callName(a, c, known)) == null) return false;
++    return true;
++}
++
+ /// The one-line name a GLM payload starts with (``NAME<arg_key>...``), or "" when it starts with none.
+ pub fn leadName(block: []const u8) []const u8 {
+     const cut = std.mem.indexOfAny(u8, block, "<{[\n\r") orelse block.len;
+diff --git a/zig/src/server/tool_parse_test.zig b/zig/src/server/tool_parse_test.zig
+index 325a097..09f8557 100644
+--- a/zig/src/server/tool_parse_test.zig
++++ b/zig/src/server/tool_parse_test.zig
+@@ -159,7 +159,6 @@ test "a call left open that would not parse whole stays the reply's text" {
+         "Trying.<tool_call>\n<function=lookup>\n<parameter=n>\n5\n", // before its </parameter>
+         "Trying.<tool_call>{\"name\":\"launch rocket!\",\"arguments\":{}}", // no function name
+         "Trying.<tool_call>", // nothing written
+-        "Trying <tool_call> tags.<tool_call>{\"name\":\"lookup\"}", // an earlier opener would take the closer
+     };
+     for (replies) |text| {
+         try std.testing.expectEqualStrings("", try closeCall(a, text, tools));
+@@ -598,3 +597,94 @@ test "GLM pairs from the cached key and value ends are the pairs each key's own
+ test {
+     _ = @import("tool_parse_visibility_test.zig");
+ }
++
++test "prose that quotes the opener ahead of a call does not swallow the call" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"properties\":{\"n\":{\"type\":\"integer\"},\"q\":{\"type\":\"string\"}}}}}]")).ok.array;
++    // the model names the labs' formats in its prose, then calls in its own (GLM's, Qwen's JSON, XML)
++    const prose = "Each lab's format differs (<minimax:tool_call>, GLM's xml-ish, Qwen's <tool_call>{})...";
++    const calls = [_][]const u8{
++        "<tool_call>lookup<arg_key>n</arg_key><arg_value>7</arg_value></tool_call>",
++        "<tool_call>{\"name\":\"lookup\",\"arguments\":{\"n\":7}}</tool_call>",
++        "<tool_call>\n<function=lookup>\n<parameter=n>\n7\n</parameter>\n</function>\n</tool_call>",
++    };
++    for (calls) |call| {
++        const text = try std.mem.concat(a, u8, &.{ prose, call });
++        for ([_]?usize{ null, 1 }) |max_calls| {
++            const r = try parse(a, text, tools, max_calls);
++            try std.testing.expectEqual(@as(usize, 0), r.rejected_envelopes);
++            try std.testing.expectEqual(@as(usize, 1), r.calls.?.len);
++            try std.testing.expectEqualStrings("lookup", r.calls.?[0].get("function").?.get("name").?.string);
++            try std.testing.expectEqualStrings("{\"n\":7}", r.calls.?[0].get("function").?.get("arguments").?.string);
++            try std.testing.expectEqualStrings(prose, r.content);
++        }
++    }
++    // a value that quotes the opener parses whole (no retry); quoted ahead of such a call, the retry goes one opener back
++    const quoting = "<tool_call>lookup<arg_key>q</arg_key><arg_value>grep -c '<tool_call>' log</arg_value></tool_call>";
++    for ([_][]const u8{ quoting, try std.mem.concat(a, u8, &.{ prose, quoting }) }) |text| {
++        const r = try parse(a, text, tools, null);
++        try std.testing.expectEqual(@as(usize, 0), r.rejected_envelopes);
++        try std.testing.expectEqualStrings("{\"q\":\"grep -c '<tool_call>' log\"}", r.calls.?[0].get("function").?.get("arguments").?.string);
++    }
++    // the call found that way still has to name an offered tool, and (one call asked) parse whole, as before
++    const kept = [_]struct { []const u8, ?usize }{
++        .{ "Qwen's <tool_call>{}... <tool_call>launch<arg_key>n</arg_key><arg_value>7</arg_value></tool_call>", null },
++        .{ "Qwen's <tool_call>{}... <tool_call>launch<arg_key>n</arg_key><arg_value>7</arg_value></tool_call>", 1 },
++        .{ "Qwen's <tool_call>{}... <tool_call>lookup<arg_key>n</arg_key><arg_value>7</arg_value> and then</tool_call>", 1 },
++        .{ "Qwen's <tool_call>{}... <tool_call></tool_call>", null },
++    };
++    for (kept) |c| {
++        const r = try parse(a, c[0], tools, c[1]);
++        try std.testing.expect(r.calls == null);
++        try std.testing.expectEqual(@as(usize, 1), r.rejected_envelopes);
++        try std.testing.expectEqualStrings(c[0], r.content);
++    }
++    // an earlier opener no longer takes the closer that closes the call the end token left open
++    const tags = "Trying <tool_call> tags.<tool_call>{\"name\":\"lookup\"}";
++    try std.testing.expectEqualStrings("</tool_call>", try closeCall(a, tags, tools));
++    const tagged = try parse(a, try std.mem.concat(a, u8, &.{ tags, "</tool_call>" }), tools, null);
++    try std.testing.expectEqualStrings("lookup", tagged.calls.?[0].get("function").?.get("name").?.string);
++    try std.testing.expectEqualStrings("Trying <tool_call> tags.", tagged.content);
++    // a call after the quoted opener that the end token left open closes as before, and parses once closed
++    const open = "Qwen's <tool_call>{}... <tool_call>lookup<arg_key>n</arg_key><arg_value>7";
++    const close = try closeCall(a, open, tools);
++    try std.testing.expectEqualStrings("</arg_value></tool_call>", close);
++    const closed = try parse(a, try std.mem.concat(a, u8, &.{ open, close }), tools, null);
++    try std.testing.expectEqualStrings("{\"n\":7}", closed.calls.?[0].get("function").?.get("arguments").?.string);
++    try std.testing.expectEqualStrings("Qwen's <tool_call>{}...", closed.content);
++    // an unoffered call stays open, as before
++    try std.testing.expectEqualStrings("", try closeCall(a, "Qwen's <tool_call>{}... <tool_call>launch<arg_key>n</arg_key><arg_value>7", tools));
++}
++
++test "an envelope of many quoted openers is rejected in linear time" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
++    var t: Timed = .{ .replies = undefined, .tools = tools, .want = null };
++    for (&t.replies, [_]usize{ 800, 6400 }) |*reply, n| {
++        var r: std.ArrayList(u8) = .empty;
++        for (0..n) |_| try r.appendSlice(a, "<tool_call>{} ");
++        try r.appendSlice(a, "</tool_call>");
++        reply.* = r.items;
++    }
++    try t.linear(); // 8x the openers: near 8x the time, not 64x
++}
++
++test "a stray opener ahead of the reply's prose does not swallow the call after it" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"update_plan\",\"parameters\":{\"properties\":{\"todos\":{\"type\":\"array\"}}}}}]")).ok.array;
++    // seen from the DERISKED checkpoint, 2026-11-27: an opener, the turn's prose, then the call in GLM's form
++    const prose = "<tool_call>Let me set up a plan for this review and start gathering the actual evidence.";
++    const call = "<tool_call>update_plan<arg_key>todos</arg_key><arg_value>[{\"content\": \"Gather git state\", \"status\": \"in_progress\"}]</arg_value></tool_call>";
++    const r = try parse(a, try std.mem.concat(a, u8, &.{ prose, call }), tools, null);
++    try std.testing.expectEqual(@as(usize, 0), r.rejected_envelopes);
++    try std.testing.expectEqual(@as(usize, 1), r.calls.?.len);
++    try std.testing.expectEqualStrings("update_plan", r.calls.?[0].get("function").?.get("name").?.string);
++    try std.testing.expectEqualStrings("{\"todos\":[{\"content\":\"Gather git state\",\"status\":\"in_progress\"}]}", r.calls.?[0].get("function").?.get("arguments").?.string);
++    try std.testing.expectEqualStrings(prose, r.content);
++}
+-- 
+2.53.0
+

@@ -55,6 +55,11 @@ ABLIT="${ABLIT:-0}"
 ABLIT_ID="Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit"
 _id="Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold"; _dir=model
 if [[ "$ABLIT" == 1 ]]; then _id=$ABLIT_ID; _dir=model-ablit; fi
+# DERISKED=1 serves the DERISKED Cyber weights instead (the same 4 bpw EXL3 layout). Its repository is private until
+# it is published: fetching it needs HF_TOKEN from an account that can read it. Not with ABLIT=1.
+DERISKED="${DERISKED:-0}"
+DERISKED_ID="Mia-AiLab/GLM-5.3-Flash-DERISKED-Cyber-EXL3-4bpw"
+if [[ "$DERISKED" == 1 ]]; then _id=$DERISKED_ID; _dir=model-derisked; fi
 MODEL_ID="${MODEL_ID:-$_id}"
 PROPOSAL_HEAD_PYTHON="${PROPOSAL_HEAD_PYTHON:-python3}"  # numpy is needed only to prepare an EXL3 draft head once
 MODEL_VARIANT="${MODEL_VARIANT:-default}"       # default: repository's canonical view; k6/k8: cuteafd-mc variant
@@ -62,6 +67,7 @@ MODEL_VARIANT="${MODEL_VARIANT:-default}"       # default: repository's canonica
 case "$MODEL_ID" in
   Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold) _rev=76c0b5173166d2795dd48860f45d8224817f894c ;;
   "$ABLIT_ID") _rev=57edefd2f5d9b371c8345883304d5af68b52fa24 ;;
+  "$DERISKED_ID") _rev=7efc7357cd23099db62f9922ae4e8e7e65c51164 ;;
   wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC) _rev=91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d ;;
   *) _rev="" ;;
 esac

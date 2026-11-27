@@ -138,8 +138,9 @@ Settings are layered: `scripts/config.sh` defaults, then `.env` (literal `KEY=va
 | --- | --- | --- |
 | `MODEL_SOURCE` | `download` | `download`: fetch the pinned 4 bpw checkpoint into `MODEL_DIR` when it is missing. `local`: serve `MODEL_DIR` as it is, with no download |
 | `ABLIT` | `0` | `1`: serve the gated [Ablit weights](#ablit-weights) instead of the published checkpoint; needs `HF_TOKEN` to download them |
+| `DERISKED` | `0` | `1`: serve the [DERISKED weights](#derisked-weights) instead of the published checkpoint; a download needs an `HF_TOKEN` that can read the repository while it is private. Not with `ABLIT=1` |
 | `HF_TOKEN` | unset | A Hugging Face read token for gated downloads. It is never passed to the ranks or printed |
-| `MODEL_DIR` | `DATA_DIR/model` (`DATA_DIR/model-ablit` with `ABLIT=1`) | The EXL3 checkpoint, mounted read-only |
+| `MODEL_DIR` | `DATA_DIR/model` (`DATA_DIR/model-ablit` with `ABLIT=1`, `DATA_DIR/model-derisked` with `DERISKED=1`) | The EXL3 checkpoint, mounted read-only |
 | `CONFIG_OVERLAY` | `auto` | `auto`: add `bits: 4` over `config.json` when an EXL3 config has none. `0`: mount `config.json` as stored |
 | `DRAFTER` | `dflash2` | `dflash2` (`--drafter /dflash2`), `mtp` (the checkpoint's MTP head) or `none` (`--no-drafts`) |
 | `DFLASH2_DIR` | `DATA_DIR/dflash2` | DFlash2 weights, downloaded at the pinned revision when missing |
@@ -284,6 +285,52 @@ transplant. Measured on the 2x DGX Spark pair (that recipe's PR #26): 15 of 30 l
 of a published refusal suite, kept the exact-copy case above byte-exact, and decoded at the parent's rate, where the
 full overlay measured about 15% below the parent on code. Not measured on this host.
 
+## DERISKED weights
+
+`DERISKED=1` serves
+[Mia-AiLab/GLM-5.3-Flash-DERISKED-Cyber-EXL3-4bpw](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-DERISKED-Cyber-EXL3-4bpw)
+instead of the published checkpoint, at the revision pinned in `scripts/config.sh` (`7efc7357`). It has the published
+checkpoint's layout: 4 bpw EXL3 routed experts with the `mcg` codebook, a BF16 head and the vision tower, about 164 GiB
+in 83 shards. The engine, the drafter and every setting are the same.
+
+The repository is private until it is published. Until then, a download needs a read token from an account that can see
+it:
+
+```bash
+# scripts/local.sh (or .env, unless scripts/local.sh sets DERISKED too: it wins)
+DERISKED=1
+HF_TOKEN=hf_...
+```
+
+Then run `./start.sh restart`. Before the image and the download, `start.sh` and `scripts/prepare.sh` check that the
+token reaches the repository and stop at once if it does not (`401`, `403` or `404`: the token is refused, or its account
+cannot see the repository). The first start downloads the checkpoint into `DATA_DIR/model-derisked`, beside the
+published one, and fits its own window. `DERISKED=0` goes back to the published checkpoint, which stays in the cache.
+Once downloaded, the weights need no token.
+
+To serve a copy you already have, skip the download and the token:
+
+```bash
+DERISKED=1
+MODEL_SOURCE=local
+MODEL_DIR=/path/to/GLM-5.3-Flash-DERISKED-Cyber-EXL3-4bpw   # read-only, never written
+```
+
+`ABLIT=1` and `DERISKED=1` select different checkpoints, so setting both is refused.
+
+The checkpoint ships its own `chat_template.jinja`, which the recipe serves (with [the effort line](#the-effort-line)
+added, as for any checkpoint). It writes image, video and audio parts as the model's media tokens instead of a "cannot
+process" reminder, and keeps tool results in their order, rather than sorting them by call, when their ids repeat or
+match no call. Tool calls use the published template's format.
+
+In agent use this checkpoint sometimes opens a `<tool_call>` before its prose and then makes the real call
+(`<tool_call>Let me set up a plan...<tool_call>update_plan<arg_key>...`). Without engine patch `0007` that reply comes
+back as text and the agent's turn ends (`rank0.log`: `tool call rejected ... malformed`). With it, the call is the call
+and the prose stays content.
+
+Verified on this host on 2026-11-27: the full 1,048,576-token window with 4 streams (`KV=fp8`, `KV_SHARD=1`), tool calls
+parsed (`finish_reason: tool_calls`), DFlash2 drafting.
+
 ## Memory on 96 GB discrete cards with a desktop on GPU 1
 
 - VRAM and system RAM are separate pools: this is not a GB10 with unified memory. Every weight must fit on the GPUs,
@@ -335,6 +382,7 @@ pinned host-RAM prompt tier, GLM `--learn-conversations`); these carry what is n
 | 0004 | The DFlash2 selector skips candidate ids outside the vocabulary (a row with NaN or -inf logits returned the kernel's no-winner id and crashed the host) |
 | 0005 | A paged engine's refusal of its other streams (`--parallel N needs ... GiB for its other streams' fixed parts`) ends `; fits: --parallel N, --context T`, the largest window beside them, which `CONTEXT=auto` retries with |
 | 0006 | `KV_SHARD=1`: a stream's reply is capped to what one GPU's part of the pool holds for its prompt, as unsharded streams are capped to the whole pool. Before, a chat past about half the window that asked a long reply (a client's `max_tokens`, or the server's clamp to the window) failed with `this request's prompt needs more KV pages than the whole pool holds` |
+| 0007 | A tool call after a `<tool_call>` its prose follows (a stray opener ahead of the reply's text, or prose quoting the opener) is the call: the parser retries a rejected envelope from the last opener inside it and keeps the text before it as content. Before, the reply came back as text with the raw call in it and the agent's turn ended (`tool call rejected ... malformed`). The recipe's 0096, lost in the port to 1.3.0 |
 
 `TF_KV_PAGES` reads as upstream's does: `auto` (the default) pages bf16 from two ranks and keeps E4M3 on whole
 windows, `off` or `0` keeps windows, and any other text pages, E4M3 included.
@@ -373,7 +421,8 @@ Thinking-on prompts are unchanged (same greedy replies). `EFFORT_LINE=always` se
 | `NotExl3Mcg4` in a rank log | The engine found experts that are not 4-bit `mcg`, as in a mixed-width quant's 3-bit gate/up. This needs the mixed-width engine patches in `patches/engine/`, or use the default 4 bpw checkpoint |
 | `libtfvideo.so is required for video inputs` (HTTP 500 on a `video_url` part) | The default image builds no video runtime. Set `WITH_VIDEO=1` and restart (it builds its own image tag); a server that already refused one video request keeps refusing until restarted |
 | An exact value (an id, a hash) copied wrong in a JSON reply on `ABLIT=1` | The Ablit weights' own error: see [Ablit weights](#ablit-weights) |
-| `[E_HF_TOKEN]` | `ABLIT=1` and the gated weights can't be fetched: see [Ablit weights](#ablit-weights), or set `ABLIT=0` |
+| `[E_HF_TOKEN]` | `ABLIT=1` and the gated weights can't be fetched: see [Ablit weights](#ablit-weights), or set `ABLIT=0`. With `DERISKED=1`: `HF_TOKEN` can't read the private repository, see [DERISKED weights](#derisked-weights) |
+| A reply that shows a raw `<tool_call>...<arg_key>` instead of calling the tool (`tool call rejected ... malformed` in `rank0.log`) | Engine patch `0007` is missing from the image: rebuild (`scripts/prepare.sh --image`) and `./start.sh restart` |
 | A reply ends with `<\|assistant\|>` followed by the same answer again, `finish_reason: length` | The checkpoint's EOS list leaves out `<\|assistant\|>`. Keep `EXTRA_EOS` at its default (`<\|assistant\|>`) |
 | With thinking off, `content` starts with a draft ("We need ...") and holds `</think>` | The model reasoned anyway. Set `THINK_OFF_SPLIT=1024` (off by default) so the draft goes to `reasoning_content` |
 | `[E_DOWNLOAD]` | The download failed: check free space and your connection, and run `./start.sh` again to resume |

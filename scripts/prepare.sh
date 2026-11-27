@@ -90,6 +90,8 @@ validate_config() {
     [[ "$path" == /* && "$path" != *:* && "$path" != *$'\n'* && "$path" != *,* ]] || fail E_CONFIG "$key must be an absolute path without colons, commas or newlines."
   done
   [[ "$ABLIT" =~ ^[01]$ ]] || fail E_CONFIG 'ABLIT must be 0 or 1.'
+  [[ "$DERISKED" =~ ^[01]$ ]] || fail E_CONFIG 'DERISKED must be 0 or 1.'
+  [[ "$ABLIT" == 0 || "$DERISKED" == 0 ]] || fail E_CONFIG 'ABLIT=1 and DERISKED=1 select different checkpoints: set one of them.'
   [[ "$ABLIT" == 0 || "$MODEL_SOURCE" == download ]] || fail E_CONFIG 'ABLIT=1 fetches the Ablit weights, so it needs MODEL_SOURCE=download. To serve a copy you already have, set ABLIT=0, MODEL_SOURCE=local and MODEL_DIR.'
   [[ "$MODEL_SOURCE" != download || -n "$MODEL_REVISION" ]] || fail E_CONFIG "MODEL_ID=$MODEL_ID has no pinned revision: set MODEL_REVISION."
   # A download never overwrites another checkpoint or revision: their files share names, so the result would be a mix.
@@ -327,12 +329,28 @@ fetch_weights() {
   [[ "$DRY_RUN" == 1 ]] || { printf '%s\n' "$rev" > "$dir/.revision"; rm -f "$dir/.downloading"; }
 }
 
-# The gated Ablit weights need HF_TOKEN only while they still have to be fetched. One small file is asked for before the
+# The gated Ablit weights (and the private DERISKED ones) need HF_TOKEN only while they still have to be fetched. One small file is asked for before the
 # image work, so a refusal says why at once. The token goes to curl on stdin, never on a command line.
 check_weights_access() {
-  [[ "$MODEL_SOURCE" == download && "$MODEL_ID" == "$ABLIT_ID" ]] || return 0
+  [[ "$MODEL_SOURCE" == download && ( "$MODEL_ID" == "$ABLIT_ID" || "$MODEL_ID" == "$DERISKED_ID" ) ]] || return 0
   ! weights_ready "$MODEL_DIR" "$MODEL_REVISION" || return 0
   local steps code
+  if [[ "$MODEL_ID" == "$DERISKED_ID" ]]; then
+    steps="The repository is private until it is published: set HF_TOKEN=hf_... (a read token from an account that can see https://huggingface.co/$MODEL_ID) in scripts/local.sh, .env or the environment, and run this again. Or set DERISKED=0 to serve the published checkpoint, or MODEL_SOURCE=local and MODEL_DIR to serve a copy you have."
+    if [[ -z "${HF_TOKEN:-}" ]]; then
+      [[ "$DRY_RUN" == 1 ]] && { warn W_HF_TOKEN "The DERISKED weights are private and HF_TOKEN is not set: a real start stops here."; return 0; }
+      fail E_HF_TOKEN "The DERISKED weights ($MODEL_ID) are private on Hugging Face. $steps"
+    fi
+    [[ "$DRY_RUN" != 1 ]] || return 0
+    code=$(printf 'Authorization: Bearer %s\n' "$HF_TOKEN" |
+      curl -s -o /dev/null -w '%{http_code}' --max-time 20 -H @- "https://huggingface.co/$MODEL_ID/resolve/$MODEL_REVISION/config.json" || true)
+    case "$code" in
+      2??|3??) log "HF_TOKEN reaches the private $MODEL_ID." ;;
+      401|403|404) fail E_HF_TOKEN "HF_TOKEN cannot read $MODEL_ID @ $MODEL_REVISION (HTTP $code). $steps" ;;
+      *) warn W_HF_TOKEN "Could not check HF_TOKEN against $MODEL_ID (HTTP $code); trying the download." ;;
+    esac
+    return 0
+  fi
   steps="1. Open https://huggingface.co/$MODEL_ID, log in and agree to its terms. 2. Create a token with read access at https://huggingface.co/settings/tokens (the same account). 3. Set HF_TOKEN=hf_... in scripts/local.sh, .env or the environment, and run this again. Or set ABLIT=0 to serve the published checkpoint."
   if [[ -z "${HF_TOKEN:-}" ]]; then
     [[ "$DRY_RUN" == 1 ]] && { warn W_HF_TOKEN "The Ablit weights are gated and HF_TOKEN is not set: a real start stops here."; return 0; }

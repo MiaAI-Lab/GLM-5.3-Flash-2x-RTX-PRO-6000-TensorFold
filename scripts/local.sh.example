@@ -7,6 +7,7 @@ PORT=8020
 # MODEL_SOURCE=local
 # MODEL_DIR=/path/to/GLM-5.3-Flash-EXL3-checkpoint   # read-only, never downloaded
 # ABLIT=1                      # the gated Ablit weights instead (README "Ablit weights"); needs HF_TOKEN below
+# DERISKED=1                   # the DERISKED Cyber weights instead (private for now: HF_TOKEN must be able to read the repository)
 # HF_TOKEN=hf_...              # a Hugging Face read token whose account agreed to the Ablit model's terms
 DRAFTER=dflash2              # mtp: the checkpoint's MTP head (no non-commercial weights); none: no drafts
 PARALLEL=4
